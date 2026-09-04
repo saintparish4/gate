@@ -14,21 +14,26 @@ import org.typelevel.otel4s.trace.Tracer.Implicits.noop
 
 import api.{
   DashboardApi, RateLimitCheckResponse, RateLimitStatusResponse, Routes,
+  TokenQuotaApi, TokenQuotaCheckRequest, TokenQuotaReconcileRequest,
 }
-import config.{IdempotencyConfig, RateLimitConfig}
+import config.{IdempotencyConfig, RateLimitConfig, TokenQuotaConfig}
 import events.EventPublisher
 import observability.MetricsPublisher
 import resilience.AggregateHealth
 import security.{
   ApiKeyAuth, ApiKeyStore, AuthenticatedClient, ClientTier, Permission,
 }
-import storage.{DynamoDBIdempotencyStore, DynamoDBRateLimitStore}
+import storage.{
+  DynamoDBIdempotencyStore, DynamoDBRateLimitStore, DynamoDBTokenQuotaStore,
+}
 import cats.effect.IO
 import cats.effect.testing.scalatest.AsyncIOSpec
 import cats.effect.unsafe.implicits.global
 import cats.syntax.all.*
 import io.circe.generic.auto.*
 import io.circe.parser.*
+import io.circe.syntax.*
+import core.TokenQuotaService
 
 /** Integration tests for HTTP API endpoints.
   *
@@ -91,6 +96,42 @@ class HttpApiIntegrationSpec
     .apply[IO](rateLimitStore, testRateLimitConfig, logger, None, eventPublisher)
     .unsafeRunSync()
 
+  val tokenQuotaTableName = "test-token-quotas"
+
+  override protected def setupResources(): Unit = {
+    super.setupResources()
+    createDynamoDBTable(tokenQuotaTableName)
+  }
+
+  // Small limits and a short window so the HTTP tests hit the edges quickly.
+  lazy val testTokenQuotaConfig: TokenQuotaConfig = TokenQuotaConfig(
+    enabled = true,
+    userLimit = 100,
+    userWindowSeconds = 60,
+    agentLimit = 80,
+    agentWindowSeconds = 60,
+    orgLimit = 1000,
+    orgWindowSeconds = 60,
+  )
+
+  lazy val tokenQuotaApi: TokenQuotaApi[IO] = TokenQuotaApi[IO](
+    TokenQuotaService[IO](
+      DynamoDBTokenQuotaStore[IO](
+        dynamoDbClient,
+        tokenQuotaTableName,
+        logger,
+        metricsPublisher,
+      ),
+      testTokenQuotaConfig,
+      metricsPublisher,
+      logger,
+    ),
+    eventPublisher,
+    metricsPublisher,
+    logger,
+    () => IO.pure("test-request-id"),
+  )
+
   lazy val testIdempotencyConfig: IdempotencyConfig =
     IdempotencyConfig(defaultTtlSeconds = 86400, maxTtlSeconds = 86400)
 
@@ -105,7 +146,7 @@ class HttpApiIntegrationSpec
     testIdempotencyConfig,
     logger,
     dashboardApi,
-    tokenQuotaApi = None,
+    tokenQuotaApi = Some(tokenQuotaApi),
     prometheusMetrics = None,
     healthCheck = IO.pure(AggregateHealth("ok", Nil)),
     getRequestId = () => IO.pure("test-request-id"),
@@ -117,6 +158,63 @@ class HttpApiIntegrationSpec
     super.beforeEach()
     clearTable(testDynamoDBConfig.rateLimitTable)
     clearTable(testDynamoDBConfig.idempotencyTable)
+    clearTable(tokenQuotaTableName)
+  }
+
+  "Token quota endpoints" - {
+
+    def quotaCheck(userId: String, tokens: Long): Request[IO] = Request[IO](
+      Method.POST,
+      uri"/v1/quota/check",
+    ).putHeaders(headers.Authorization(Credentials.Token(ci"Bearer", "test-key")))
+      .withEntity(
+        TokenQuotaCheckRequest(userId = userId, estimatedInputTokens = tokens)
+          .asJson,
+      )
+
+    def quotaReconcile(
+        userId: String,
+        actual: Long,
+        estimated: Long,
+    ): Request[IO] = Request[IO](Method.POST, uri"/v1/quota/reconcile")
+      .putHeaders(headers.Authorization(Credentials.Token(ci"Bearer", "test-key")))
+      .withEntity(
+        TokenQuotaReconcileRequest(
+          userId = userId,
+          actualInputTokens = actual,
+          actualOutputTokens = 0,
+          estimatedInputTokens = estimated,
+          estimatedOutputTokens = 0,
+        ).asJson,
+      )
+
+    "POST /v1/quota/check admits under the limit, then rejects with Retry-After inside the window" in {
+      for {
+        first <- httpApp.run(quotaCheck("quota-user-1", 90))
+        second <- httpApp.run(quotaCheck("quota-user-1", 50))
+        body <- second.as[String]
+      } yield {
+        first.status shouldBe Status.Ok
+        second.status shouldBe Status.TooManyRequests
+        val retryAfter = second.headers.get(ci"Retry-After")
+          .map(_.head.value.toInt)
+        retryAfter.exists(r => r >= 1 && r <= 60) shouldBe true
+        body should include("\"exceededLevel\":\"user\"")
+      }
+    }
+
+    "POST /v1/quota/reconcile replaces the estimate so freed tokens can be reused" in {
+      for {
+        first <- httpApp.run(quotaCheck("quota-user-2", 60))
+        reconciled <- httpApp.run(quotaReconcile("quota-user-2", 30, 60))
+        second <- httpApp.run(quotaCheck("quota-user-2", 60))
+      } yield {
+        first.status shouldBe Status.Ok
+        reconciled.status shouldBe Status.Ok
+        // 30 actually used + 60 requested = 90, inside the 100-token limit.
+        second.status shouldBe Status.Ok
+      }
+    }
   }
 
   "Health endpoints" - {

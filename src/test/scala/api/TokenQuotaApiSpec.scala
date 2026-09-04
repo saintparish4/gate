@@ -54,6 +54,33 @@ class TokenQuotaApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
     )
   }
 
+  /** A service whose answers are fixed, for exercising the HTTP mapping. */
+  def stubService(
+      decision: QuotaDecision,
+      reconciled: ReconcileResult,
+  ): TokenQuotaService[IO] = new TokenQuotaService[IO]:
+    def checkQuota(
+        identifier: QuotaIdentifier,
+        estimatedInputTokens: Long,
+        estimatedOutputTokens: Long,
+    ): IO[QuotaDecision] = IO.pure(decision)
+    def reconcile(
+        identifier: QuotaIdentifier,
+        actualInputTokens: Long,
+        actualOutputTokens: Long,
+        estimatedInputTokens: Long,
+        estimatedOutputTokens: Long,
+    ): IO[ReconcileResult] = IO.pure(reconciled)
+
+  def makeApiWith(service: TokenQuotaService[IO]): TokenQuotaApi[IO] =
+    TokenQuotaApi[IO](
+      service,
+      EventPublisher.noop[IO],
+      MetricsPublisher.noop[IO],
+      Logger[IO],
+      () => IO.pure("test-request-id"),
+    )
+
   def checkRequest(
       userId: String,
       estimatedInput: Long,
@@ -121,6 +148,59 @@ class TokenQuotaApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
         body.inputDelta shouldBe -20L // 80 actual - 100 estimated
         body.outputDelta shouldBe 10L // 10 actual - 0 estimated
       }
+
+    "puts the same Retry-After in the header and the body when quota is exceeded" in
+      makeApi().flatMap(api =>
+        for
+          _ <- api.check(checkRequest("user-e", estimatedInput = 90), testClient)
+          resp <- api
+            .check(checkRequest("user-e", estimatedInput = 50), testClient)
+          body <- resp.as[TokenQuotaCheckResponse]
+        yield (resp, body),
+      ).asserting { case (resp, body) =>
+        resp.status shouldBe Status.TooManyRequests
+        body.allowed shouldBe false
+        body.exceededLevel shouldBe Some("user")
+        // The window is one second, so the wait can only ever be one second.
+        body.retryAfter shouldBe Some(1)
+        resp.headers.get(ci"Retry-After").map(_.head.value) shouldBe Some("1")
+      }
+
+    "returns 503 with Retry-After when the reservation is contended" in {
+      val api = makeApiWith(
+        stubService(QuotaDecision.Contended(25), ReconcileResult.Reconciled(0, 0)),
+      )
+      for
+        resp <- api
+          .check(checkRequest("user-f", estimatedInput = 10), testClient)
+        body <- resp.as[TokenQuotaCheckResponse]
+      yield
+        resp.status shouldBe Status.ServiceUnavailable
+        resp.headers.get(ci"Retry-After").map(_.head.value) shouldBe Some("1")
+        body.allowed shouldBe false
+        body.exceededLevel shouldBe None
+    }
+
+    "returns 400 for negative reconcile counts" in makeApi().flatMap(api =>
+      api.reconcile(reconcileRequest("user-g", -1, 0, 10, 0), testClient),
+    ).asserting(_.status shouldBe Status.BadRequest)
+
+    "POST /v1/quota/reconcile returns 503 when the adjustment cannot be recorded" in {
+      val api = makeApiWith(stubService(
+        QuotaDecision.Available(Map.empty),
+        ReconcileResult.Contended(25),
+      ))
+      for
+        resp <- api
+          .reconcile(reconcileRequest("user-h", 80, 10, 100, 0), testClient)
+        body <- resp.as[TokenQuotaReconcileResponse]
+      yield
+        resp.status shouldBe Status.ServiceUnavailable
+        resp.headers.get(ci"Retry-After").map(_.head.value) shouldBe Some("1")
+        body.status shouldBe "contended"
+        body.inputDelta shouldBe -20L
+        body.outputDelta shouldBe 10L
+    }
 
     "returns 404 when token-quota is disabled (tokenQuotaApi = None in Routes)" in {
       // This tests the Routes-level guard, not the API directly.

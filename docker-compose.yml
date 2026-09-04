@@ -46,6 +46,7 @@ services:
       - IDEMPOTENCY_TABLE=idempotency
       - KINESIS_STREAM=rate-limit-events
       - KINESIS_ENABLED=true
+      - TOKEN_QUOTA_ENABLED=true
       # OpenTelemetry: traces go to the `jaeger` service under the `obs`
       # profile (`docker compose --profile obs up`). Without the obs profile
       # the DNS name does not resolve and OTel exporter logs are silent/ignored.

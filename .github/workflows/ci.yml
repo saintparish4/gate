@@ -161,7 +161,7 @@ jobs:
         docker compose logs --tail 200 rate-limiter || true
         exit 1
 
-    - name: "Run correctness invariants (A: token-bucket non-over-issue, B: idempotency exactly-one-Created)"
+    - name: "Run correctness invariants (A: token-bucket non-over-issue, B: idempotency exactly-one-Created, C: quota non-over-admission)"
       run: sbt "loadSim/run --scenario correctness"
 
     - name: Cleanup

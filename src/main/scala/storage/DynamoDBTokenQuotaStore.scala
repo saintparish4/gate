@@ -2,7 +2,6 @@ package storage
 
 import scala.concurrent.duration.*
 import scala.jdk.CollectionConverters.*
-import scala.jdk.FutureConverters.*
 
 import org.typelevel.log4cats.Logger
 
@@ -10,7 +9,10 @@ import cats.effect.*
 import cats.syntax.all.*
 import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient
 import software.amazon.awssdk.services.dynamodb.model.*
-import core.{TokenQuotaState, TokenQuotaStore}
+import core.{
+  PlannedWrite, QuotaReservation, QuotaTarget, ReserveOutcome, TokenQuotaState,
+  TokenQuotaStore,
+}
 import observability.MetricsPublisher
 import DynamoDBOps.*
 
@@ -21,10 +23,14 @@ import DynamoDBOps.*
   *   - input_tokens (N): cumulative input tokens in current window
   *   - output_tokens (N): cumulative output tokens in current window
   *   - window_start (N): epoch millis when the current window began
-  *   - version (N): OCC version counter
+  *   - version (N): OCC version counter, monotonic across window rollovers
   *   - ttl (N): epoch seconds for DynamoDB TTL cleanup
   *
-  * Uses OCC via retryOnConditionFail from DynamoDBOps.
+  * A reservation reads every target with a consistent read, checks the limits
+  * against exactly that snapshot, and writes all targets with
+  * version-conditional puts: one PutItem for a single target,
+  * TransactWriteItems for several. Any condition failure re-reads and retries,
+  * so the limit check and the write can never disagree about the state.
   */
 class DynamoDBTokenQuotaStore[F[_]: Async](
     client: DynamoDbAsyncClient,
@@ -33,7 +39,13 @@ class DynamoDBTokenQuotaStore[F[_]: Async](
     metrics: MetricsPublisher[F],
 ) extends TokenQuotaStore[F]:
 
-  private val MaxRetries = 25
+  private val MaxAttempts = 25
+
+  private case class ConditionalItem(
+      item: Map[String, AttributeValue],
+      condition: String,
+      values: Map[String, AttributeValue],
+  )
 
   override def getQuota(pk: String): F[Option[TokenQuotaState]] =
     val request = GetItemRequest.builder().tableName(tableName)
@@ -51,144 +63,110 @@ class DynamoDBTokenQuotaStore[F[_]: Async](
       else Async[F].pure(None),
     )
 
-  override def incrementQuota(
-      pk: String,
-      inputTokensDelta: Long,
-      outputTokensDelta: Long,
-      windowSeconds: Long,
+  override def reserve(
+      targets: List[QuotaTarget],
+      inputDelta: Long,
+      outputDelta: Long,
       nowMs: Long,
-  ): F[Boolean] = incrementWithRetry(
-    pk,
-    inputTokensDelta,
-    outputTokensDelta,
-    windowSeconds,
-    nowMs,
-    MaxRetries,
-  )
+  ): F[ReserveOutcome] =
+    if targets.isEmpty then Async[F].pure(ReserveOutcome.Reserved(Map.empty))
+    else attemptReserve(targets, inputDelta, outputDelta, nowMs, attempt = 1)
 
   override def healthCheck: F[Either[String, Unit]] =
     dynamoHealthCheck(client, tableName)
 
-  private def incrementWithRetry(
-      pk: String,
+  private def attemptReserve(
+      targets: List[QuotaTarget],
       inputDelta: Long,
       outputDelta: Long,
-      windowSec: Long,
       nowMs: Long,
-      retriesRemaining: Int,
-  ): F[Boolean] =
+      attempt: Int,
+  ): F[ReserveOutcome] =
     for
-      current <- getQuota(pk)
-      result <- current match
-        case Some(state)
-            if isWithinWindow(state.windowStart, nowMs, windowSec) =>
-          val newInput = math.max(0, state.inputTokens + inputDelta)
-          val newOutput = math.max(0, state.outputTokens + outputDelta)
-          val newVersion = state.version + 1
-          val ttl = nowMs / 1000 + windowSec + 60 // window + 60s grace
-
-          attemptConditionalUpdate(
-            pk,
-            newInput,
-            newOutput,
-            state.windowStart,
-            newVersion,
-            state.version,
-            ttl,
-          ).flatMap {
-            case true => Async[F].pure(true)
-            case false =>
-              if retriesRemaining > 0 then
-                metrics.increment("TokenQuotaOCCRetry") *>
-                  jitteredBackoff(MaxRetries - retriesRemaining) *>
-                  incrementWithRetry(
-                    pk,
-                    inputDelta,
-                    outputDelta,
-                    windowSec,
-                    nowMs,
-                    retriesRemaining - 1,
-                  )
-              else
-                logger.warn(s"OCC retries exhausted for token quota pk=$pk") *>
-                  Async[F].pure(false)
+      current <- readCurrent(targets)
+      outcome <- QuotaReservation
+        .plan(targets, current, inputDelta, outputDelta, nowMs) match
+        case Left(exceeded) => Async[F].pure(exceeded)
+        case Right(planned) => write(planned, nowMs).flatMap {
+            case true => Async[F].pure(ReserveOutcome.Reserved(
+                planned.map(p => p.target.pk -> p.after).toMap,
+              ))
+            case false if attempt < MaxAttempts =>
+              metrics.increment("TokenQuotaOCCRetry") *>
+                jitteredBackoff(attempt) *> attemptReserve(
+                  targets,
+                  inputDelta,
+                  outputDelta,
+                  nowMs,
+                  attempt + 1,
+                )
+            case false => logger
+                .warn(s"OCC retries exhausted reserving quota for ${targets
+                    .map(_.pk).mkString(", ")}")
+                .as(ReserveOutcome.Contended(attempt))
           }
+    yield outcome
 
-        case _ =>
-          val inputTokens = math.max(0, inputDelta)
-          val outputTokens = math.max(0, outputDelta)
-          val ttl = nowMs / 1000 + windowSec + 60
+  private def readCurrent(
+      targets: List[QuotaTarget],
+  ): F[Map[String, TokenQuotaState]] = targets
+    .traverse(t => getQuota(t.pk).map(t.pk -> _)).map(_.collect {
+      case (pk, Some(state)) => pk -> state
+    }.toMap)
 
-          attemptCreateNew(pk, inputTokens, outputTokens, nowMs, ttl).flatMap {
-            case true => Async[F].pure(true)
-            case false =>
-              if retriesRemaining > 0 then
-                metrics.increment("TokenQuotaOCCRetry") *>
-                  jitteredBackoff(MaxRetries - retriesRemaining) *>
-                  incrementWithRetry(
-                    pk,
-                    inputDelta,
-                    outputDelta,
-                    windowSec,
-                    nowMs,
-                    retriesRemaining - 1,
-                  )
-              else
-                logger
-                  .warn(s"OCC retries exhausted for new token quota pk=$pk") *>
-                  Async[F].pure(false)
-          }
-    yield result
+  private def write(planned: List[PlannedWrite], nowMs: Long): F[Boolean] =
+    planned.map(conditionalItem(_, nowMs)) match
+      case single :: Nil => putOne(single)
+      case many => putAll(many)
+
+  private def conditionalItem(p: PlannedWrite, nowMs: Long): ConditionalItem =
+    // 60 s of grace past the window so a late reconcile still finds the item
+    val ttl = nowMs / 1000 + p.target.windowSeconds + 60
+    val item = Map(
+      "pk" -> attr(p.target.pk),
+      "input_tokens" -> attrN(p.after.inputTokens),
+      "output_tokens" -> attrN(p.after.outputTokens),
+      "window_start" -> attrN(p.after.windowStart),
+      "version" -> attrN(p.after.version),
+      "ttl" -> attrN(ttl),
+    )
+    p.before match
+      case Some(s) => ConditionalItem(
+          item,
+          "version = :expectedVersion",
+          Map(":expectedVersion" -> attrN(s.version)),
+        )
+      case None => ConditionalItem(item, "attribute_not_exists(pk)", Map.empty)
+
+  private def putOne(ci: ConditionalItem): F[Boolean] =
+    val builder = PutItemRequest.builder().tableName(tableName)
+      .item(ci.item.asJava).conditionExpression(ci.condition)
+    val request =
+      if ci.values.isEmpty then builder.build()
+      else builder.expressionAttributeValues(ci.values.asJava).build()
+    conditionalPut(client, request).recover {
+      case _: TransactionConflictException => false
+    }
+
+  private def putAll(items: List[ConditionalItem]): F[Boolean] =
+    val actions = items.map { ci =>
+      val put = Put.builder().tableName(tableName).item(ci.item.asJava)
+        .conditionExpression(ci.condition)
+      val withValues =
+        if ci.values.isEmpty then put
+        else put.expressionAttributeValues(ci.values.asJava)
+      TransactWriteItem.builder().put(withValues.build()).build()
+    }
+    val request = TransactWriteItemsRequest.builder()
+      .transactItems(actions.asJava).build()
+    Async[F].fromCompletableFuture(
+      Async[F].delay(client.transactWriteItems(request).toCompletableFuture),
+    ).as(true).recover { case _: TransactionCanceledException => false }
 
   private def jitteredBackoff(attempt: Int): F[Unit] =
-    val baseMs = math.min(1L << attempt, 64L) // 1, 2, 4, 8, 16, 32, 64 cap
+    val baseMs = math.min(1L << attempt, 64L)
     Async[F].delay(scala.util.Random.nextLong(baseMs + 1))
       .flatMap(jitter => Async[F].sleep(jitter.millis))
-
-  private def attemptConditionalUpdate(
-      pk: String,
-      inputTokens: Long,
-      outputTokens: Long,
-      windowStart: Long,
-      newVersion: Long,
-      expectedVersion: Long,
-      ttl: Long,
-  ): F[Boolean] =
-    val item = Map(
-      "pk" -> attr(pk),
-      "input_tokens" -> attrN(inputTokens),
-      "output_tokens" -> attrN(outputTokens),
-      "window_start" -> attrN(windowStart),
-      "version" -> attrN(newVersion),
-      "ttl" -> attrN(ttl),
-    )
-    val request = PutItemRequest.builder().tableName(tableName).item(item.asJava)
-      .conditionExpression("version = :expectedVersion")
-      .expressionAttributeValues(
-        Map(":expectedVersion" -> attrN(expectedVersion)).asJava,
-      ).build()
-
-    conditionalPut(client, request)
-
-  private def attemptCreateNew(
-      pk: String,
-      inputTokens: Long,
-      outputTokens: Long,
-      windowStart: Long,
-      ttl: Long,
-  ): F[Boolean] =
-    val item = Map(
-      "pk" -> attr(pk),
-      "input_tokens" -> attrN(inputTokens),
-      "output_tokens" -> attrN(outputTokens),
-      "window_start" -> attrN(windowStart),
-      "version" -> attrN(1L),
-      "ttl" -> attrN(ttl),
-    )
-    val request = PutItemRequest.builder().tableName(tableName).item(item.asJava)
-      .conditionExpression("attribute_not_exists(pk)").build()
-
-    conditionalPut(client, request)
 
   private def parseState(
       item: Map[String, AttributeValue],
@@ -211,12 +189,6 @@ class DynamoDBTokenQuotaStore[F[_]: Async](
     catch
       case e: NumberFormatException =>
         Left(s"malformed numeric attribute: ${e.getMessage}")
-
-  private def isWithinWindow(
-      windowStart: Long,
-      nowMs: Long,
-      windowSec: Long,
-  ): Boolean = nowMs - windowStart < windowSec * 1000
 
 object DynamoDBTokenQuotaStore:
   def apply[F[_]: Async](

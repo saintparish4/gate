@@ -327,7 +327,7 @@ object Scenarios:
   // ------------------------------------------------------------------
 
   /**
-   * correctness: runs two invariants and exits non-zero on any violation.
+   * correctness: runs three invariants and exits non-zero on any violation.
    *
    * Invariant A — token-bucket non-over-issue:
    *   Server must never issue more tokens than capacity + refillRate * duration.
@@ -339,6 +339,12 @@ object Scenarios:
    *   For K=10 shared keys, N=50 parallel clients must never observe more than
    *   one "new" response per key. No HTTP errors, no 409 conflicts (same body).
    *   Assert: created_count == K and error_count == 0 and conflict_count == 0.
+   *
+   * Invariant C — token-quota non-over-admission:
+   *   N=50 parallel clients each ask for 25,000 tokens against one user whose
+   *   limit is 1,000,000 (the default), so at most 40 checks may be admitted.
+   *   Requires TOKEN_QUOTA_ENABLED=true on the server.
+   *   Assert: admitted * 25,000 <= 1,000,000, at least one 429, no HTTP errors.
    */
   def correctness(client: Client[IO], baseUrl: String): IO[ExitCode] =
     val runId = System.currentTimeMillis.toString
@@ -346,7 +352,8 @@ object Scenarios:
       _  <- Console[IO].println(s"=== correctness — run $runId ===")
       a  <- invariantA_tokenBucketNonOverIssue(client, baseUrl, runId)
       b  <- invariantB_idempotencyExactlyOneCreated(client, baseUrl, runId)
-      ok  = a.passed && b.passed
+      c  <- invariantC_quotaNonOverAdmission(client, baseUrl, runId)
+      ok  = a.passed && b.passed && c.passed
       _  <- Console[IO].println(
               s"""
                  |=== Correctness Results ===
@@ -354,6 +361,8 @@ object Scenarios:
                  |     ${a.details}
                  |  B) Idempotency exactly-one-Created : ${if b.passed then "PASS" else "FAIL"}
                  |     ${b.details}
+                 |  C) Token quota non-over-admission  : ${if c.passed then "PASS" else "FAIL"}
+                 |     ${c.details}
                  |
                  |Overall: ${if ok then "PASS" else "FAIL"}
                  |""".stripMargin
@@ -462,6 +471,61 @@ object Scenarios:
         else
           val errSection = if e > 0 then s"\n     Sample errors:\n${sampler.render}" else ""
           s"VIOLATION: created=$c (expected $K), conflicts=$cf (expected 0), errors=$e (expected 0), duplicates=${duplicate.get}$errSection"
+      IO.pure(InvariantResult(pass, why))
+    }
+
+  private def invariantC_quotaNonOverAdmission(
+    client:  Client[IO],
+    baseUrl: String,
+    runId:   String,
+  ): IO[InvariantResult] =
+    val concurrency  = 50
+    val durationSecs = 20
+    val userLimit    = 1_000_000L   // TOKEN_QUOTA_USER_LIMIT default
+    val perRequest   = 25_000L      // 40 admissions fill the window exactly
+    val maxAdmitted  = userLimit / perRequest
+    val userId       = s"correctness:C:$runId"
+
+    val total     = new AtomicLong(0)
+    val admitted  = new AtomicLong(0)
+    val rejected  = new AtomicLong(0)
+    val contended = new AtomicLong(0)
+    val errors    = new AtomicLong(0)
+    val sampler   = new ErrorSampler(5)
+
+    Console[IO].println(
+      s"""-- Invariant C — token-quota non-over-admission --
+         |  userId        = $userId
+         |  concurrency   = $concurrency
+         |  duration      = ${durationSecs}s
+         |  userLimit     = $userLimit
+         |  perRequest    = $perRequest
+         |  maxAdmitted   = $maxAdmitted
+         |""".stripMargin
+    ) *>
+    IO.race(
+      progressTicker("invariantC", durationSecs, total, admitted, rejected, errors, okLabel = "admitted", nokLabel = "rejected"),
+      (0 until concurrency).toList.parTraverse_ { _ =>
+        sendQuotaCheck(client, baseUrl, userId, perRequest).flatMap {
+          case Right("allowed")   => IO { total.incrementAndGet(); admitted.incrementAndGet() }
+          case Right("exceeded")  => IO { total.incrementAndGet(); rejected.incrementAndGet() }
+          case Right("contended") => IO { total.incrementAndGet(); contended.incrementAndGet() }
+          case Right(other)       => IO { total.incrementAndGet(); errors.incrementAndGet(); sampler.record(s"unexpected outcome: $other") }
+          case Left(msg)          => IO { total.incrementAndGet(); errors.incrementAndGet(); sampler.record(msg) }
+        }.loop
+      }
+    ) *> IO.defer {
+      val adm    = admitted.get
+      val rej    = rejected.get
+      val con    = contended.get
+      val e      = errors.get
+      val tokens = adm * perRequest
+      val pass   = tokens <= userLimit && rej > 0 && e == 0
+      val why =
+        if pass then s"admitted=$adm ($tokens tokens) <= userLimit=$userLimit, rejected=$rej, contended=$con, errors=$e"
+        else if e > 0 then s"errors=$e (admitted=$adm, rejected=$rej, contended=$con)\n     Sample errors:\n${sampler.render}"
+        else if rej == 0 then s"VACUOUS: limit never reached (admitted=$adm, contended=$con) — quotas disabled or stack too slow"
+        else s"OVER-ADMISSION: admitted=$adm ($tokens tokens) > userLimit=$userLimit (rejected=$rej, contended=$con)"
       IO.pure(InvariantResult(pass, why))
     }
 
@@ -747,6 +811,28 @@ object Http:
           Right("conflict")
         else
           Left(s"HTTP ${resp.status.code}: $body")
+      }
+    }.handleError(e => Left(e.getMessage))
+
+  /** Right("allowed" | "exceeded" | "contended") for the three decision outcomes; Left for anything else. */
+  def sendQuotaCheck(client: Client[IO], baseUrl: String, userId: String, estimatedInputTokens: Long): IO[Either[String, String]] =
+    val body = Json.obj("userId" := userId, "estimatedInputTokens" := estimatedInputTokens)
+    val req  = Request[IO](
+      method  = Method.POST,
+      uri     = Uri.unsafeFromString(s"$baseUrl/v1/quota/check"),
+      headers = Headers(
+        "Content-Type"  -> "application/json",
+        "Authorization" -> s"Bearer ${LoadSim.defaultApiKey}",
+      ),
+    ).withEntity(body.noSpaces)
+
+    client.run(req).use { resp =>
+      resp.as[String].map { body =>
+        resp.status.code match
+          case 200  => Right("allowed")
+          case 429  => Right("exceeded")
+          case 503  => Right("contended")
+          case code => Left(s"HTTP $code: $body")
       }
     }.handleError(e => Left(e.getMessage))
 
