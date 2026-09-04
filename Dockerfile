@@ -40,12 +40,12 @@ RUN sbt universal:stage
 FROM eclipse-temurin:17-jre-jammy AS runtime
 
 # Add metadata labels (2025 standard: OCI labels)
-LABEL org.opencontainers.image.title="Rate Limiter Platform" \
-      org.opencontainers.image.description="Scala-based rate limiting and idempotency service" \
+LABEL org.opencontainers.image.title="Keyra" \
+      org.opencontainers.image.description="Distributed rate limiting, token quotas, and idempotency for AI gateways" \
       org.opencontainers.image.version="0.1.0-SNAPSHOT" \
-      org.opencontainers.image.authors="scalax" \
-      org.opencontainers.image.source="https://github.com/yourorg/scalax" \
-      maintainer="scalax"
+      org.opencontainers.image.authors="Sharif Parish" \
+      org.opencontainers.image.source="https://github.com/saintparish4/keyra" \
+      maintainer="Sharif Parish"
 
 # Install curl for health checks
 RUN apt-get update && \
@@ -95,4 +95,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
 # Use the startup script from sbt-native-packager
 # The script name matches the project name from build.sbt
 # It handles classpath and JVM options properly
-ENTRYPOINT ["./bin/scalax"]
+ENTRYPOINT ["./bin/keyra"]

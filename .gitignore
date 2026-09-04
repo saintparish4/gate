@@ -91,3 +91,11 @@ tfplan*
 docs/DEPLOYMENT.md
 docs/RUNBOOK.md
 TESTING_DASHBOARD.md
+
+# Local-only tooling and notes
+CLAUDE.md
+.claude/
+base/
+
+# Windows alternate-data-stream markers that WSL exposes as files
+*:Zone.Identifier
