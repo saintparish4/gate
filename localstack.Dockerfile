@@ -1,4 +1,5 @@
-FROM localstack/localstack
+# Pinned: `latest` (2026.x) exits with code 55 unless a paid auth token is set.
+FROM localstack/localstack:4.14.0
 
 # Copy init script to a path that is not overwritten by the base image at
 # runtime (e.g. anonymous volume on /etc/localstack/init). The entrypoint
