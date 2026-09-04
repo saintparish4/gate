@@ -5,29 +5,29 @@ import java.util.concurrent.atomic.AtomicReference
 
 import scala.concurrent.duration.*
 
+import org.http4s.*
+import org.http4s.circe.CirceEntityDecoder.*
+import org.http4s.circe.CirceEntityEncoder.*
+import org.http4s.implicits.*
 import org.scalatest.freespec.AsyncFreeSpec
 import org.scalatest.matchers.should.Matchers
+import org.typelevel.log4cats.Logger
+import org.typelevel.log4cats.noop.NoOpLogger
+import org.typelevel.otel4s.trace.Tracer
 
 import cats.effect.*
 import cats.effect.testing.scalatest.AsyncIOSpec
 import cats.syntax.all.*
 import io.circe.generic.auto.*
 import io.circe.syntax.*
-import org.http4s.*
-import org.http4s.circe.CirceEntityDecoder.*
-import org.http4s.circe.CirceEntityEncoder.*
-import org.http4s.implicits.*
-import org.typelevel.log4cats.Logger
-import org.typelevel.log4cats.noop.NoOpLogger
-import org.typelevel.otel4s.trace.Tracer
-
 import config.*
 import core.*
 import events.*
 import observability.MetricsPublisher
 import security.*
 
-class AuditEventIntegrationSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
+class AuditEventIntegrationSpec
+    extends AsyncFreeSpec with AsyncIOSpec with Matchers:
 
   given Logger[IO] = NoOpLogger[IO]
   given Tracer[IO] = Tracer.noop[IO]
@@ -42,8 +42,8 @@ class AuditEventIntegrationSpec extends AsyncFreeSpec with AsyncIOSpec with Matc
           captured.updateAndGet(event :: _)
           ()
         }
-        def publishBatch(events: List[RateLimitEvent]): IO[Unit] =
-          events.traverse_(publish)
+        def publishBatch(events: List[RateLimitEvent]): IO[Unit] = events
+          .traverse_(publish)
         def healthCheck: IO[Either[String, Unit]] = IO.pure(Right(()))
 
       val config = RateLimitConfig(

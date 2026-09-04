@@ -27,11 +27,11 @@ class InMemoryIdempotencyStore[F[_]: Temporal](
         stateMap.get(idempotencyKey) match
           case Some(record) => record.status match
               case IdempotencyStatus.Pending =>
-                val conflict = for
-                  incoming <- requestHash
-                  stored   <- record.requestHash
-                  if incoming != stored
-                yield ()
+                val conflict =
+                  for
+                    incoming <- requestHash
+                    stored <- record.requestHash if incoming != stored
+                  yield ()
                 conflict match
                   case Some(_) => (
                       stateMap,
@@ -43,14 +43,15 @@ class InMemoryIdempotencyStore[F[_]: Temporal](
                     )
                   case None => (
                       stateMap,
-                      IdempotencyResult.InProgress(idempotencyKey, record.createdAt),
+                      IdempotencyResult
+                        .InProgress(idempotencyKey, record.createdAt),
                     )
               case IdempotencyStatus.Completed =>
-                val conflict = for
-                  incoming <- requestHash
-                  stored   <- record.requestHash
-                  if incoming != stored
-                yield ()
+                val conflict =
+                  for
+                    incoming <- requestHash
+                    stored <- record.requestHash if incoming != stored
+                  yield ()
                 conflict match
                   case Some(_) => (
                       stateMap,

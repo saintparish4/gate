@@ -1,10 +1,8 @@
 package resilience
 
-import scala.concurrent.duration.DurationInt
 import scala.concurrent.duration.*
 
-import org.scalacheck.Gen
-import org.scalacheck.Shrink
+import org.scalacheck.{Gen, Shrink}
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.should.Matchers
 import org.scalatestplus.scalacheck.ScalaCheckPropertyChecks
@@ -13,7 +11,8 @@ class RetryPolicyPropertySpec
     extends AnyFreeSpec with ScalaCheckPropertyChecks with Matchers:
 
   // Shrink toward 1 so we never try base=0 (RetryPolicy requires baseDelay > 0)
-  private given Shrink[Int] = Shrink(n => if n <= 1 then Stream.empty else Stream(n / 2).filter(_ >= 1))
+  private given Shrink[Int] =
+    Shrink(n => if n <= 1 then Stream.empty else Stream(n / 2).filter(_ >= 1))
 
   val genBaseDelayMs: Gen[Int] = Gen.choose(1, 1000)
   val genAttempt: Gen[Int] = Gen.choose(1, 50)
@@ -66,12 +65,10 @@ class RetryPolicyPropertySpec
     "RetryPolicy rejects invalid configurations" - {
 
       "maxDelay < baseDelay throws" in forAll(Gen.choose(2, 100))(base =>
-        whenever(base >= 2) {
-          forAll(Gen.choose(1, base - 1))(tooSmall =>
-            an[IllegalArgumentException] should be thrownBy
-              RetryPolicy(baseDelay = base.millis, maxDelay = tooSmall.millis),
-          )
-        },
+        whenever(base >= 2)(forAll(Gen.choose(1, base - 1))(tooSmall =>
+          an[IllegalArgumentException] should be thrownBy
+            RetryPolicy(baseDelay = base.millis, maxDelay = tooSmall.millis),
+        )),
       )
 
       "multiplier < 1.0 throws" in

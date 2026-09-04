@@ -10,6 +10,7 @@ import org.scalatest.matchers.should.Matchers
 import org.typelevel.ci.*
 import org.typelevel.log4cats.Logger
 import org.typelevel.log4cats.slf4j.Slf4jLogger
+import org.typelevel.otel4s.trace.Tracer.Implicits.noop
 
 import api.{
   DashboardApi, RateLimitCheckResponse, RateLimitStatusResponse, Routes,
@@ -26,7 +27,6 @@ import cats.effect.IO
 import cats.effect.testing.scalatest.AsyncIOSpec
 import cats.effect.unsafe.implicits.global
 import cats.syntax.all.*
-import org.typelevel.otel4s.trace.Tracer.Implicits.noop
 import io.circe.generic.auto.*
 import io.circe.parser.*
 

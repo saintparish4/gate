@@ -205,44 +205,62 @@ class DynamoDBIdempotencyStoreIntegrationSpec
 
     "should return KeyConflict for same key with different request hash" in {
       val test = for {
-        _ <- store.check("hash-key-1", clientId = "client-1", ttlSeconds = 3600,
-          requestHash = Some("hash-aaa"))
-        result <- store.check("hash-key-1", clientId = "client-1", ttlSeconds = 3600,
-          requestHash = Some("hash-bbb"))
+        _ <- store.check(
+          "hash-key-1",
+          clientId = "client-1",
+          ttlSeconds = 3600,
+          requestHash = Some("hash-aaa"),
+        )
+        result <- store.check(
+          "hash-key-1",
+          clientId = "client-1",
+          ttlSeconds = 3600,
+          requestHash = Some("hash-bbb"),
+        )
       } yield result
 
-      test.asserting { result =>
-        result shouldBe a[IdempotencyResult.KeyConflict]
-      }
+      test.asserting(result => result shouldBe a[IdempotencyResult.KeyConflict])
     }
 
     "should return InProgress for same key with matching request hash" in {
       val test = for {
-        _ <- store.check("hash-key-2", clientId = "client-1", ttlSeconds = 3600,
-          requestHash = Some("hash-same"))
-        result <- store.check("hash-key-2", clientId = "client-1", ttlSeconds = 3600,
-          requestHash = Some("hash-same"))
+        _ <- store.check(
+          "hash-key-2",
+          clientId = "client-1",
+          ttlSeconds = 3600,
+          requestHash = Some("hash-same"),
+        )
+        result <- store.check(
+          "hash-key-2",
+          clientId = "client-1",
+          ttlSeconds = 3600,
+          requestHash = Some("hash-same"),
+        )
       } yield result
 
-      test.asserting { result =>
-        result shouldBe a[IdempotencyResult.InProgress]
-      }
+      test.asserting(result => result shouldBe a[IdempotencyResult.InProgress])
     }
 
     "should handle concurrent same-key different-body" in {
       val test = for {
         results <- (1 to 10).toList.parTraverse(i =>
-          store.check("conflict-int-key", clientId = "client-1", ttlSeconds = 3600,
-            requestHash = Some(s"body-$i"))
+          store.check(
+            "conflict-int-key",
+            clientId = "client-1",
+            ttlSeconds = 3600,
+            requestHash = Some(s"body-$i"),
+          ),
         )
         newCount = results.count(_.isInstanceOf[IdempotencyResult.New])
-        conflictCount = results.count(_.isInstanceOf[IdempotencyResult.KeyConflict])
-        inProgressCount = results.count(_.isInstanceOf[IdempotencyResult.InProgress])
+        conflictCount = results
+          .count(_.isInstanceOf[IdempotencyResult.KeyConflict])
+        inProgressCount = results
+          .count(_.isInstanceOf[IdempotencyResult.InProgress])
       } yield (newCount, conflictCount, inProgressCount)
 
       test.asserting { case (newCount, conflictCount, inProgressCount) =>
         newCount shouldBe 1
-        (conflictCount + inProgressCount) shouldBe 9
+        conflictCount + inProgressCount shouldBe 9
       }
     }
   }

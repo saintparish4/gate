@@ -48,12 +48,16 @@ class RateLimitApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
       config: RateLimitConfig = configWithProfiles,
       events: EventPublisher[IO] = EventPublisher.noop[IO],
       metrics: MetricsPublisher[IO] = MetricsPublisher.noop[IO],
-  ): IO[RateLimitApi[IO]] = InMemoryRateLimitStore.create[IO]
-    .map(store =>
-      RateLimitApi[IO](store, events, metrics, config, Logger[IO], () =>
-        IO.pure("test-request-id"),
-      ),
-    )
+  ): IO[RateLimitApi[IO]] = InMemoryRateLimitStore.create[IO].map(store =>
+    RateLimitApi[IO](
+      store,
+      events,
+      metrics,
+      config,
+      Logger[IO],
+      () => IO.pure("test-request-id"),
+    ),
+  )
 
   def postCheckRequest(
       key: String,
@@ -108,9 +112,9 @@ class RateLimitApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
     "falls back to config defaults when tier has no named profile" in {
       // Premium tier has no named profile in configWithProfiles; uses defaults (50 cap).
       val premiumClient = testClient.copy(tier = ClientTier.Premium)
-      makeApi()
-        .flatMap(api => api.check(postCheckRequest("admin-key", 1), premiumClient))
-        .asserting((r: Response[IO]) => r.status.shouldBe(Status.Ok))
+      makeApi().flatMap(api =>
+        api.check(postCheckRequest("admin-key", 1), premiumClient),
+      ).asserting((r: Response[IO]) => r.status.shouldBe(Status.Ok))
     }
 
     "Allowed response carries X-RateLimit-* headers" in makeApi()

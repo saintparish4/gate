@@ -14,6 +14,7 @@ import org.scalatest.matchers.should.Matchers
 import org.typelevel.ci.*
 import org.typelevel.log4cats.Logger
 import org.typelevel.log4cats.noop.NoOpLogger
+import org.typelevel.otel4s.trace.Tracer.Implicits.noop
 
 import config.*
 import core.*
@@ -26,7 +27,6 @@ import testutil.*
 import cats.effect.*
 import cats.effect.testing.scalatest.AsyncIOSpec
 import cats.syntax.all.*
-import org.typelevel.otel4s.trace.Tracer.Implicits.noop
 import io.circe.parser.*
 import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient
 import software.amazon.awssdk.services.dynamodb.model.*
@@ -216,7 +216,8 @@ class DynamoDBStoreErrorSpec
         metricNames <- Ref.of[IO, List[String]](Nil)
         metricsPublisher = capturingMetrics(metricNames)
         given Logger[IO] = capturingLogger(errorLogs)
-        store = DynamoDBRateLimitStore[IO](client, "test-table", metricsPublisher)
+        store =
+          DynamoDBRateLimitStore[IO](client, "test-table", metricsPublisher)
         decision <- store.checkAndConsume(key, cost = 1, testProfile)
 
         logs <- errorLogs.get

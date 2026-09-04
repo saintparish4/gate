@@ -130,10 +130,18 @@ class InMemoryIdempotencyStoreSpec
     "should return KeyConflict when request hash doesn't match (pending)" in {
       val test = for {
         store <- InMemoryIdempotencyStore.create[IO]
-        _ <- store.check("hash-key", clientId = "client-1", ttlSeconds = 3600,
-          requestHash = Some("abc123"))
-        result <- store.check("hash-key", clientId = "client-1", ttlSeconds = 3600,
-          requestHash = Some("different-hash"))
+        _ <- store.check(
+          "hash-key",
+          clientId = "client-1",
+          ttlSeconds = 3600,
+          requestHash = Some("abc123"),
+        )
+        result <- store.check(
+          "hash-key",
+          clientId = "client-1",
+          ttlSeconds = 3600,
+          requestHash = Some("different-hash"),
+        )
       } yield result
 
       test.asserting { result =>
@@ -146,33 +154,49 @@ class InMemoryIdempotencyStoreSpec
 
     "should return KeyConflict when request hash doesn't match (completed)" in {
       val now = Instant.now()
-      val response = StoredResponse(201, """{"id": 1}""", Map.empty, completedAt = now)
+      val response =
+        StoredResponse(201, """{"id": 1}""", Map.empty, completedAt = now)
 
       val test = for {
         store <- InMemoryIdempotencyStore.create[IO]
-        _ <- store.check("hash-complete-key", clientId = "client-1", ttlSeconds = 3600,
-          requestHash = Some("original-hash"))
+        _ <- store.check(
+          "hash-complete-key",
+          clientId = "client-1",
+          ttlSeconds = 3600,
+          requestHash = Some("original-hash"),
+        )
         _ <- store.storeResponse("hash-complete-key", response)
-        result <- store.check("hash-complete-key", clientId = "client-1", ttlSeconds = 3600,
-          requestHash = Some("different-hash"))
+        result <- store.check(
+          "hash-complete-key",
+          clientId = "client-1",
+          ttlSeconds = 3600,
+          requestHash = Some("different-hash"),
+        )
       } yield result
 
-      test.asserting { result =>
-        result shouldBe a[IdempotencyResult.KeyConflict]
-      }
+      test.asserting(result => result shouldBe a[IdempotencyResult.KeyConflict])
     }
 
     "should return Duplicate when request hash matches" in {
       val now = Instant.now()
-      val response = StoredResponse(201, """{"id": 1}""", Map.empty, completedAt = now)
+      val response =
+        StoredResponse(201, """{"id": 1}""", Map.empty, completedAt = now)
 
       val test = for {
         store <- InMemoryIdempotencyStore.create[IO]
-        _ <- store.check("hash-match-key", clientId = "client-1", ttlSeconds = 3600,
-          requestHash = Some("same-hash"))
+        _ <- store.check(
+          "hash-match-key",
+          clientId = "client-1",
+          ttlSeconds = 3600,
+          requestHash = Some("same-hash"),
+        )
         _ <- store.storeResponse("hash-match-key", response)
-        result <- store.check("hash-match-key", clientId = "client-1", ttlSeconds = 3600,
-          requestHash = Some("same-hash"))
+        result <- store.check(
+          "hash-match-key",
+          clientId = "client-1",
+          ttlSeconds = 3600,
+          requestHash = Some("same-hash"),
+        )
       } yield result
 
       test.asserting { result =>
@@ -185,15 +209,21 @@ class InMemoryIdempotencyStoreSpec
     "should return InProgress when no hash provided and record has hash" in {
       val test = for {
         store <- InMemoryIdempotencyStore.create[IO]
-        _ <- store.check("no-hash-key", clientId = "client-1", ttlSeconds = 3600,
-          requestHash = Some("stored-hash"))
-        result <- store.check("no-hash-key", clientId = "client-1", ttlSeconds = 3600,
-          requestHash = None)
+        _ <- store.check(
+          "no-hash-key",
+          clientId = "client-1",
+          ttlSeconds = 3600,
+          requestHash = Some("stored-hash"),
+        )
+        result <- store.check(
+          "no-hash-key",
+          clientId = "client-1",
+          ttlSeconds = 3600,
+          requestHash = None,
+        )
       } yield result
 
-      test.asserting { result =>
-        result shouldBe a[IdempotencyResult.InProgress]
-      }
+      test.asserting(result => result shouldBe a[IdempotencyResult.InProgress])
     }
 
     "health check should return true" in {

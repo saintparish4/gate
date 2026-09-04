@@ -7,11 +7,10 @@ import org.scalatest.freespec.AsyncFreeSpec
 import org.scalatest.matchers.should.Matchers
 import org.typelevel.log4cats.Logger
 import org.typelevel.log4cats.slf4j.Slf4jLogger
-import software.amazon.awssdk.services.dynamodb.model.{
-  AttributeValue,
-  PutItemRequest,
-}
 
+import software.amazon.awssdk.services.dynamodb.model.{
+  AttributeValue, PutItemRequest,
+}
 import core.TokenQuotaState
 import storage.DynamoDBTokenQuotaStore
 import observability.MetricsPublisher
@@ -21,9 +20,10 @@ import cats.syntax.all.*
 
 /** Integration tests for DynamoDBTokenQuotaStore.
   *
-  * Uses LocalStack/TestContainers. Tests: getQuota (missing/corrupt), incrementQuota
-  * (new window, accumulate, new window after expiry), OCC under concurrency,
-  * healthCheck. Requires Docker. Without Docker, run unit tests only: sbt unitTest
+  * Uses LocalStack/TestContainers. Tests: getQuota (missing/corrupt),
+  * incrementQuota (new window, accumulate, new window after expiry), OCC under
+  * concurrency, healthCheck. Requires Docker. Without Docker, run unit tests
+  * only: sbt unitTest
   */
 @Integration
 class DynamoDBTokenQuotaStoreIntegrationSpec
@@ -56,8 +56,8 @@ class DynamoDBTokenQuotaStoreIntegrationSpec
 
   "DynamoDBTokenQuotaStore" - {
 
-    "getQuota returns None for missing key" in
-      store.getQuota("user:u999:3600s").asserting(_ shouldBe None)
+    "getQuota returns None for missing key" in store.getQuota("user:u999:3600s")
+      .asserting(_ shouldBe None)
 
     "incrementQuota creates a new window on first call" in {
       val pk = "user:u1:3600s"
@@ -71,14 +71,12 @@ class DynamoDBTokenQuotaStoreIntegrationSpec
 
       test.asserting { case (ok, state) =>
         ok shouldBe true
-        state shouldBe Some(
-          TokenQuotaState(
-            inputTokens = 10L,
-            outputTokens = 20L,
-            windowStart = nowMs,
-            version = 1L,
-          ),
-        )
+        state shouldBe Some(TokenQuotaState(
+          inputTokens = 10L,
+          outputTokens = 20L,
+          windowStart = nowMs,
+          version = 1L,
+        ))
       }
     }
 
@@ -93,16 +91,14 @@ class DynamoDBTokenQuotaStoreIntegrationSpec
         state <- store.getQuota(pk)
       } yield state
 
-      test.asserting { state =>
-        state shouldBe Some(
-          TokenQuotaState(
-            inputTokens = 130L,
-            outputTokens = 70L,
-            windowStart = nowMs,
-            version = 2L,
-          ),
-        )
-      }
+      test.asserting(state =>
+        state shouldBe Some(TokenQuotaState(
+          inputTokens = 130L,
+          outputTokens = 70L,
+          windowStart = nowMs,
+          version = 2L,
+        )),
+      )
     }
 
     "incrementQuota starts new window when previous expires" in {
@@ -124,12 +120,8 @@ class DynamoDBTokenQuotaStoreIntegrationSpec
       } yield (oldState, newState)
 
       test.asserting { case (oldState, newState) =>
-        oldState shouldBe Some(
-          TokenQuotaState(100L, 100L, windowStartMs, 1L),
-        )
-        newState shouldBe Some(
-          TokenQuotaState(5L, 5L, nowMs, 1L),
-        )
+        oldState shouldBe Some(TokenQuotaState(100L, 100L, windowStartMs, 1L))
+        newState shouldBe Some(TokenQuotaState(5L, 5L, nowMs, 1L))
       }
     }
 
@@ -140,16 +132,15 @@ class DynamoDBTokenQuotaStoreIntegrationSpec
       val n = 20
 
       val test = for {
-        _ <- (1 to n).toList.parTraverse(_ =>
-          store.incrementQuota(pk, 1L, 1L, windowSec, nowMs),
-        )
+        _ <- (1 to n).toList
+          .parTraverse(_ => store.incrementQuota(pk, 1L, 1L, windowSec, nowMs))
         state <- store.getQuota(pk)
       } yield state
 
       test.asserting { state =>
         state shouldBe defined
         val s = state.get
-        (s.inputTokens + s.outputTokens) shouldBe (n * 2L)
+        s.inputTokens + s.outputTokens shouldBe n * 2L
       }
     }
 
@@ -159,11 +150,8 @@ class DynamoDBTokenQuotaStoreIntegrationSpec
         "pk" -> AttributeValue.builder().s(pk).build(),
         // omit input_tokens, output_tokens, window_start, version so parseState fails
       )
-      val request = PutItemRequest
-        .builder()
-        .tableName(tokenQuotaTableName)
-        .item(item.asJava)
-        .build()
+      val request = PutItemRequest.builder().tableName(tokenQuotaTableName)
+        .item(item.asJava).build()
       dynamoDbClient.putItem(request).get()
 
       store.getQuota(pk).asserting(_ shouldBe None)
