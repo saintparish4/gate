@@ -7,8 +7,8 @@ import scala.jdk.CollectionConverters.*
 
 import org.scalatest.freespec.AsyncFreeSpec
 import org.scalatest.matchers.should.Matchers
-
 import org.typelevel.log4cats.Logger
+
 import testutil.*
 import cats.effect.*
 import cats.effect.testing.scalatest.AsyncIOSpec
@@ -73,9 +73,10 @@ class LeakyBucketStoreErrorSpec
         case (decision, logs, recorded) =>
           decision shouldBe a[RateLimitDecision.Allowed]
 
-          logs.exists(msg =>
-            msg.contains(key) && msg.contains("Corrupt"),
-          ) shouldBe true
+          logs
+            .exists(msg =>
+              msg.contains(key) && msg.contains("Corrupt"),
+            ) shouldBe true
 
           recorded should contain("CorruptStateRead")
       }

@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Scala](https://img.shields.io/badge/scala-3.7.4-red.svg)](https://www.scala-lang.org/)
-[![CI](https://github.com/your-org/scalax/workflows/CI/badge.svg)](https://github.com/your-org/scalax/actions)
+[![CI](https://github.com/saintparish4/keyra/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/saintparish4/keyra/actions/workflows/ci.yml)
 
 A distributed rate limiter, idempotency service, and token quota engine built with Scala 3, Cats Effect, and DynamoDB. Enforces per-key request limits and multi-level LLM token quotas correctly across multiple stateless instances — without a lock service.
 
@@ -634,8 +634,8 @@ The rate-limit store is wrapped with a layered resilience stack (configured via 
 
 ```bash
 # Clone repository
-git clone https://github.com/your-org/scala-rate-limiter.git
-cd scala-rate-limiter
+git clone https://github.com/saintparish4/keyra.git
+cd keyra
 
 # Start local environment (LocalStack)
 docker-compose up -d

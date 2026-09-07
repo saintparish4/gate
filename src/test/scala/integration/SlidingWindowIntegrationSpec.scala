@@ -36,12 +36,11 @@ class SlidingWindowIntegrationSpec
     ttlSeconds = 60L,
   )
 
-  lazy val store: DynamoDBSlidingWindowStore[IO] =
-    DynamoDBSlidingWindowStore[IO](
-      dynamoDbClient,
-      testDynamoDBConfig.rateLimitTable,
-      MetricsPublisher.noop[IO],
-    )
+  lazy val store: DynamoDBSlidingWindowStore[IO] = DynamoDBSlidingWindowStore[IO](
+    dynamoDbClient,
+    testDynamoDBConfig.rateLimitTable,
+    MetricsPublisher.noop[IO],
+  )
 
   override protected def beforeEach(): Unit = {
     super.beforeEach()

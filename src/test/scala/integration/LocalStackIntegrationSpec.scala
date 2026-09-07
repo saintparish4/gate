@@ -33,9 +33,11 @@ import software.amazon.awssdk.services.kinesis.model.{
 trait LocalStackIntegrationSpec extends BeforeAndAfterAll {
   self: Suite =>
 
+  // I pin the image because `latest` (2026.x) refuses to start without a paid auth token.
   protected lazy val localstack: LocalStackContainer = {
-    val container =
-      new LocalStackContainer(DockerImageName.parse("localstack/localstack"))
+    val container = new LocalStackContainer(
+      DockerImageName.parse(LocalStackIntegrationSpec.Image),
+    )
     container.withServices(Service.DYNAMODB, Service.KINESIS)
     container
   }
@@ -187,4 +189,8 @@ trait LocalStackIntegrationSpec extends BeforeAndAfterAll {
       dynamoDbClient.deleteItem(deleteRequest).get()
     }
   }
+}
+
+object LocalStackIntegrationSpec {
+  val Image = "localstack/localstack:4.14.0"
 }

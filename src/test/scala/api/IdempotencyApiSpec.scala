@@ -9,6 +9,7 @@ import org.scalatest.freespec.AsyncFreeSpec
 import org.scalatest.matchers.should.Matchers
 import org.typelevel.ci.*
 import org.typelevel.log4cats.Logger
+import org.typelevel.otel4s.trace.Tracer.Implicits.noop
 
 import config.IdempotencyConfig
 import core.*
@@ -20,7 +21,6 @@ import cats.effect.*
 import cats.effect.testing.scalatest.AsyncIOSpec
 import cats.syntax.all.*
 import io.circe.parser.*
-import org.typelevel.otel4s.trace.Tracer.Implicits.noop
 
 /** Unit tests for IdempotencyApi: TTL capping and warning when client TTL
   * exceeds max.

@@ -493,6 +493,6 @@ The API uses URL-based versioning (e.g., `/v1/`). Breaking changes will incremen
 
 ## Support
 
-**Issues:** [GitHub Issues](https://github.com/your-org/scala-rate-limiter/issues)  
+**Issues:** [GitHub Issues](https://github.com/saintparish4/keyra/issues)  
 
 **Note:** Status page and production documentation are not yet available. This API is currently in development and tested locally only.

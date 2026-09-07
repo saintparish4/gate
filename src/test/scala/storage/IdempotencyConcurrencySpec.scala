@@ -131,21 +131,26 @@ class IdempotencyConcurrencySpec
       val test =
         for
           store <- InMemoryIdempotencyStore.create[IO]
-          results <- IO.parSequenceN(concurrency)(
-            (1 to concurrency).toList.map(i =>
-              store.check("conflict-key", clientId, ttlSeconds,
-                requestHash = Some(s"body-hash-$i")),
-            ),
-          )
+          results <- IO
+            .parSequenceN(concurrency)((1 to concurrency).toList.map(i =>
+              store.check(
+                "conflict-key",
+                clientId,
+                ttlSeconds,
+                requestHash = Some(s"body-hash-$i"),
+              ),
+            ))
           newCount = results.count(_.isInstanceOf[IdempotencyResult.New])
-          conflictCount = results.count(_.isInstanceOf[IdempotencyResult.KeyConflict])
-          inProgressCount = results.count(_.isInstanceOf[IdempotencyResult.InProgress])
+          conflictCount = results
+            .count(_.isInstanceOf[IdempotencyResult.KeyConflict])
+          inProgressCount = results
+            .count(_.isInstanceOf[IdempotencyResult.InProgress])
         yield (newCount, conflictCount, inProgressCount)
 
       test.asserting { case (newCount, conflictCount, inProgressCount) =>
         newCount shouldBe 1
         // Non-winners see either InProgress (same hash by luck) or KeyConflict
-        (conflictCount + inProgressCount) shouldBe concurrency - 1
+        conflictCount + inProgressCount shouldBe concurrency - 1
       }
     }
   }

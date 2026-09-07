@@ -35,22 +35,6 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-sbt-
           
-    - name: Start LocalStack
-      run: |
-        docker compose up -d localstack
-        echo "Waiting for LocalStack to be ready..."
-        for i in $(seq 1 90); do
-          if (curl -sf http://localhost:4566/_localstack/health || true) | grep -qE 'dynamodb.*(running|available)|(running|available).*dynamodb'; then
-            echo "LocalStack ready after ${i} attempts."
-            exit 0
-          fi
-          echo "Attempt $i/90: LocalStack not ready yet..."
-          sleep 2
-        done
-        echo "LocalStack health response:"
-        curl -s http://localhost:4566/_localstack/health || true
-        exit 1
-        
     - name: Check formatting
       run: sbt scalafmtCheckAll
 
@@ -58,24 +42,10 @@ jobs:
       run: sbt compile
 
     - name: Run unit tests
-      run: sbt test
+      run: sbt unitTest
       
     - name: Run integration tests
       run: sbt "testOnly *IntegrationSpec"
-      env:
-        USE_LOCALSTACK: "true"
-        DYNAMODB_ENDPOINT: "http://localhost:4566"
-        KINESIS_ENDPOINT: "http://localhost:4566"
-        AWS_ACCESS_KEY_ID: "test"
-        AWS_SECRET_ACCESS_KEY: "test"
-        AWS_REGION: "us-east-1"
-        
-    - name: Build Docker image
-      run: sbt docker:publishLocal
-      
-    - name: Cleanup
-      if: always()
-      run: docker compose down -v
 
   smoke:
     name: Smoke test
@@ -105,9 +75,6 @@ jobs:
         key: ${{ runner.os }}-sbt-${{ hashFiles('**/*.sbt', '**/project/build.properties') }}
         restore-keys: |
           ${{ runner.os }}-sbt-
-
-    - name: Build Docker image
-      run: sbt docker:publishLocal
 
     - name: Start full stack
       run: docker compose up -d
@@ -172,9 +139,6 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-sbt-
 
-    - name: Build Docker image
-      run: sbt docker:publishLocal
-
     - name: Start full stack
       run: docker compose up -d
       env:
@@ -197,7 +161,7 @@ jobs:
         docker compose logs --tail 200 rate-limiter || true
         exit 1
 
-    - name: Run correctness invariants (A: token-bucket non-over-issue, B: idempotency exactly-one-Created)
+    - name: "Run correctness invariants (A: token-bucket non-over-issue, B: idempotency exactly-one-Created)"
       run: sbt "loadSim/run --scenario correctness"
 
     - name: Cleanup

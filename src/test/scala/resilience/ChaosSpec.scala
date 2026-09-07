@@ -149,10 +149,11 @@ class ChaosSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
           )
         yield results
 
-      TestControl.executeEmbed(test).asserting { (results: List[Either[Throwable, RateLimitDecision]]) =>
-        // With retries and AllowAll degradation, no result should be a Left (propagated error)
-        results.forall(_.isRight).shouldBe(true)
-      }
+      TestControl.executeEmbed(test)
+        .asserting((results: List[Either[Throwable, RateLimitDecision]]) =>
+          // With retries and AllowAll degradation, no result should be a Left (propagated error)
+          results.forall(_.isRight).shouldBe(true),
+        )
     }
 
     "slow DynamoDB responses: timeout fires before retry, degradation kicks in" in {
@@ -230,10 +231,12 @@ class ChaosSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
           yield results,
         )
 
-      TestControl.executeEmbed(test).asserting { (results: List[RateLimitDecision]) =>
-        results.should(have size 10)
-        // AllowAll degradation: all 10 come back as Allowed
-        results.forall(_.isInstanceOf[RateLimitDecision.Allowed]).shouldBe(true)
+      TestControl.executeEmbed(test).asserting {
+        (results: List[RateLimitDecision]) =>
+          results.should(have size 10)
+          // AllowAll degradation: all 10 come back as Allowed
+          results.forall(_.isInstanceOf[RateLimitDecision.Allowed])
+            .shouldBe(true)
       }
     }
   }
