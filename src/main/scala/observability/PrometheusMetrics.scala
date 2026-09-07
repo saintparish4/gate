@@ -113,6 +113,10 @@ object PrometheusMetrics:
             .inc()
         case "TokenQuotaExceeded" => prom.tokenQuotaTotal
             .labels(dimensions.getOrElse("level", "unknown"), "exceeded").inc()
+        case "TokenQuotaContended" => prom.tokenQuotaTotal
+            .labels("all", "contended").inc()
+        case "TokenQuotaReconcileFailed" => prom.tokenQuotaTotal
+            .labels("all", "reconcile_failed").inc()
         case "DroppedKinesisEvent" => prom.eventsDropped.inc()
         case _ => ()
     }

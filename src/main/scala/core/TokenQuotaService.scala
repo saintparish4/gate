@@ -1,9 +1,5 @@
 package core
 
-import java.time.Instant
-
-import scala.concurrent.duration.*
-
 import org.typelevel.log4cats.Logger
 
 import cats.effect.*
@@ -42,6 +38,19 @@ object QuotaDecision:
       retryAfterSeconds: Int,
   ) extends QuotaDecision
 
+  /** The store lost every conditional write in its retry budget. Nothing was
+    * reserved, so the caller should fail closed and retry shortly.
+    */
+  case class Contended(attempts: Int) extends QuotaDecision
+
+sealed trait ReconcileResult
+object ReconcileResult:
+  case class Reconciled(inputDelta: Long, outputDelta: Long)
+      extends ReconcileResult
+
+  /** The adjustment was not recorded; the caller should retry it. */
+  case class Contended(attempts: Int) extends ReconcileResult
+
 case class TokenQuotaState(
     inputTokens: Long,
     outputTokens: Long,
@@ -50,16 +59,103 @@ case class TokenQuotaState(
 ):
   def totalTokens: Long = inputTokens + outputTokens
 
+object TokenQuotaState:
+  def inWindow(s: TokenQuotaState, windowSeconds: Long, nowMs: Long): Boolean =
+    nowMs - s.windowStart < windowSeconds * 1000
+
+  /** Usage that still counts at `nowMs`; a lapsed window contributes nothing.
+    */
+  def usedWithin(
+      current: Option[TokenQuotaState],
+      windowSeconds: Long,
+      nowMs: Long,
+  ): Long = current.filter(inWindow(_, windowSeconds, nowMs)).map(_.totalTokens)
+    .getOrElse(0L)
+
+  /** State after applying the deltas at `nowMs`. A lapsed window starts over
+    * holding only this delta. I keep the version monotonic across rollovers so
+    * a stale writer can never match a freshly reset counter.
+    */
+  def next(
+      current: Option[TokenQuotaState],
+      inputDelta: Long,
+      outputDelta: Long,
+      windowSeconds: Long,
+      nowMs: Long,
+  ): TokenQuotaState =
+    val version = current.map(_.version + 1).getOrElse(1L)
+    current.filter(inWindow(_, windowSeconds, nowMs)) match
+      case Some(s) => TokenQuotaState(
+          clamp(s.inputTokens + inputDelta),
+          clamp(s.outputTokens + outputDelta),
+          s.windowStart,
+          version,
+        )
+      case None =>
+        TokenQuotaState(clamp(inputDelta), clamp(outputDelta), nowMs, version)
+
+  private def clamp(n: Long): Long = math.max(0L, n)
+
+/** One counter a reservation applies to. `limit = None` records the delta
+  * unconditionally, which is what reconciliation needs.
+  */
+case class QuotaTarget(pk: String, windowSeconds: Long, limit: Option[Long])
+
+sealed trait ReserveOutcome
+object ReserveOutcome:
+  /** Every target was written; states are keyed by target pk. */
+  case class Reserved(states: Map[String, TokenQuotaState])
+      extends ReserveOutcome
+
+  /** The delta would push `pk` past its limit; nothing was written. */
+  case class LimitExceeded(pk: String, used: Long, windowStart: Long)
+      extends ReserveOutcome
+
+  /** Conditional writes kept losing; nothing was written. */
+  case class Contended(attempts: Int) extends ReserveOutcome
+
+/** One target's read state and the state a reservation would write. */
+case class PlannedWrite(
+    target: QuotaTarget,
+    before: Option[TokenQuotaState],
+    after: TokenQuotaState,
+)
+
+/** Pure reservation planning shared by every store implementation. */
+object QuotaReservation:
+  /** Computes the post-reservation state for every target, or the first target
+    * in order whose limit the delta would overflow.
+    */
+  def plan(
+      targets: List[QuotaTarget],
+      current: Map[String, TokenQuotaState],
+      inputDelta: Long,
+      outputDelta: Long,
+      nowMs: Long,
+  ): Either[ReserveOutcome.LimitExceeded, List[PlannedWrite]] = targets
+    .traverse { t =>
+      val before = current.get(t.pk)
+      val after = TokenQuotaState
+        .next(before, inputDelta, outputDelta, t.windowSeconds, nowMs)
+      if t.limit.exists(after.totalTokens > _) then
+        Left(ReserveOutcome.LimitExceeded(
+          t.pk,
+          TokenQuotaState.usedWithin(before, t.windowSeconds, nowMs),
+          after.windowStart,
+        ))
+      else Right(PlannedWrite(t, before, after))
+    }
+
 trait TokenQuotaStore[F[_]]:
   def getQuota(pk: String): F[Option[TokenQuotaState]]
 
-  def incrementQuota(
-      pk: String,
-      inputTokensDelta: Long,
-      outputTokensDelta: Long,
-      windowSeconds: Long,
+  /** Applies the deltas to every target or to none of them. */
+  def reserve(
+      targets: List[QuotaTarget],
+      inputDelta: Long,
+      outputDelta: Long,
       nowMs: Long,
-  ): F[Boolean]
+  ): F[ReserveOutcome]
 
   def healthCheck: F[Either[String, Unit]]
 
@@ -70,34 +166,19 @@ object TokenQuotaStore:
         override def getQuota(pk: String): F[Option[TokenQuotaState]] = ref.get
           .map(_.get(pk))
 
-        override def incrementQuota(
-            pk: String,
-            inputTokensDelta: Long,
-            outputTokensDelta: Long,
-            windowSeconds: Long,
+        override def reserve(
+            targets: List[QuotaTarget],
+            inputDelta: Long,
+            outputDelta: Long,
             nowMs: Long,
-        ): F[Boolean] = ref.modify { m =>
-          val current = m.get(pk)
-          val withinWindow = current
-            .exists(s => nowMs - s.windowStart < windowSeconds * 1000)
-          if withinWindow then
-            val s = current.get
-            val updated = TokenQuotaState(
-              math.max(0, s.inputTokens + inputTokensDelta),
-              math.max(0, s.outputTokens + outputTokensDelta),
-              s.windowStart,
-              s.version + 1,
-            )
-            (m + (pk -> updated), true)
-          else
-            val fresh = TokenQuotaState(
-              math.max(0, inputTokensDelta),
-              math.max(0, outputTokensDelta),
-              nowMs,
-              1L,
-            )
-            (m + (pk -> fresh), true)
-        }
+        ): F[ReserveOutcome] = ref.modify(m =>
+          QuotaReservation
+            .plan(targets, m, inputDelta, outputDelta, nowMs) match
+            case Left(exceeded) => (m, exceeded)
+            case Right(planned) =>
+              val written = planned.map(p => p.target.pk -> p.after).toMap
+              (m ++ written, ReserveOutcome.Reserved(written)),
+        )
 
         override def healthCheck: F[Either[String, Unit]] = Async[F].pure(Right(()))
     }
@@ -115,9 +196,11 @@ trait TokenQuotaService[F[_]]:
       actualOutputTokens: Long,
       estimatedInputTokens: Long,
       estimatedOutputTokens: Long,
-  ): F[Unit]
+  ): F[ReconcileResult]
 
 object TokenQuotaService:
+  private case class Level(level: QuotaLevel, limit: Long, target: QuotaTarget)
+
   def apply[F[_]: Async](
       store: TokenQuotaStore[F],
       config: TokenQuotaConfig,
@@ -130,58 +213,17 @@ object TokenQuotaService:
         estimatedInputTokens: Long,
         estimatedOutputTokens: Long,
     ): F[QuotaDecision] =
-      val estimatedTotal = estimatedInputTokens + estimatedOutputTokens
-      val checks = buildLevelChecks(identifier)
-
-      checks.foldLeftM[F, QuotaDecision](
-        QuotaDecision.Available(Map.empty): QuotaDecision,
-      ) {
-        case (
-              QuotaDecision.Available(remaining),
-              (level, pk, limit, windowSec),
-            ) =>
-          for
-            nowMs <- Clock[F].realTime.map(_.toMillis)
-            state <- store.getQuota(pk)
-            currentUsed = state
-              .filter(s => isWithinWindow(s.windowStart, nowMs, windowSec))
-              .map(_.totalTokens).getOrElse(0L)
-          yield
-            if currentUsed + estimatedTotal > limit then
-              val retryAfter = windowSec.toInt
-              QuotaDecision.Exceeded(level, limit, currentUsed, retryAfter)
-            else
-              QuotaDecision.Available(
-                remaining + (level -> (limit - currentUsed - estimatedTotal)),
-              )
-
-        case (exceeded: QuotaDecision.Exceeded, _) => Async[F].pure(exceeded)
-      }.flatTap {
-        case QuotaDecision.Available(_) =>
-          val checks2 = buildLevelChecks(identifier)
-          checks2.traverse_ { case (level, pk, _, windowSec) =>
-            for
-              nowMs <- Clock[F].realTime.map(_.toMillis)
-              success <- store.incrementQuota(
-                pk,
-                estimatedInputTokens,
-                estimatedOutputTokens,
-                windowSec,
-                nowMs,
-              )
-              _ <-
-                if !success then
-                  logger.warn(
-                    s"OCC conflict reserving quota for $pk, retries exhausted",
-                  )
-                else Async[F].unit
-            yield ()
-          }
-        case QuotaDecision.Exceeded(level, limit, used, _) => metrics
-            .increment("TokenQuotaExceeded", Map("level" -> level.prefix)) *>
-            logger.info(s"Quota exceeded at ${level
-                .prefix} level: used=$used, limit=$limit")
-      }
+      val levels = levelsFor(identifier)
+      for
+        nowMs <- Clock[F].realTime.map(_.toMillis)
+        outcome <- store.reserve(
+          levels.map(_.target),
+          estimatedInputTokens,
+          estimatedOutputTokens,
+          nowMs,
+        )
+        decision <- toDecision(levels, outcome, nowMs)
+      yield decision
 
     override def reconcile(
         identifier: QuotaIdentifier,
@@ -189,65 +231,120 @@ object TokenQuotaService:
         actualOutputTokens: Long,
         estimatedInputTokens: Long,
         estimatedOutputTokens: Long,
-    ): F[Unit] =
+    ): F[ReconcileResult] =
       val inputDelta = actualInputTokens - estimatedInputTokens
       val outputDelta = actualOutputTokens - estimatedOutputTokens
-      if inputDelta == 0 && outputDelta == 0 then Async[F].unit
+      if inputDelta == 0 && outputDelta == 0 then
+        Async[F].pure(ReconcileResult.Reconciled(0, 0))
       else
-        val checks = buildLevelChecks(identifier)
-        checks.traverse_ { case (level, pk, _, windowSec) =>
-          for
-            nowMs <- Clock[F].realTime.map(_.toMillis)
-            _ <- store
-              .incrementQuota(pk, inputDelta, outputDelta, windowSec, nowMs)
-            _ <- metrics.gauge(
-              "keyra_tokens_consumed",
-              (actualInputTokens + actualOutputTokens).toDouble,
-              Map("level" -> level.prefix) ++ identifierDims(identifier, level),
-            )
-          yield ()
+        val levels = levelsFor(identifier)
+        // Actual usage already happened, so I record it even past the limit.
+        val unlimited = levels.map(_.target.copy(limit = None))
+        for
+          nowMs <- Clock[F].realTime.map(_.toMillis)
+          outcome <- store.reserve(unlimited, inputDelta, outputDelta, nowMs)
+          result <- toReconcileResult(
+            identifier,
+            levels,
+            outcome,
+            inputDelta,
+            outputDelta,
+          )
+        yield result
+
+    private def toDecision(
+        levels: List[Level],
+        outcome: ReserveOutcome,
+        nowMs: Long,
+    ): F[QuotaDecision] = outcome match
+      case ReserveOutcome.Reserved(states) =>
+        val remaining = levels
+          .map(l => l.level -> (l.limit - states(l.target.pk).totalTokens))
+        Async[F].pure(QuotaDecision.Available(remaining.toMap))
+
+      case ReserveOutcome.LimitExceeded(pk, used, windowStart) =>
+        levelFor(levels, pk).flatMap { l =>
+          val retryAfter =
+            secondsUntilReset(windowStart, l.target.windowSeconds, nowMs)
+          metrics
+            .increment("TokenQuotaExceeded", Map("level" -> l.level.prefix)) *>
+            logger.info(s"Quota exceeded at ${l.level
+                .prefix} level: used=$used, limit=${l.limit}")
+              .as(QuotaDecision.Exceeded(l.level, l.limit, used, retryAfter))
         }
 
-    private def buildLevelChecks(
-        id: QuotaIdentifier,
-    ): List[(QuotaLevel, String, Long, Long)] =
-      val userCheck = List((
+      case ReserveOutcome.Contended(attempts) => metrics
+          .increment("TokenQuotaContended") *>
+          logger.warn(s"Quota reservation lost $attempts conditional writes; nothing reserved")
+            .as(QuotaDecision.Contended(attempts))
+
+    private def toReconcileResult(
+        identifier: QuotaIdentifier,
+        levels: List[Level],
+        outcome: ReserveOutcome,
+        inputDelta: Long,
+        outputDelta: Long,
+    ): F[ReconcileResult] = outcome match
+      case ReserveOutcome.Reserved(states) => levels.traverse_(l =>
+          metrics.gauge(
+            "keyra_tokens_consumed",
+            states(l.target.pk).totalTokens.toDouble,
+            Map("level" -> l.level.prefix) ++ identifierDims(identifier, l.level),
+          ),
+        ).as(ReconcileResult.Reconciled(inputDelta, outputDelta))
+
+      case ReserveOutcome.Contended(attempts) => metrics
+          .increment("TokenQuotaReconcileFailed") *>
+          logger.warn(s"Quota reconciliation for ${identifier
+              .userId} lost $attempts conditional writes; usage not recorded")
+            .as(ReconcileResult.Contended(attempts))
+
+      case ReserveOutcome.LimitExceeded(pk, _, _) => Async[F]
+          .raiseError(new IllegalStateException(
+            s"Unlimited reservation on $pk reported a limit",
+          ))
+
+    private def levelFor(levels: List[Level], pk: String): F[Level] =
+      levels.find(_.target.pk == pk) match
+        case Some(l) => Async[F].pure(l)
+        case None => Async[F].raiseError(new IllegalStateException(
+            s"Store reported unknown quota target $pk",
+          ))
+
+    private def levelsFor(id: QuotaIdentifier): List[Level] =
+      val user = mkLevel(
         QuotaLevel.User,
-        quotaPk(QuotaLevel.User, id.userId, config.userWindowSeconds),
+        id.userId,
         config.userLimit,
         config.userWindowSeconds,
-      ))
-      val agentCheck = id.agentId.toList.map { aid =>
-        val effectiveLimit = math
-          .min(config.agentLimit, (config.userLimit * 0.8).toLong)
-        (
-          QuotaLevel.Agent,
-          quotaPk(QuotaLevel.Agent, aid, config.agentWindowSeconds),
-          effectiveLimit,
-          config.agentWindowSeconds,
-        )
-      }
-      val orgCheck = id.orgId.toList.map(oid =>
-        (
-          QuotaLevel.Org,
-          quotaPk(QuotaLevel.Org, oid, config.orgWindowSeconds),
-          config.orgLimit,
-          config.orgWindowSeconds,
-        ),
       )
-      userCheck ++ agentCheck ++ orgCheck
+      val agent = id.agentId.map { aid =>
+        val limit = math.min(config.agentLimit, (config.userLimit * 0.8).toLong)
+        mkLevel(QuotaLevel.Agent, aid, limit, config.agentWindowSeconds)
+      }
+      val org = id.orgId.map(oid =>
+        mkLevel(QuotaLevel.Org, oid, config.orgLimit, config.orgWindowSeconds),
+      )
+      user :: agent.toList ::: org.toList
 
-    private def quotaPk(
-        level: QuotaLevel,
+    private def mkLevel(
+        l: QuotaLevel,
         id: String,
+        limit: Long,
         windowSec: Long,
-    ): String = s"${level.prefix}:$id:${windowSec}s"
+    ): Level = Level(
+      l,
+      limit,
+      QuotaTarget(s"${l.prefix}:$id:${windowSec}s", windowSec, Some(limit)),
+    )
 
-    private def isWithinWindow(
+    private def secondsUntilReset(
         windowStart: Long,
+        windowSeconds: Long,
         nowMs: Long,
-        windowSec: Long,
-    ): Boolean = nowMs - windowStart < windowSec * 1000
+    ): Int =
+      val remainingMs = windowStart + windowSeconds * 1000 - nowMs
+      math.max(1L, (remainingMs + 999) / 1000).toInt
 
     private def identifierDims(
         id: QuotaIdentifier,

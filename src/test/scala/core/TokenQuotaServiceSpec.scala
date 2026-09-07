@@ -1,7 +1,5 @@
 package core
 
-import java.time.Instant
-
 import scala.concurrent.duration.*
 
 import org.scalatest.freespec.AsyncFreeSpec
@@ -11,6 +9,8 @@ import org.typelevel.log4cats.noop.NoOpLogger
 
 import cats.effect.*
 import cats.effect.testing.scalatest.AsyncIOSpec
+import cats.effect.testkit.TestControl
+import cats.syntax.all.*
 import config.TokenQuotaConfig
 import observability.MetricsPublisher
 
@@ -29,111 +29,191 @@ class TokenQuotaServiceSpec
     orgWindowSeconds = 86400,
   )
 
-  def inMemoryStore
-      : IO[(TokenQuotaStore[IO], Ref[IO, Map[String, TokenQuotaState]])] = Ref
-    .of[IO, Map[String, TokenQuotaState]](Map.empty).map { ref =>
-      val store = new TokenQuotaStore[IO]:
-        override def getQuota(pk: String): IO[Option[TokenQuotaState]] = ref.get
-          .map(_.get(pk))
-        override def incrementQuota(
-            pk: String,
-            inputDelta: Long,
-            outputDelta: Long,
-            windowSec: Long,
-            nowMs: Long,
-        ): IO[Boolean] = ref.modify { m =>
-          val current = m.get(pk)
-          val withinWindow = current
-            .exists(s => nowMs - s.windowStart < windowSec * 1000)
-          if withinWindow then
-            val s = current.get
-            val updated = TokenQuotaState(
-              math.max(0, s.inputTokens + inputDelta),
-              math.max(0, s.outputTokens + outputDelta),
-              s.windowStart,
-              s.version + 1,
-            )
-            (m + (pk -> updated), true)
-          else
-            val fresh = TokenQuotaState(
-              math.max(0, inputDelta),
-              math.max(0, outputDelta),
-              nowMs,
-              1L,
-            )
-            (m + (pk -> fresh), true)
-        }
-        override def healthCheck: IO[Either[String, Unit]] = IO.pure(Right(()))
-      (store, ref)
-    }
+  def service(
+      config: TokenQuotaConfig = defaultConfig,
+      store: Option[TokenQuotaStore[IO]] = None,
+  ): IO[(TokenQuotaService[IO], TokenQuotaStore[IO])] = store
+    .fold(TokenQuotaStore.inMemory[IO])(IO.pure).map(s =>
+      (TokenQuotaService[IO](s, config, MetricsPublisher.noop[IO], summon), s),
+    )
 
-  "TokenQuotaService" - {
-    "should allow quota when under limit" in {
+  def userPk(id: String): String =
+    s"user:$id:${defaultConfig.userWindowSeconds}s"
+
+  def orgPk(id: String, config: TokenQuotaConfig): String =
+    s"org:$id:${config.orgWindowSeconds}s"
+
+  /** A store that loses every conditional write. */
+  def contendedStore(attempts: Int): TokenQuotaStore[IO] =
+    new TokenQuotaStore[IO]:
+      def getQuota(pk: String): IO[Option[TokenQuotaState]] = IO.pure(None)
+      def reserve(
+          targets: List[QuotaTarget],
+          inputDelta: Long,
+          outputDelta: Long,
+          nowMs: Long,
+      ): IO[ReserveOutcome] = IO.pure(ReserveOutcome.Contended(attempts))
+      def healthCheck: IO[Either[String, Unit]] = IO.pure(Right(()))
+
+  "TokenQuotaService.checkQuota" - {
+
+    "allows a request under the limit and reports remaining tokens per level" in {
       for
-        (store, _) <- inMemoryStore
-        svc = TokenQuotaService[IO](
-          store,
-          defaultConfig,
-          MetricsPublisher.noop[IO],
-          summon,
-        )
+        (svc, _) <- service()
         result <- svc.checkQuota(QuotaIdentifier("user1"), 1000, 500)
-      yield result shouldBe a[QuotaDecision.Available]
+      yield result shouldBe QuotaDecision.Available(Map(QuotaLevel.User -> 8500L))
     }
 
-    "should reject when user quota is exceeded" in {
+    "rejects once the window usage would exceed the limit" in {
       for
-        (store, _) <- inMemoryStore
-        svc = TokenQuotaService[IO](
-          store,
-          defaultConfig,
-          MetricsPublisher.noop[IO],
-          summon,
-        )
+        (svc, _) <- service()
         _ <- svc.checkQuota(QuotaIdentifier("user1"), 8000, 0)
         result <- svc.checkQuota(QuotaIdentifier("user1"), 5000, 0)
-      yield result shouldBe a[QuotaDecision.Exceeded]
+      yield result match
+        case QuotaDecision.Exceeded(level, limit, used, _) =>
+          level shouldBe QuotaLevel.User
+          limit shouldBe 10_000L
+          used shouldBe 8000L
+        case other => fail(s"expected Exceeded, got $other")
     }
 
-    "should enforce agent limit at 80% of user limit" in {
-      val config = defaultConfig.copy(agentLimit = 9_000) // 80% of 10000 = 8000
+    "does not record a rejected request" in {
       for
-        (store, _) <- inMemoryStore
-        svc =
-          TokenQuotaService[IO](store, config, MetricsPublisher.noop[IO], summon)
+        (svc, store) <- service()
+        _ <- svc.checkQuota(QuotaIdentifier("user1"), 8000, 0)
+        _ <- svc.checkQuota(QuotaIdentifier("user1"), 5000, 0)
+        state <- store.getQuota(userPk("user1"))
+      yield state.map(_.totalTokens) shouldBe Some(8000L)
+    }
+
+    "reports Retry-After as the seconds left in the window, not the window length" in {
+      val program =
+        for
+          (svc, _) <- service()
+          _ <- svc.checkQuota(QuotaIdentifier("user1"), 8000, 0)
+          _ <- IO.sleep(59.minutes)
+          result <- svc.checkQuota(QuotaIdentifier("user1"), 5000, 0)
+        yield result
+
+      TestControl.executeEmbed(program).asserting {
+        case QuotaDecision.Exceeded(_, _, _, retryAfter) => retryAfter shouldBe
+            60
+        case other => fail(s"expected Exceeded, got $other")
+      }
+    }
+
+    "starts a fresh window once the previous one lapses" in {
+      val program =
+        for
+          (svc, _) <- service()
+          _ <- svc.checkQuota(QuotaIdentifier("user1"), 8000, 0)
+          _ <- IO.sleep(61.minutes)
+          result <- svc.checkQuota(QuotaIdentifier("user1"), 5000, 0)
+        yield result
+
+      TestControl.executeEmbed(program).asserting(
+        _ shouldBe QuotaDecision.Available(Map(QuotaLevel.User -> 5000L)),
+      )
+    }
+
+    "caps the agent level at 80% of the user limit" in {
+      val config = defaultConfig.copy(agentLimit = 9_000)
+      for
+        (svc, _) <- service(config)
         result <- svc.checkQuota(
           QuotaIdentifier("user1", agentId = Some("agent1")),
           8500,
           0,
         )
-      yield
-        // Agent effective limit = min(9000, 10000*0.8) = 8000, so 8500 exceeds
-        result shouldBe a[QuotaDecision.Exceeded]
+      yield result match
+        case QuotaDecision.Exceeded(level, limit, _, _) =>
+          level shouldBe QuotaLevel.Agent
+          limit shouldBe 8000L
+        case other => fail(s"expected Exceeded, got $other")
     }
 
-    "should reconcile actual vs estimated" in {
+    "reserves nothing at any level when a later level is exceeded" in {
+      val config = defaultConfig.copy(orgLimit = 1_000)
       for
-        (store, ref) <- inMemoryStore
-        svc = TokenQuotaService[IO](
-          store,
-          defaultConfig,
-          MetricsPublisher.noop[IO],
-          summon,
-        )
+        (svc, store) <- service(config)
+        result <- svc
+          .checkQuota(QuotaIdentifier("user1", orgId = Some("org1")), 5000, 0)
+        user <- store.getQuota(userPk("user1"))
+        org <- store.getQuota(orgPk("org1", config))
+      yield
+        result shouldBe a[QuotaDecision.Exceeded]
+        user shouldBe None
+        org shouldBe None
+    }
+
+    "never admits more than the limit under concurrent checks" in {
+      val perRequest = 300L
+      for
+        (svc, store) <- service()
+        decisions <- (1 to 50).toList
+          .parTraverse(_ => svc.checkQuota(QuotaIdentifier("hot"), perRequest, 0))
+        state <- store.getQuota(userPk("hot"))
+      yield
+        val admitted = decisions.count(_.isInstanceOf[QuotaDecision.Available])
+        admitted shouldBe 33
+        state.map(_.totalTokens) shouldBe Some(admitted * perRequest)
+    }
+
+    "fails closed when the store cannot win a write" in {
+      for
+        (svc, _) <- service(store = Some(contendedStore(25)))
+        result <- svc.checkQuota(QuotaIdentifier("user1"), 10, 0)
+      yield result shouldBe QuotaDecision.Contended(25)
+    }
+  }
+
+  "TokenQuotaService.reconcile" - {
+
+    "replaces the estimate with actual usage" in {
+      for
+        (svc, store) <- service()
         _ <- svc.checkQuota(QuotaIdentifier("user1"), 1000, 0)
-        _ <- svc.reconcile(
+        result <- svc.reconcile(
           QuotaIdentifier("user1"),
           actualInputTokens = 800,
           actualOutputTokens = 0,
           estimatedInputTokens = 1000,
           estimatedOutputTokens = 0,
         )
-        state <- ref.get
+        state <- store.getQuota(userPk("user1"))
       yield
-        // After reconcile, net usage should reflect actual (800), not estimate (1000)
-        // The delta is -200 input tokens, so usage goes down by 200
-        val userKey = state.keys.find(_.startsWith("user:user1"))
-        userKey shouldBe defined
-        state(userKey.get).inputTokens shouldBe 800
+        result shouldBe ReconcileResult.Reconciled(-200, 0)
+        state.map(_.inputTokens) shouldBe Some(800L)
+    }
+
+    "records overshoot past the limit so the next check is rejected" in {
+      for
+        (svc, store) <- service()
+        _ <- svc.checkQuota(QuotaIdentifier("user1"), 9000, 0)
+        _ <- svc.reconcile(QuotaIdentifier("user1"), 9000, 3000, 9000, 0)
+        state <- store.getQuota(userPk("user1"))
+        next <- svc.checkQuota(QuotaIdentifier("user1"), 1, 0)
+      yield
+        state.map(_.totalTokens) shouldBe Some(12_000L)
+        next match
+          case QuotaDecision.Exceeded(_, _, used, _) => used shouldBe 12_000L
+          case other => fail(s"expected Exceeded, got $other")
+    }
+
+    "is a no-op when actual usage equals the estimate" in {
+      for
+        (svc, store) <- service()
+        result <- svc.reconcile(QuotaIdentifier("user1"), 500, 100, 500, 100)
+        state <- store.getQuota(userPk("user1"))
+      yield
+        result shouldBe ReconcileResult.Reconciled(0, 0)
+        state shouldBe None
+    }
+
+    "surfaces contention instead of dropping the adjustment" in {
+      for
+        (svc, _) <- service(store = Some(contendedStore(25)))
+        result <- svc.reconcile(QuotaIdentifier("user1"), 800, 0, 1000, 0)
+      yield result shouldBe ReconcileResult.Contended(25)
     }
   }

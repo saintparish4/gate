@@ -29,52 +29,27 @@ class TokenQuotaApi[F[_]: Async: Tracer](
     logger: Logger[F],
     getRequestId: () => F[String],
 ) extends Http4sDsl[F]:
+  import TokenQuotaApi.ContendedRetryAfterSeconds
 
   /** POST /v1/quota/check
     *
-    * Pre-request: check if estimated token usage is within quota.
+    * Pre-request: atomically reserve the estimated tokens at every level, or
+    * reject without reserving anything.
     */
   def check(request: Request[F], client: AuthenticatedClient): F[Response[F]] =
     for
       startTime <- Clock[F].realTime.map(_.toMillis)
       req <- request.as[TokenQuotaCheckRequest]
-
-      response <-
-        if req.estimatedInputTokens < 0 || req.estimatedOutputTokens < 0 then
-          BadRequest(io.circe.Json.obj(
-            "error" -> io.circe.Json.fromString("validation_error"),
-            "message" ->
-              io.circe.Json.fromString("token estimates must be non-negative"),
-          ))
-        else
-          for
-            identifier <- Async[F].pure(QuotaIdentifier(
-              userId = req.userId,
-              agentId = req.agentId,
-              orgId = req.orgId,
-            ))
-            decision <- TracingMiddleware
-              .traced("checkQuota")(quotaService.checkQuota(
-                identifier,
-                req.estimatedInputTokens,
-                req.estimatedOutputTokens,
-              ))
-
-            latency <- Clock[F].realTime.map(_.toMillis - startTime)
-            _ <- metricsPublisher
-              .recordLatency("token_quota_check", latency.toDouble)
-
-            now <- Clock[F].realTime.map(d => Instant.ofEpochMilli(d.toMillis))
-            traceId <- currentTraceId
-            _ <- publishQuotaEvent(decision, req, client, now, traceId).start
-
-            resp <- buildCheckResponse(decision)
-          yield resp
+      response <- nonNegative(
+        req.estimatedInputTokens,
+        req.estimatedOutputTokens,
+      )("token estimates must be non-negative")(runCheck(req, client, startTime))
     yield response
 
   /** POST /v1/quota/reconcile
     *
-    * Post-LLM-call: adjust quota counters with actual token usage.
+    * Post-LLM-call: replace the estimate with actual usage. Actual usage is
+    * recorded even when it lands past the limit.
     */
   def reconcile(
       request: Request[F],
@@ -83,33 +58,62 @@ class TokenQuotaApi[F[_]: Async: Tracer](
     for
       startTime <- Clock[F].realTime.map(_.toMillis)
       req <- request.as[TokenQuotaReconcileRequest]
+      response <- nonNegative(
+        req.actualInputTokens,
+        req.actualOutputTokens,
+        req.estimatedInputTokens,
+        req.estimatedOutputTokens,
+      )("token counts must be non-negative")(runReconcile(req, startTime))
+    yield response
 
-      identifier = QuotaIdentifier(
-        userId = req.userId,
-        agentId = req.agentId,
-        orgId = req.orgId,
-      )
+  private def runCheck(
+      req: TokenQuotaCheckRequest,
+      client: AuthenticatedClient,
+      startTime: Long,
+  ): F[Response[F]] =
+    val identifier = QuotaIdentifier(req.userId, req.agentId, req.orgId)
+    for
+      decision <- TracingMiddleware.traced("checkQuota")(quotaService.checkQuota(
+        identifier,
+        req.estimatedInputTokens,
+        req.estimatedOutputTokens,
+      ))
+      latency <- Clock[F].realTime.map(_.toMillis - startTime)
+      _ <- metricsPublisher.recordLatency("token_quota_check", latency.toDouble)
+      now <- Clock[F].realTime.map(d => Instant.ofEpochMilli(d.toMillis))
+      traceId <- currentTraceId
+      _ <- publishQuotaEvent(decision, req, client, now, traceId).start
+      resp <- buildCheckResponse(decision)
+    yield resp
 
-      _ <- quotaService.reconcile(
+  private def runReconcile(
+      req: TokenQuotaReconcileRequest,
+      startTime: Long,
+  ): F[Response[F]] =
+    val identifier = QuotaIdentifier(req.userId, req.agentId, req.orgId)
+    for
+      result <- quotaService.reconcile(
         identifier,
         req.actualInputTokens,
         req.actualOutputTokens,
         req.estimatedInputTokens,
         req.estimatedOutputTokens,
       )
-
       latency <- Clock[F].realTime.map(_.toMillis - startTime)
       _ <- metricsPublisher
         .recordLatency("token_quota_reconcile", latency.toDouble)
-
-      resp <- Ok(
-        TokenQuotaReconcileResponse(
-          status = "reconciled",
-          inputDelta = req.actualInputTokens - req.estimatedInputTokens,
-          outputDelta = req.actualOutputTokens - req.estimatedOutputTokens,
-        ).asJson,
-      )
+      resp <- buildReconcileResponse(result, req)
     yield resp
+
+  private def nonNegative(
+      values: Long*,
+  )(message: String)(ok: => F[Response[F]]): F[Response[F]] =
+    if values.exists(_ < 0) then
+      BadRequest(io.circe.Json.obj(
+        "error" -> io.circe.Json.fromString("validation_error"),
+        "message" -> io.circe.Json.fromString(message),
+      ))
+    else ok
 
   private def buildCheckResponse(decision: QuotaDecision): F[Response[F]] =
     decision match
@@ -132,7 +136,36 @@ class TokenQuotaApi[F[_]: Async: Tracer](
             message =
               Some(s"${level.prefix} quota exceeded: $used/$limit tokens used"),
           ).asJson,
-        ).map(_.putHeaders(Header.Raw(ci"Retry-After", retryAfter.toString)))
+        ).map(withRetryAfter(retryAfter))
+      case QuotaDecision.Contended(attempts) => ServiceUnavailable(
+          TokenQuotaCheckResponse(
+            allowed = false,
+            remainingTokens = Map.empty,
+            exceededLevel = None,
+            retryAfter = Some(ContendedRetryAfterSeconds),
+            message =
+              Some(s"quota state contended after $attempts attempts; nothing was reserved, retry shortly"),
+          ).asJson,
+        ).map(withRetryAfter(ContendedRetryAfterSeconds))
+
+  private def buildReconcileResponse(
+      result: ReconcileResult,
+      req: TokenQuotaReconcileRequest,
+  ): F[Response[F]] = result match
+    case ReconcileResult.Reconciled(inputDelta, outputDelta) => Ok(
+        TokenQuotaReconcileResponse("reconciled", inputDelta, outputDelta)
+          .asJson,
+      )
+    case ReconcileResult.Contended(_) => ServiceUnavailable(
+        TokenQuotaReconcileResponse(
+          status = "contended",
+          inputDelta = req.actualInputTokens - req.estimatedInputTokens,
+          outputDelta = req.actualOutputTokens - req.estimatedOutputTokens,
+        ).asJson,
+      ).map(withRetryAfter(ContendedRetryAfterSeconds))
+
+  private def withRetryAfter(seconds: Int)(resp: Response[F]): Response[F] =
+    resp.putHeaders(Header.Raw(ci"Retry-After", seconds.toString))
 
   private def currentTraceId: F[Option[String]] = Tracer[F].currentSpanContext
     .map(_.filter(_.isValid).map(_.traceIdHex))
@@ -218,6 +251,9 @@ case class TokenQuotaReconcileResponse(
 )
 
 object TokenQuotaApi:
+  /** What a 503 tells clients to wait before retrying a contended write. */
+  val ContendedRetryAfterSeconds: Int = 1
+
   def apply[F[_]: Async: Tracer](
       quotaService: TokenQuotaService[F],
       eventPublisher: EventPublisher[F],

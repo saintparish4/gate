@@ -2,7 +2,7 @@
 
 ## Overview
 
-The Rate Limiter Platform provides RESTful HTTP APIs for distributed rate limiting and idempotency checking. All endpoints return JSON responses and use standard HTTP status codes.
+Keyra provides RESTful HTTP APIs for distributed rate limiting, LLM token quotas, and idempotency checking. All endpoints return JSON responses and use standard HTTP status codes.
 
 **Base URL (Local):** `http://localhost:8080`  
 **Base URL (AWS):** `http://<load-balancer-dns>` (not yet tested)  
@@ -272,6 +272,165 @@ curl -X POST http://localhost:8080/v1/idempotency/payment:abc-123/complete \
     "statusCode": 201,
     "body": "{\"paymentId\": \"pay_xyz789\"}",
     "headers": {"Content-Type": "application/json"}
+  }'
+```
+
+---
+
+## Token Quota Endpoints
+
+Token quotas cap LLM token consumption per user, per agent, and per org. A check reserves the estimated tokens at every level named in the request in **one atomic write**; if any level would overflow, nothing is reserved anywhere. Both endpoints exist only when `TOKEN_QUOTA_ENABLED=true`; otherwise they return `404`.
+
+**Window semantics:** each counter's window starts on its first use and lasts `TOKEN_QUOTA_<LEVEL>_WINDOW` seconds (defaults: user 1 h, agent 1 h, org 24 h). When a window lapses the counter starts over on the next request. The agent level is capped at the smaller of `TOKEN_QUOTA_AGENT_LIMIT` and 80% of the user limit.
+
+### Check Token Quota
+
+Reserves the estimated tokens before the LLM call.
+
+**Endpoint:** `POST /v1/quota/check`
+
+**Request:**
+```json
+{
+  "userId": "user:alice",
+  "agentId": "agent:planner",
+  "orgId": "org:acme",
+  "estimatedInputTokens": 1200,
+  "estimatedOutputTokens": 400
+}
+```
+
+**Request Fields:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `userId` | string | Yes | User whose quota is charged |
+| `agentId` | string | No | Agent acting for the user; adds the agent level |
+| `orgId` | string | No | Organisation; adds the org level |
+| `estimatedInputTokens` | integer | Yes | Expected prompt tokens (≥ 0) |
+| `estimatedOutputTokens` | integer | No | Expected completion tokens (≥ 0, default 0) |
+
+**Allowed Response (200):**
+```json
+{
+  "allowed": true,
+  "remainingTokens": { "user": 998400, "agent": 498400, "org": 9998400 },
+  "exceededLevel": null,
+  "retryAfter": null
+}
+```
+
+`remainingTokens` is what is left at each requested level *after* this reservation.
+
+**Exceeded Response (429):**
+
+Headers: `Retry-After: 1740`
+
+```json
+{
+  "allowed": false,
+  "remainingTokens": {},
+  "exceededLevel": "org",
+  "retryAfter": 1740,
+  "message": "org quota exceeded: 9999000/10000000 tokens used"
+}
+```
+
+`retryAfter` is the number of seconds until the exceeded level's window resets. Nothing was reserved at any level.
+
+**Contended Response (503):**
+
+Headers: `Retry-After: 1`
+
+```json
+{
+  "allowed": false,
+  "remainingTokens": {},
+  "exceededLevel": null,
+  "retryAfter": 1,
+  "message": "quota state contended after 25 attempts; nothing was reserved, retry shortly"
+}
+```
+
+Returned when the store lost every conditional write in its retry budget because many callers were racing on the same counters. Nothing was reserved; repeat the check.
+
+**Validation Error (400):** any token count below zero.
+
+**Example cURL:**
+```bash
+curl -X POST http://localhost:8080/v1/quota/check \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer test-api-key" \
+  -d '{
+    "userId": "user:alice",
+    "orgId": "org:acme",
+    "estimatedInputTokens": 1200,
+    "estimatedOutputTokens": 400
+  }'
+```
+
+---
+
+### Reconcile Token Usage
+
+After the LLM responds, replaces the estimate with actual usage. The difference (`actual − estimated`, per direction) is applied to every level named in the request in one atomic write. Actual usage is recorded even when it lands past the limit; the next check for that identity is then rejected until the window resets.
+
+**Endpoint:** `POST /v1/quota/reconcile`
+
+**Request:**
+```json
+{
+  "userId": "user:alice",
+  "agentId": "agent:planner",
+  "orgId": "org:acme",
+  "actualInputTokens": 1000,
+  "actualOutputTokens": 550,
+  "estimatedInputTokens": 1200,
+  "estimatedOutputTokens": 400
+}
+```
+
+**Request Fields:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `userId` | string | Yes | Same identity the check used |
+| `agentId` | string | No | Same as the check, if it was given |
+| `orgId` | string | No | Same as the check, if it was given |
+| `actualInputTokens` | integer | Yes | Prompt tokens the provider billed (≥ 0) |
+| `actualOutputTokens` | integer | Yes | Completion tokens the provider billed (≥ 0) |
+| `estimatedInputTokens` | integer | Yes | The value sent to `/check` (≥ 0) |
+| `estimatedOutputTokens` | integer | Yes | The value sent to `/check` (≥ 0) |
+
+**Reconciled Response (200):**
+```json
+{ "status": "reconciled", "inputDelta": -200, "outputDelta": 150 }
+```
+
+A reconcile whose deltas are both zero changes nothing and still returns `200`.
+
+**Contended Response (503):**
+
+Headers: `Retry-After: 1`
+
+```json
+{ "status": "contended", "inputDelta": -200, "outputDelta": 150 }
+```
+
+The adjustment was **not** recorded; send the same request again.
+
+**Example cURL:**
+```bash
+curl -X POST http://localhost:8080/v1/quota/reconcile \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer test-api-key" \
+  -d '{
+    "userId": "user:alice",
+    "orgId": "org:acme",
+    "actualInputTokens": 1000,
+    "actualOutputTokens": 550,
+    "estimatedInputTokens": 1200,
+    "estimatedOutputTokens": 400
   }'
 ```
 
