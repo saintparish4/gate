@@ -57,6 +57,14 @@ object Main extends IOApp:
       stores <- StoreModule
         .resource[IO](config, obs.metricsPublisher, eventPublisher)
       _ <- Resource.eval(summon[Logger[IO]].info("Stores initialized"))
+      _ <- Resource.eval(wiring.Warmup.rateLimitPath[IO](
+        stores.rateLimitStore,
+        core.RateLimitProfile(
+          config.rateLimit.defaultCapacity,
+          config.rateLimit.defaultRefillRatePerSecond,
+          config.rateLimit.defaultTtlSeconds,
+        ),
+      ))
 
       given Tracer[IO] <- config.tracing.enabled match
         case true =>
