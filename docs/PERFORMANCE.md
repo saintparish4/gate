@@ -32,7 +32,7 @@ is the honest signal that the system is at capacity.
 
 ### Before your first run: the meta auth rate limit
 
-Keyra's auth middleware has its own anti-brute-force counter (see
+Gate's auth middleware has its own anti-brute-force counter (see
 `AuthRateLimiter` in [`ApiKeyAuth.scala`](../src/main/scala/security/ApiKeyAuth.scala)).
 It's keyed **per API key, per minute**, and the production default is 1,000
 req/min. The load sim uses a single shared test key, so a real load test would
@@ -82,7 +82,7 @@ emitting a misleading markdown row.
   scheduling: a worker can't send its next request until the previous one
   returns. Once per-request latency > the target inter-request interval, the
   driver cannot reach the target. At 2000 target RPS we measured 1319 actual
-  — LocalStack is saturated, not Keyra's algorithm. Production runs against
+  — LocalStack is saturated, not Gate's algorithm. Production runs against
   real DynamoDB routinely sustain 5–10× higher per-host throughput.
 - **Zero errors, zero 429s across the full sweep.** This is the signal that
   matters for correctness: the service stayed responsive under 60 s of
@@ -102,7 +102,7 @@ The token-bucket path performs **exactly two DynamoDB operations per
 
 Under hot-key contention the conditional `PutItem` can fail and retry up to 10
 times, consuming additional WCUs; the `RateLimitOCCRetry` CloudWatch metric and
-`keyra_requests_total{result="rejected"}` Prometheus counter expose that cost.
+`gate_requests_total{result="rejected"}` Prometheus counter expose that cost.
 
 ### Estimated spend at AWS on-demand pricing (us-east-1)
 

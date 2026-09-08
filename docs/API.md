@@ -2,7 +2,7 @@
 
 ## Overview
 
-Keyra provides RESTful HTTP APIs for distributed rate limiting, LLM token quotas, and idempotency checking. All endpoints return JSON responses and use standard HTTP status codes.
+Gate provides RESTful HTTP APIs for distributed rate limiting, LLM token quotas, and idempotency checking. All endpoints return JSON responses and use standard HTTP status codes.
 
 **Base URL (Local):** `http://localhost:8080`  
 **Base URL (AWS):** `http://<load-balancer-dns>` (not yet tested)  

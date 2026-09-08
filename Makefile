@@ -79,7 +79,7 @@ logs: ## Follow LocalStack logs
 	docker-compose logs -f localstack
 
 run: ## Run the application with sbt (requires LocalStack)
-	@echo "Starting Rate Limiter Platform..."
+	@echo "Starting Gate..."
 	@echo ""
 	@command -v sbt >/dev/null 2>&1 || { \
 		echo "Error: sbt not found in PATH."; \

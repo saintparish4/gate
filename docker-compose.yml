@@ -12,7 +12,7 @@ services:
       - PERSISTENCE=1
       - DOCKER_HOST=unix:///var/run/docker.sock
     volumes:
-      # Init script is installed at runtime by keyra-entrypoint.sh (see
+      # Init script is installed at runtime by gate-entrypoint.sh (see
       # localstack.Dockerfile) so it is present even if the base image
       # overwrites /etc/localstack/init (e.g. anonymous volume).
       - "localstack-data:/var/lib/localstack"
@@ -51,7 +51,7 @@ services:
       # profile (`docker compose --profile obs up`). Without the obs profile
       # the DNS name does not resolve and OTel exporter logs are silent/ignored.
       - TRACING_ENABLED=true
-      - OTEL_SERVICE_NAME=keyra
+      - OTEL_SERVICE_NAME=gate
       - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://jaeger:4317}
       # Local dev: fail-open so a tripped circuit breaker doesn't block the smoke test.
       # Production uses reject-all (the application.conf default).
@@ -75,7 +75,7 @@ services:
 
   # Observability stack — start with `docker compose --profile obs up`.
   # Runs alongside the base services; Prometheus scrapes the app's /metrics
-  # endpoint and Grafana is auto-provisioned with the Keyra dashboard.
+  # endpoint and Grafana is auto-provisioned with the Gate dashboard.
   prometheus:
     image: prom/prometheus:v2.54.1
     profiles: ["obs"]

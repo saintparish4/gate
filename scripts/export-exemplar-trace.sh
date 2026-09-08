@@ -12,10 +12,10 @@
 set -euo pipefail
 
 JAEGER_URL="${JAEGER_URL:-http://localhost:16686}"
-SERVICE="${OTEL_SERVICE_NAME:-keyra}"
+SERVICE="${OTEL_SERVICE_NAME:-gate}"
 OUT="${OUT:-docs/exemplar-trace.json}"
-API_KEY="${KEYRA_API_KEY:-test-api-key}"
-BASE_URL="${KEYRA_BASE_URL:-http://localhost:8080}"
+API_KEY="${GATE_API_KEY:-test-api-key}"
+BASE_URL="${GATE_BASE_URL:-http://localhost:8080}"
 
 echo "==> Driving a small burst of traffic against $BASE_URL ..."
 for i in $(seq 1 20); do

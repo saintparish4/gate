@@ -27,8 +27,7 @@ object Main extends IOApp:
   private def application: Resource[IO, Server] =
     for
       given Logger[IO] <- Resource.eval(Slf4jLogger.create[IO])
-      _ <- Resource
-        .eval(summon[Logger[IO]].info("Starting Rate Limiter Platform..."))
+      _ <- Resource.eval(summon[Logger[IO]].info("Starting Gate..."))
 
       config <- Resource.eval(AppConfig.loadOrDefault[IO])
       _ <- Resource
@@ -63,7 +62,7 @@ object Main extends IOApp:
         case true =>
           for
             otelJava <- OtelJava.autoConfigured[IO]()
-            tracer <- Resource.eval(otelJava.tracerProvider.get("keyra"))
+            tracer <- Resource.eval(otelJava.tracerProvider.get("gate"))
           yield tracer
         case false => Resource.pure[IO, Tracer[IO]](Tracer.noop[IO])
 

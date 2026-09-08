@@ -1,4 +1,4 @@
-# Keyra — Distributed Rate Limiting & Compliance Platform
+# Gate — Distributed Rate Limiting & Compliance Platform
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Scala](https://img.shields.io/badge/scala-3.7.4-red.svg)](https://www.scala-lang.org/)
@@ -6,7 +6,7 @@
 
 A distributed rate limiter, idempotency service, and token quota engine built with Scala 3, Cats Effect, and DynamoDB. Enforces per-key request limits and multi-level LLM token quotas correctly across multiple stateless instances — without a lock service.
 
-### Why Keyra?
+### Why Gate?
 
 - **Public or partner APIs** — Enforce per-tenant RPS and burst limits across many stateless containers with one source of truth in DynamoDB ([token bucket + OCC](#optimistic-concurrency-control-flow)).
 - **AI / LLM gateways** — Stack rate limits with multi-level token quotas (user / agent / org) so spend and abuse stay bounded ([`POST /v1/quota/check`](#api-endpoints) when enabled with `TOKEN_QUOTA_ENABLED=true`; see [Token quotas](#token-quotas-ai-workloads)).
@@ -122,7 +122,7 @@ make start
 # or: docker-compose up -d --build localstack
 ```
 
-Expected output: LocalStack container starts; the init script creates the DynamoDB tables and Kinesis stream automatically. The LocalStack image is built from `localstack.Dockerfile`, which installs scripts from `localstack-init/` (`init-aws.sh` creates the tables and stream; `keyra-entrypoint.sh` runs at container start). If you see `FileNotFoundError: ... init-aws.sh`, run `make start-clean` to rebuild the LocalStack image and try again.
+Expected output: LocalStack container starts; the init script creates the DynamoDB tables and Kinesis stream automatically. The LocalStack image is built from `localstack.Dockerfile`, which installs scripts from `localstack-init/` (`init-aws.sh` creates the tables and stream; `gate-entrypoint.sh` runs at container start). If you see `FileNotFoundError: ... init-aws.sh`, run `make start-clean` to rebuild the LocalStack image and try again.
 
 **Step 2 — Verify the service is alive**
 
@@ -234,7 +234,7 @@ curl -s -X POST http://localhost:8080/v1/quota/check \
 curl -s http://localhost:8080/metrics | head -20
 ```
 
-Returns metrics in Prometheus text exposition format: `keyra_requests_total`, `keyra_dynamodb_latency_seconds`, `keyra_token_quota_total`, etc.
+Returns metrics in Prometheus text exposition format: `gate_requests_total`, `gate_dynamodb_latency_seconds`, `gate_token_quota_total`, etc.
 
 ---
 
@@ -255,9 +255,9 @@ Returns metrics in Prometheus text exposition format: `keyra_requests_total`, `k
 
 See **[API Reference](docs/API.md)** for full request/response schemas.
 
-## Operating Keyra
+## Operating Gate
 
-The `obs` Docker Compose profile stands up Prometheus, Grafana (auto-provisioned with the Keyra dashboard), and Jaeger alongside the running service.
+The `obs` Docker Compose profile stands up Prometheus, Grafana (auto-provisioned with the Gate dashboard), and Jaeger alongside the running service.
 
 ```bash
 docker compose --profile obs up -d
@@ -265,13 +265,13 @@ docker compose --profile obs up -d
 
 | Tool        | URL                              | Purpose                                   |
 |-------------|----------------------------------|-------------------------------------------|
-| Grafana     | <http://localhost:3000>          | `admin` / `admin`; "Keyra — Rate Limiting & Quotas" dashboard |
+| Grafana     | <http://localhost:3000>          | `admin` / `admin`; "Gate — Rate Limiting & Quotas" dashboard |
 | Prometheus  | <http://localhost:9090>          | Raw metric explorer, scrape targets       |
-| Jaeger      | <http://localhost:16686>         | Distributed traces (service `keyra`)      |
+| Jaeger      | <http://localhost:16686>         | Distributed traces (service `gate`)      |
 
-Dashboard source: [`observability/grafana/dashboards/keyra.json`](observability/grafana/dashboards/keyra.json). Panels cover request rate by result, rate-limit check p50/p95/p99, DynamoDB latency by operation, circuit breaker state, token consumption, and Kinesis publish vs drop.
+Dashboard source: [`observability/grafana/dashboards/gate.json`](observability/grafana/dashboards/gate.json). Panels cover request rate by result, rate-limit check p50/p95/p99, DynamoDB latency by operation, circuit breaker state, token consumption, and Kinesis publish vs drop.
 
-![Keyra Grafana dashboard](docs/images/grafana-dashboard.png)
+![Gate Grafana dashboard](docs/images/grafana-dashboard.png)
 
 > Screenshot placeholder — run `docker compose --profile obs up -d`, drive a few seconds of traffic with `sbt "loadSim/run --scenario normal"`, capture the dashboard, and save it at `docs/images/grafana-dashboard.png`. No build step reads this file; it is purely documentation.
 
@@ -296,7 +296,7 @@ Terraform provisions the following AWS resources ([`terraform/`](terraform/)):
 |---|---|
 | **DynamoDB** `rate-limits` | Token-bucket state per key (OCC on version field) |
 | **DynamoDB** `idempotency` | Idempotency key storage with TTL auto-expiry |
-| **DynamoDB** `keyra-token-quotas` | Multi-level token quota counters (user/agent/org) |
+| **DynamoDB** `gate-token-quotas` | Multi-level token quota counters (user/agent/org) |
 | **Kinesis** `rate-limit-events` | Rate-limit decision event stream |
 | **ECS Fargate** | Containerised app; autoscaling 2–10 tasks |
 | **ALB** | Application Load Balancer fronting ECS |
@@ -407,7 +407,7 @@ Multi-level LLM token quotas are enforced simultaneously at user, agent, and org
 | `METRICS_FLUSH_THRESHOLD` | `metrics.flush-threshold` | `1000` |
 | `PROMETHEUS_ENABLED` | `prometheus.enabled` | `true` |
 | `TRACING_ENABLED` | `tracing.enabled` | `true` |
-| `OTEL_SERVICE_NAME` | `tracing.service-name` | `keyra` |
+| `OTEL_SERVICE_NAME` | `tracing.service-name` | `gate` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `tracing.exporter-endpoint` | `http://localhost:4317` |
 | `AUTH_ENABLED` | `security.authentication.enabled` | `true` |
 | `CIRCUIT_BREAKER_ENABLED` | `resilience.circuit-breaker.enabled` | `true` |
@@ -469,17 +469,17 @@ Metrics are dual-published to **CloudWatch** (AWS) and **Prometheus** (`GET /met
 
 | Metric name | Type | Labels | Description |
 |---|---|---|---|
-| `keyra_requests_total` | Counter | `key`, `result` | Total rate limit requests (allowed/rejected) |
-| `keyra_idempotency_total` | Counter | `result` | Total idempotency checks |
-| `keyra_token_quota_total` | Counter | `level`, `result` | Token quota checks (available/exceeded) |
-| `keyra_tokens_consumed` | Gauge | `user`, `agent`, `org` | Current token consumption per entity |
-| `keyra_dynamodb_latency_seconds` | Histogram | `operation` | DynamoDB operation latency |
-| `keyra_rate_limit_check_seconds` | Histogram | — | End-to-end rate-limit check latency |
-| `keyra_idempotency_check_seconds` | Histogram | — | End-to-end idempotency check latency |
-| `keyra_token_quota_check_seconds` | Histogram | — | Token quota check latency |
-| `keyra_events_published_total` | Counter | `event_type` | Kinesis events published |
-| `keyra_events_dropped_total` | Counter | — | Events dropped after retry exhaustion |
-| `keyra_circuit_breaker_state` | Gauge | `name` | Circuit breaker state (0=closed, 0.5=half-open, 1=open) |
+| `gate_requests_total` | Counter | `key`, `result` | Total rate limit requests (allowed/rejected) |
+| `gate_idempotency_total` | Counter | `result` | Total idempotency checks |
+| `gate_token_quota_total` | Counter | `level`, `result` | Token quota checks (available/exceeded) |
+| `gate_tokens_consumed` | Gauge | `user`, `agent`, `org` | Current token consumption per entity |
+| `gate_dynamodb_latency_seconds` | Histogram | `operation` | DynamoDB operation latency |
+| `gate_rate_limit_check_seconds` | Histogram | — | End-to-end rate-limit check latency |
+| `gate_idempotency_check_seconds` | Histogram | — | End-to-end idempotency check latency |
+| `gate_token_quota_check_seconds` | Histogram | — | Token quota check latency |
+| `gate_events_published_total` | Counter | `event_type` | Kinesis events published |
+| `gate_events_dropped_total` | Counter | — | Events dropped after retry exhaustion |
+| `gate_circuit_breaker_state` | Gauge | `name` | Circuit breaker state (0=closed, 0.5=half-open, 1=open) |
 
 ### CloudWatch metrics
 
@@ -516,7 +516,7 @@ Trace IDs are propagated through Kinesis events for end-to-end audit correlation
 | Env var | Default | Description |
 |---|---|---|
 | `TRACING_ENABLED` | `true` | Enable/disable OTel tracing |
-| `OTEL_SERVICE_NAME` | `keyra` | Service name in traces |
+| `OTEL_SERVICE_NAME` | `gate` | Service name in traces |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4317` | OTLP gRPC endpoint (Jaeger, Tempo, etc.) |
 
 To view traces locally, run Jaeger:
@@ -527,7 +527,7 @@ docker run -d --name jaeger \
   jaegertracing/all-in-one:latest
 ```
 
-Then open `http://localhost:16686` and search for service `keyra`.
+Then open `http://localhost:16686` and search for service `gate`.
 
 ## Features
 
@@ -577,7 +577,7 @@ Multi-level LLM token quota enforcement for AI infrastructure:
 - **Post-response reconciliation** — `POST /v1/quota/reconcile` adjusts counters based on actual usage.
 - **Agent cap** — Agent limit is validated at startup to be ≤ 80% of user limit.
 - **Retry-After** — `429` responses include `Retry-After` header with seconds until the quota window resets.
-- **Metrics** — `keyra_tokens_consumed{user, agent, org}` gauge exported to Prometheus and CloudWatch.
+- **Metrics** — `gate_tokens_consumed{user, agent, org}` gauge exported to Prometheus and CloudWatch.
 
 ### Resilience
 
@@ -748,7 +748,7 @@ The k6 thresholds intentionally fail under this scenario — they are tuned for 
 ✗ error rate<1% → actual 41.57%     (429s counted as failures by k6)
 ```
 
-To observe OCC retries in production: watch the `RateLimitOCCRetry` CloudWatch metric or `keyra_requests_total{result="rejected"}` in Prometheus. A spike that coincides with latency spikes confirms the retry overhead as the source. This is the honest cost of distributed correctness without a lock service — the system stays **safe** (never over-issues) at the expense of throughput and tail latency under hot-key load.
+To observe OCC retries in production: watch the `RateLimitOCCRetry` CloudWatch metric or `gate_requests_total{result="rejected"}` in Prometheus. A spike that coincides with latency spikes confirms the retry overhead as the source. This is the honest cost of distributed correctness without a lock service — the system stays **safe** (never over-issues) at the expense of throughput and tail latency under hot-key load.
 
 ---
 
@@ -837,7 +837,7 @@ logger.info(
 
 ## Roadmap
 
-Keyra is being built in 8 phases. Phases 1–4 are complete; Phase 5 is in progress.
+Gate is being built in 8 phases. Phases 1–4 are complete; Phase 5 is in progress.
 
 | Phase | Status | Description |
 |-------|--------|-------------|

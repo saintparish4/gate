@@ -4,7 +4,7 @@
 # or runtime mounts over /etc/localstack/init (e.g. anonymous volume or bind).
 set -euo pipefail
 READY_D="/etc/localstack/init/ready.d"
-INIT_SCRIPT="/opt/keyra-init/init-aws.sh"
+INIT_SCRIPT="/opt/gate-init/init-aws.sh"
 if [ -f "$INIT_SCRIPT" ]; then
   mkdir -p "$READY_D"
   cp -f "$INIT_SCRIPT" "$READY_D/init-aws.sh"

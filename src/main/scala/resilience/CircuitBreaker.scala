@@ -75,9 +75,9 @@ object CircuitBreakerConfig:
     halfOpenMaxCalls = 5,
   )
 
-/** Kept for binary/source compatibility. Use KeyraError.CircuitOpen directly.
+/** Kept for binary/source compatibility. Use GateError.CircuitOpen directly.
   */
-type CircuitBreakerOpen = core.KeyraError.CircuitOpen
+type CircuitBreakerOpen = core.GateError.CircuitOpen
 
 object CircuitBreaker:
 
@@ -127,7 +127,7 @@ object CircuitBreaker:
                     executeHalfOpen(fa, now)
                   else
                     recordRejection *>
-                      Temporal[F].raiseError(core.KeyraError.CircuitOpen(name)),
+                      Temporal[F].raiseError(core.GateError.CircuitOpen(name)),
                 )
 
             case CircuitState.HalfOpen => executeHalfOpen(fa, now)
@@ -159,7 +159,7 @@ object CircuitBreaker:
             stateRef.get.flatMap { s =>
               if s.halfOpenCalls >= config.halfOpenMaxCalls then
                 recordRejection *>
-                  Temporal[F].raiseError(core.KeyraError.CircuitOpen(name))
+                  Temporal[F].raiseError(core.GateError.CircuitOpen(name))
               else
                 stateRef.update(_.copy(halfOpenCalls = s.halfOpenCalls + 1)) *>
                   fa.attempt.flatMap {
@@ -173,7 +173,7 @@ object CircuitBreaker:
             }
           else
             recordRejection *>
-              Temporal[F].raiseError(core.KeyraError.CircuitOpen(name))
+              Temporal[F].raiseError(core.GateError.CircuitOpen(name))
         }
 
       private def recordSuccess(now: Long): F[Unit] = stateRef.update(s =>

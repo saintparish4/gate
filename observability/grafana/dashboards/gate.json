@@ -12,7 +12,7 @@
       }
     ]
   },
-  "description": "Keyra operational dashboard: request flow, DynamoDB latency, OCC retries, circuit breaker state, token quota consumption, Kinesis publish/drop.",
+  "description": "Gate operational dashboard: request flow, DynamoDB latency, OCC retries, circuit breaker state, token quota consumption, Kinesis publish/drop.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -59,7 +59,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(rate(keyra_requests_total[1m]))",
+          "expr": "sum(rate(gate_requests_total[1m]))",
           "legendFormat": "rps",
           "datasource": { "type": "prometheus", "uid": "prometheus" }
         }
@@ -98,7 +98,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "100 * (sum(rate(keyra_requests_total{result=\"allowed\"}[5m])) / clamp_min(sum(rate(keyra_requests_total[5m])), 1e-9))",
+          "expr": "100 * (sum(rate(gate_requests_total{result=\"allowed\"}[5m])) / clamp_min(sum(rate(gate_requests_total[5m])), 1e-9))",
           "legendFormat": "allowed %",
           "datasource": { "type": "prometheus", "uid": "prometheus" }
         }
@@ -135,7 +135,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(rate(keyra_requests_total{result=\"rejected\"}[5m]))",
+          "expr": "sum(rate(gate_requests_total{result=\"rejected\"}[5m]))",
           "legendFormat": "rejected rps",
           "datasource": { "type": "prometheus", "uid": "prometheus" }
         }
@@ -170,7 +170,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(keyra_circuit_breaker_state >= 0.9)",
+          "expr": "sum(gate_circuit_breaker_state >= 0.9)",
           "legendFormat": "open",
           "datasource": { "type": "prometheus", "uid": "prometheus" }
         }
@@ -205,7 +205,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (result) (rate(keyra_requests_total[1m]))",
+          "expr": "sum by (result) (rate(gate_requests_total[1m]))",
           "legendFormat": "{{result}}",
           "datasource": { "type": "prometheus", "uid": "prometheus" }
         }
@@ -230,19 +230,19 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(keyra_rate_limit_check_seconds_bucket[5m])))",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(gate_rate_limit_check_seconds_bucket[5m])))",
           "legendFormat": "p50",
           "datasource": { "type": "prometheus", "uid": "prometheus" }
         },
         {
           "refId": "B",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(keyra_rate_limit_check_seconds_bucket[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(gate_rate_limit_check_seconds_bucket[5m])))",
           "legendFormat": "p95",
           "datasource": { "type": "prometheus", "uid": "prometheus" }
         },
         {
           "refId": "C",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(keyra_rate_limit_check_seconds_bucket[5m])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(gate_rate_limit_check_seconds_bucket[5m])))",
           "legendFormat": "p99",
           "datasource": { "type": "prometheus", "uid": "prometheus" }
         }
@@ -275,13 +275,13 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "histogram_quantile(0.99, sum by (operation, le) (rate(keyra_dynamodb_latency_seconds_bucket[5m])))",
+          "expr": "histogram_quantile(0.99, sum by (operation, le) (rate(gate_dynamodb_latency_seconds_bucket[5m])))",
           "legendFormat": "{{operation}} p99",
           "datasource": { "type": "prometheus", "uid": "prometheus" }
         },
         {
           "refId": "B",
-          "expr": "histogram_quantile(0.50, sum by (operation, le) (rate(keyra_dynamodb_latency_seconds_bucket[5m])))",
+          "expr": "histogram_quantile(0.50, sum by (operation, le) (rate(gate_dynamodb_latency_seconds_bucket[5m])))",
           "legendFormat": "{{operation}} p50",
           "datasource": { "type": "prometheus", "uid": "prometheus" }
         }
@@ -317,7 +317,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "keyra_circuit_breaker_state",
+          "expr": "gate_circuit_breaker_state",
           "legendFormat": "{{name}}",
           "datasource": { "type": "prometheus", "uid": "prometheus" }
         }
@@ -350,7 +350,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (user) (keyra_tokens_consumed)",
+          "expr": "sum by (user) (gate_tokens_consumed)",
           "legendFormat": "user={{user}}",
           "datasource": { "type": "prometheus", "uid": "prometheus" }
         }
@@ -379,13 +379,13 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(rate(keyra_events_published_total[1m]))",
+          "expr": "sum(rate(gate_events_published_total[1m]))",
           "legendFormat": "published",
           "datasource": { "type": "prometheus", "uid": "prometheus" }
         },
         {
           "refId": "B",
-          "expr": "sum(rate(keyra_events_dropped_total[1m]))",
+          "expr": "sum(rate(gate_events_dropped_total[1m]))",
           "legendFormat": "dropped",
           "datasource": { "type": "prometheus", "uid": "prometheus" }
         }
@@ -394,13 +394,13 @@
   ],
   "refresh": "10s",
   "schemaVersion": 39,
-  "tags": ["keyra", "rate-limiting", "dynamodb"],
+  "tags": ["gate", "rate-limiting", "dynamodb"],
   "templating": { "list": [] },
   "time": { "from": "now-30m", "to": "now" },
   "timepicker": {},
   "timezone": "",
-  "title": "Keyra — Rate Limiting & Quotas",
-  "uid": "keyra-main",
+  "title": "Gate — Rate Limiting & Quotas",
+  "uid": "gate-main",
   "version": 1,
   "weekStart": ""
 }

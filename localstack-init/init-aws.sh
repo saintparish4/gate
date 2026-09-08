@@ -107,28 +107,28 @@ awslocal dynamodb update-time-to-live \
   --table-name idempotency \
   --time-to-live-specification Enabled=true,AttributeName=ttl 2>/dev/null || echo "Note: TTL update skipped (may already be enabled or not supported)"
 
-# Create DynamoDB table: keyra-token-quotas
-if table_exists "keyra-token-quotas"; then
-    echo "DynamoDB table 'keyra-token-quotas' already exists, skipping creation"
+# Create DynamoDB table: gate-token-quotas
+if table_exists "gate-token-quotas"; then
+    echo "DynamoDB table 'gate-token-quotas' already exists, skipping creation"
 else
-    echo "Creating DynamoDB table: keyra-token-quotas"
+    echo "Creating DynamoDB table: gate-token-quotas"
     if awslocal dynamodb create-table \
-      --table-name keyra-token-quotas \
+      --table-name gate-token-quotas \
       --attribute-definitions AttributeName=pk,AttributeType=S \
       --key-schema AttributeName=pk,KeyType=HASH \
       --billing-mode PAY_PER_REQUEST \
       --tags Key=Environment,Value=local; then
-        echo "Waiting for table 'keyra-token-quotas' to become active..."
-        awslocal dynamodb wait table-exists --table-name keyra-token-quotas || true
+        echo "Waiting for table 'gate-token-quotas' to become active..."
+        awslocal dynamodb wait table-exists --table-name gate-token-quotas || true
     else
-        echo "WARNING: Failed to create table 'keyra-token-quotas', it may already exist"
+        echo "WARNING: Failed to create table 'gate-token-quotas', it may already exist"
     fi
 fi
 
-# Enable TTL on keyra-token-quotas table
-echo "Enabling TTL on keyra-token-quotas table"
+# Enable TTL on gate-token-quotas table
+echo "Enabling TTL on gate-token-quotas table"
 awslocal dynamodb update-time-to-live \
-  --table-name keyra-token-quotas \
+  --table-name gate-token-quotas \
   --time-to-live-specification Enabled=true,AttributeName=ttl 2>/dev/null || echo "Note: TTL update skipped (may already be enabled or not supported)"
 
 # Wait for Kinesis service

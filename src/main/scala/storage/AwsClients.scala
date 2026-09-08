@@ -51,7 +51,7 @@ object AwsClients:
         .connectionMaxIdleTime(JavaDuration.ofSeconds(c.connectionMaxIdleSeconds))
         .build()
 
-      // Disable SDK-level retries: Keyra handles retries via RetryPolicy.
+      // Disable SDK-level retries: Gate handles retries via RetryPolicy.
       val overrideConfig =
         if c.disableSdkRetries then
           ClientOverrideConfiguration.builder().retryPolicy(SdkRetryPolicy.none())
@@ -105,7 +105,7 @@ object AwsClients:
         .connectionMaxIdleTime(JavaDuration.ofSeconds(c.connectionMaxIdleSeconds))
         .build()
 
-      // Disable SDK-level retries: Keyra handles retries via RetryPolicy.
+      // Disable SDK-level retries: Gate handles retries via RetryPolicy.
       val overrideConfig =
         if c.disableSdkRetries then
           ClientOverrideConfiguration.builder().retryPolicy(SdkRetryPolicy.none())

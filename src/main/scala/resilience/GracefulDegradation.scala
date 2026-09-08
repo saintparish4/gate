@@ -185,9 +185,9 @@ object BulkheadConfig:
   val highThroughput: BulkheadConfig =
     BulkheadConfig(maxConcurrent = 100, maxWait = 500.millis)
 
-/** Kept for binary/source compatibility. Use KeyraError.BulkheadFull directly.
+/** Kept for binary/source compatibility. Use GateError.BulkheadFull directly.
   */
-type BulkheadRejected = core.KeyraError.BulkheadFull
+type BulkheadRejected = core.GateError.BulkheadFull
 
 object Bulkhead:
   import cats.effect.std.Semaphore
@@ -214,7 +214,7 @@ object Bulkhead:
           case _: java.util.concurrent.TimeoutException => queuedRef
               .update(_ - 1) *> logger.warn(
               s"Bulkhead '$name' rejected request - wait timeout exceeded",
-            ) *> Temporal[F].raiseError(core.KeyraError.BulkheadFull(name))
+            ) *> Temporal[F].raiseError(core.GateError.BulkheadFull(name))
           case e => Temporal[F].raiseError(e)
         }
 

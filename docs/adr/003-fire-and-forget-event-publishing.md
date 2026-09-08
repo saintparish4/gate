@@ -21,7 +21,7 @@ Kinesis event publishing is fire-and-forget: events are enqueued to a bounded in
 ## Mitigations
 
 - **Structured log as secondary record.** Every audit event (`AuditEvent`) is logged as a structured INFO line before being enqueued to Kinesis. CloudWatch Logs provides searchability and short-term retention as a fallback.
-- **Observable drops.** The `DroppedKinesisEvent` metric (CloudWatch) and `keyra_events_dropped_total` (Prometheus) make event loss visible. Alerting on this metric is recommended.
+- **Observable drops.** The `DroppedKinesisEvent` metric (CloudWatch) and `gate_events_dropped_total` (Prometheus) make event loss visible. Alerting on this metric is recommended.
 - **Bounded queue with backpressure signal.** The queue size is configurable (`kinesis.queue-size`, default 10,000). When full, new events are dropped rather than causing unbounded memory growth.
 
 ## When to Reconsider
