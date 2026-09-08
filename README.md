@@ -368,14 +368,16 @@ leaves zero usable keys and every request answers 401. Write keys first:
 
 ```bash
 aws secretsmanager put-secret-value \
-  --secret-id "gate/demo/api-keys" \
+  --secret-id "rate-limiter/demo/api-keys" \
   --secret-string '[{"apiKey":"...","apiKeyId":"key_001","clientName":"Demo","tier":"basic","permissions":["ratelimit_check","ratelimit_status","idempotency_check"],"active":true}]'
 ```
 
 then redeploy with `-var="enable_secrets_manager=true"`. The secret name is
-`<project>/<environment>/api-keys` because the app composes its lookup key from
-`SECRETS_PREFIX`, `SECRETS_ENVIRONMENT` and `API_KEYS_SECRET_NAME`; the three
-must agree with the name Terraform gives the secret.
+`<project_name>/<environment>/api-keys` because the app composes its lookup key
+from `SECRETS_PREFIX`, `SECRETS_ENVIRONMENT` and `API_KEYS_SECRET_NAME`; the
+three must agree with the name Terraform gives the secret. `project_name`
+defaults to `rate-limiter` and `demo.tfvars` does not override it, so the demo
+environment's resources are all named `rate-limiter-demo-*`.
 
 **Deploy to dev**
 
