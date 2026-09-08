@@ -18,7 +18,7 @@ import DynamoDBOps.*
 
 /** DynamoDB-backed token quota store.
   *
-  * Table schema (keyra-token-quotas):
+  * Table schema (gate-token-quotas):
   *   - pk (S): "{level}:{id}:{window}" e.g. "user:u123:3600s"
   *   - input_tokens (N): cumulative input tokens in current window
   *   - output_tokens (N): cumulative output tokens in current window

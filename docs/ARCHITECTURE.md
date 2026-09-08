@@ -2,7 +2,7 @@
 
 **Note:** This document describes the intended architecture. AWS deployment has not been tested. Currently only local development with docker-compose (LocalStack) is validated.
 
-**Local development (Docker / LocalStack):** The `localstack` service in `docker-compose.yml` is built from `localstack.Dockerfile`. That image extends `localstack/localstack` and adds scripts from `localstack-init/`: `init-aws.sh` creates the DynamoDB tables (`rate-limits`, `idempotency`, `keyra-token-quotas`) and the Kinesis stream (`rate-limit-events`); `keyra-entrypoint.sh` copies the init script into LocalStack’s `ready.d` at container start so resources are created automatically. See README “Quickstart” and `make start` / `make start-clean`.
+**Local development (Docker / LocalStack):** The `localstack` service in `docker-compose.yml` is built from `localstack.Dockerfile`. That image extends `localstack/localstack` and adds scripts from `localstack-init/`: `init-aws.sh` creates the DynamoDB tables (`rate-limits`, `idempotency`, `gate-token-quotas`) and the Kinesis stream (`rate-limit-events`); `gate-entrypoint.sh` copies the init script into LocalStack’s `ready.d` at container start so resources are created automatically. See README “Quickstart” and `make start` / `make start-clean`.
 
 **Cross-references:**
 - Token-bucket refill formula and invariants: [`core/TokenBucket.scala`](../src/main/scala/core/TokenBucket.scala) — both the DynamoDB store and the in-memory store delegate to it. The canonical formula is reproduced in [Rate limit check path](#rate-limit-check-path) below.

@@ -40,7 +40,7 @@ RUN sbt universal:stage
 FROM eclipse-temurin:17-jre-jammy AS runtime
 
 # Add metadata labels (2025 standard: OCI labels)
-LABEL org.opencontainers.image.title="Keyra" \
+LABEL org.opencontainers.image.title="Gate" \
       org.opencontainers.image.description="Distributed rate limiting, token quotas, and idempotency for AI gateways" \
       org.opencontainers.image.version="0.1.0-SNAPSHOT" \
       org.opencontainers.image.authors="Sharif Parish" \
@@ -95,4 +95,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
 # Use the startup script from sbt-native-packager
 # The script name matches the project name from build.sbt
 # It handles classpath and JVM options properly
-ENTRYPOINT ["./bin/keyra"]
+ENTRYPOINT ["./bin/gate"]

@@ -11,7 +11,7 @@ Implement a custom `CircuitBreaker[F]` using Cats Effect primitives (`Ref`, `Clo
 - **Full control over state transitions.** The circuit breaker has three states (Closed → Open → HalfOpen → Closed|Open) with configurable failure thresholds, reset timeouts, and half-open probe counts. The state machine is small enough (~200 lines) that owning it means no surprises when debugging production behaviour.
 - **No extra dependency.** resilience4j brings a Java-centric API surface and transitive dependencies (Vavr, RxJava adapters). cats-retry is primarily a retry library — it can model some circuit breaker patterns but requires composition of multiple primitives. A purpose-built implementation keeps the dependency tree lean.
 - **Cats Effect native.** Built directly on `Ref[F, State]` for lock-free state management and `Clock[F]` for time. No bridging between Java concurrency primitives and Cats Effect fibers.
-- **Observable by construction.** State transitions emit `CircuitBreakerStateChange` events to Kinesis and update the `keyra_circuit_breaker_state` Prometheus gauge. Wiring observability into a library's internal callbacks is always more fragile than owning the code.
+- **Observable by construction.** State transitions emit `CircuitBreakerStateChange` events to Kinesis and update the `gate_circuit_breaker_state` Prometheus gauge. Wiring observability into a library's internal callbacks is always more fragile than owning the code.
 
 ## What's Sacrificed
 

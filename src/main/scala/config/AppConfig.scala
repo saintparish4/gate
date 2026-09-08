@@ -74,7 +74,7 @@ case class PrometheusConfig(enabled: Boolean = true) derives ConfigReader
 
 case class TracingConfig(
     enabled: Boolean = false,
-    serviceName: String = "keyra",
+    serviceName: String = "gate",
     exporterEndpoint: String = "http://localhost:4317",
 ) derives ConfigReader
 
@@ -134,7 +134,7 @@ case class IdempotencyConfig(
 // Token quota limits for AI workloads (per-user, per-agent, per-org)
 case class TokenQuotaConfig(
     enabled: Boolean = false,
-    tableName: String = "keyra-token-quotas",
+    tableName: String = "gate-token-quotas",
     userLimit: Long = 1_000_000,
     userWindowSeconds: Long = 3600,
     agentLimit: Long = 500_000,

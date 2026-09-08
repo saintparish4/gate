@@ -2,11 +2,11 @@ global:
   scrape_interval: 5s
   evaluation_interval: 15s
   external_labels:
-    app: keyra
+    app: gate
     env: local
 
 scrape_configs:
-  - job_name: keyra
+  - job_name: gate
     metrics_path: /metrics
     static_configs:
       - targets: ["rate-limiter:8080"]

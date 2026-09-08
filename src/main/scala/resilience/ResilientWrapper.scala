@@ -131,7 +131,7 @@ object ResilientRateLimitStore:
         val withTimeout = Temporal[F]
           .timeout(operation, config.timeout.rateLimitCheck)
           .adaptError { case _: java.util.concurrent.TimeoutException =>
-            core.KeyraError.StoreTimeout(name, config.timeout.rateLimitCheck)
+            core.GateError.StoreTimeout(name, config.timeout.rateLimitCheck)
           }
 
         val withRetry = Retry.withPolicy(retryPolicy, name)(withTimeout)

@@ -40,7 +40,7 @@ case class RetryPolicy(
     multiplier: Double = 2.0,
     jitterFactor: Double = 0.1,
     retryOn: Throwable => Boolean = {
-      case _: core.KeyraError.Retryable => true
+      case _: core.GateError.Retryable => true
       case _ => false
     },
 ):
@@ -81,7 +81,7 @@ object RetryPolicy:
     multiplier = 2.0,
     jitterFactor = 0.2,
     retryOn = {
-      case _: core.KeyraError.Retryable => true
+      case _: core.GateError.Retryable => true
       case _: software.amazon.awssdk.services.dynamodb.model.ProvisionedThroughputExceededException =>
         true
       case _: software.amazon.awssdk.core.exception.SdkServiceException => true
@@ -90,7 +90,7 @@ object RetryPolicy:
   )
 
   /** Retry policy for OCC (optimistic concurrency control) conflicts. Retries
-    * on KeyraError.Retryable and on OCCConflictException so that
+    * on GateError.Retryable and on OCCConflictException so that
     * DynamoDBRateLimitStore / LeakyBucketRateLimitStore (which still throw
     * OCCConflictException) get OCC retries.
     */
@@ -101,7 +101,7 @@ object RetryPolicy:
     multiplier = 1.5,
     jitterFactor = 0.2,
     retryOn = {
-      case _: core.KeyraError.Retryable => true
+      case _: core.GateError.Retryable => true
       case _: OCCConflictException => true
       case _ => false
     },
@@ -115,7 +115,7 @@ object RetryPolicy:
     multiplier = 2.0,
     jitterFactor = 0.15,
     retryOn = {
-      case _: core.KeyraError.Retryable => true
+      case _: core.GateError.Retryable => true
       case _: software.amazon.awssdk.services.kinesis.model.ProvisionedThroughputExceededException =>
         true
       case _: software.amazon.awssdk.core.exception.SdkServiceException => true

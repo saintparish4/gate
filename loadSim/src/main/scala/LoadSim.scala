@@ -15,7 +15,7 @@ import java.util.concurrent.{ConcurrentHashMap, ConcurrentLinkedQueue}
 import org.HdrHistogram.ConcurrentHistogram
 
 /**
- * Load simulation runner for Keyra.
+ * Load simulation runner for Gate.
  *
  * Scenarios:
  *   normal         — many unique keys, steady rate, verifies base throughput

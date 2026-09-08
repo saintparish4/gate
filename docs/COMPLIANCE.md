@@ -1,4 +1,4 @@
-# Keyra Compliance Documentation — PCI DSS 4.0.1
+# Gate Compliance Documentation — PCI DSS 4.0.1
 
 ## Audit Trail Architecture
 

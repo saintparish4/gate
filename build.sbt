@@ -64,7 +64,7 @@ dockerBaseImage := "eclipse-temurin:17-jre"
 dockerExposedPorts := Seq(8080)
 
 lazy val root = project.in(file(".")).settings(
-  name := "keyra",
+  name := "gate",
   version := "0.1.0-SNAPSHOT",
   scalaVersion := scala3Version,
   libraryDependencies += "org.scalameta" %% "munit" % "1.0.0" % Test,
@@ -80,7 +80,7 @@ addCommandAlias(
 )
 
 lazy val loadSim = project.in(file("loadSim")).settings(
-  name := "keyra-load-sim",
+  name := "gate-load-sim",
   scalaVersion := scala3Version,
   libraryDependencies ++= Seq(
     "org.typelevel" %% "cats-effect" % CatsEffectVersion,

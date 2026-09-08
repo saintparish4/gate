@@ -287,7 +287,7 @@ object TokenQuotaService:
     ): F[ReconcileResult] = outcome match
       case ReserveOutcome.Reserved(states) => levels.traverse_(l =>
           metrics.gauge(
-            "keyra_tokens_consumed",
+            "gate_tokens_consumed",
             states(l.target.pk).totalTokens.toDouble,
             Map("level" -> l.level.prefix) ++ identifierDims(identifier, l.level),
           ),

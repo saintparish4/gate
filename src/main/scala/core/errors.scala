@@ -2,20 +2,20 @@ package core
 
 import scala.concurrent.duration.FiniteDuration
 
-/** Sealed error hieracrchy for all domain-level failures in Keyra.
+/** Sealed error hieracrchy for all domain-level failures in Gate.
   *
   * Split into Retryable (caller may retry after a delay) and NonRetryable
   * (caller must not retry -- either a logic error or a hard resource limit).
   * This replaces the scattered RuntimeException subclasses in CircuitBreaker,
   * GracefulDegradation, and ResilientWrapper.
   */
-sealed trait KeyraError extends Exception:
+sealed trait GateError extends Exception:
   override def fillInStackTrace(): Throwable = this // cheap -- no stack trace needed
 
-object KeyraError:
+object GateError:
 
-  sealed trait Retryable extends KeyraError
-  sealed trait NonRetryable extends KeyraError
+  sealed trait Retryable extends GateError
+  sealed trait NonRetryable extends GateError
 
   // ── Retryable ──────────────────────────────────────────────────────────────
 

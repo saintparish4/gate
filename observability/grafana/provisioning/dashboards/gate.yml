@@ -1,9 +1,9 @@
 apiVersion: 1
 
 providers:
-  - name: Keyra
+  - name: Gate
     orgId: 1
-    folder: Keyra
+    folder: Gate
     type: file
     disableDeletion: false
     editable: true
