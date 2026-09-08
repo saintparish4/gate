@@ -131,7 +131,7 @@ curl http://localhost:8080/health
 ```
 
 ```json
-{ "status": "healthy", "version": "0.2.0" }
+{ "status": "healthy", "version": "0.1.0" }
 ```
 
 **Step 3 — Check a rate limit (allowed)**
@@ -426,7 +426,7 @@ The service exposes two probe endpoints on the same HTTP port (`8080`):
 Returns `200 OK` whenever the process is alive. No dependency checks are performed. Use for container liveness probes; failure means the container should be restarted.
 
 ```json
-{ "status": "healthy", "version": "0.2.0" }
+{ "status": "healthy", "version": "0.1.0" }
 ```
 
 ### `GET /ready` — readiness
@@ -835,20 +835,17 @@ logger.info(
 )
 ```
 
-## Roadmap
+## Status
 
-Gate is being built in 8 phases. Phases 1–4 are complete; Phase 5 is in progress.
+Gate is at **0.1.0**. Rate limiting, LLM token quotas, and idempotency are
+implemented, tested at unit, property, integration, and end-to-end level, and
+gated in CI by three invariants that run against a live stack on every change:
+token-bucket non-over-issue, idempotency exactly-one-Created, and token-quota
+non-over-admission.
 
-| Phase | Status | Description |
-|-------|--------|-------------|
-| **1. Core Hardening** | Done | Resilience stack wiring, bug fixes, DRY cleanup, test foundations |
-| **2. Idempotency Completeness** | Done | Request fingerprinting, TOCTOU race fix, 409 Conflict |
-| **3. Token Quotas** | Done | Multi-level LLM token quota enforcement (user/agent/org) |
-| **4. Prometheus & OpenTelemetry** | Done | Prometheus endpoint, dual-publish metrics, distributed tracing |
-| **5. Audit Trail & S3 Compliance** | Partial | PCI DSS 4.0.1 audit events to Kinesis + structured logs. S3 archival via Firehose defined in Terraform but not yet deployed. |
-| **6. Sliding Window** | Planned | Third rate-limiting algorithm option |
-| **7. Client SDKs & Maven** | Planned | TypeScript + Python SDKs, http4s middleware, Maven Central |
-| **8. Managed SaaS** | Planned | DynamoDB Global Tables, RBAC, compliance dashboard, billing |
+Not yet proven: the Terraform stack has never been applied, so there are no
+numbers from a real AWS deployment. Treat the performance figures here as
+LocalStack measurements.
 
 ## Contributing
 

@@ -448,7 +448,7 @@ Returns service health status.
 ```json
 {
   "status": "healthy",
-  "version": "0.2.0"
+  "version": "0.1.0"
 }
 ```
 

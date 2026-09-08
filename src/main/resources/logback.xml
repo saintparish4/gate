@@ -1,0 +1,18 @@
+<configuration>
+  <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+    <encoder>
+      <pattern>%d{HH:mm:ss.SSS} %-5level %logger{36} - %msg%n</pattern>
+    </encoder>
+  </appender>
+
+  <!-- The AWS SDK and Netty log every request, response and wire-level hex dump
+       at DEBUG. Without this the shipped image writes hundreds of thousands of
+       lines an hour and buries the application's own logs. -->
+  <logger name="software.amazon.awssdk" level="WARN"/>
+  <logger name="io.netty" level="WARN"/>
+  <logger name="org.http4s" level="INFO"/>
+
+  <root level="${LOG_LEVEL:-INFO}">
+    <appender-ref ref="STDOUT"/>
+  </root>
+</configuration>

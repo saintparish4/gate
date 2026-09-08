@@ -63,13 +63,17 @@ enablePlugins(JavaAppPackaging, DockerPlugin)
 dockerBaseImage := "eclipse-temurin:17-jre"
 dockerExposedPorts := Seq(8080)
 
-lazy val root = project.in(file(".")).settings(
+lazy val root = project.in(file(".")).enablePlugins(BuildInfoPlugin).settings(
   name := "gate",
-  version := "0.1.0-SNAPSHOT",
+  version := "0.1.0",
   scalaVersion := scala3Version,
   libraryDependencies += "org.scalameta" %% "munit" % "1.0.0" % Test,
   scalacOptions += "-Xkind-projector",
   semanticdbEnabled := true,
+  // /health reports this. It used to be a literal in Routes.scala and had
+  // already drifted to 0.2.0 while the build said 0.1.0-SNAPSHOT.
+  buildInfoKeys := Seq[BuildInfoKey](name, version),
+  buildInfoPackage := "buildinfo",
 )
 
 // Run unit tests only (excludes integration tests that require Docker/LocalStack).

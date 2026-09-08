@@ -234,7 +234,8 @@ class HttpApiIntegrationSpec
         body <- response.as[String]
       } yield {
         body should include("healthy")
-        body should include("0.2.0")
+        // Asserted against the build so the literal cannot drift again.
+        body should include(buildinfo.BuildInfo.version)
       }
     }
 
