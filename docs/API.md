@@ -524,8 +524,9 @@ All error responses follow this format:
 
 | Status | Error Code | Description |
 |--------|------------|-------------|
-| 400 | `bad_request` | Invalid request format or parameters |
+| 400 | `bad_request` | Body is not valid JSON, or a parameter is invalid |
 | 401 | `unauthorized` | Missing or invalid authentication |
+| 422 | — | Body is valid JSON but does not match the endpoint's schema (e.g. a required field is missing) |
 | 404 | `not_found` | Resource not found |
 | 429 | `rate_limit_exceeded` | Rate limit exceeded |
 | 500 | `internal_error` | Internal server error |

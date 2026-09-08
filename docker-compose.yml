@@ -18,11 +18,13 @@ services:
       - "localstack-data:/var/lib/localstack"
       - "/var/run/docker.sock:/var/run/docker.sock" 
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
-      interval: 10s 
-      timeout: 5s 
-      retries: 10
-      start_period: 30s 
+      # Healthy only once the ready.d init hooks (table + stream creation) have
+      # completed, so dependants never start against a half-initialised stack.
+      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/init/ready | grep -q '\"completed\": true'"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 20s
     networks:
       - rate-limiter-network 
 
@@ -53,9 +55,15 @@ services:
       - TRACING_ENABLED=true
       - OTEL_SERVICE_NAME=gate
       - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://jaeger:4317}
-      # Local dev: fail-open so a tripped circuit breaker doesn't block the smoke test.
-      # Production uses reject-all (the application.conf default).
-      - DEGRADATION_MODE=allow-all
+      # LocalStack is one Python process, roughly 10-50x slower than DynamoDB
+      # under concurrency, so the production 2 s budgets would time out normal
+      # OCC retry loops here and trip the circuit breaker. These only widen the
+      # per-check budget; the limits themselves are unchanged.
+      - TIMEOUT_RATE_LIMIT_CHECK=10 seconds
+      - TIMEOUT_IDEMPOTENCY_CHECK=10 seconds
+      # DEGRADATION_MODE is left at the production default (reject-all) so the
+      # CI correctness job measures real behaviour; allow-all would turn a
+      # tripped circuit breaker into unlimited admissions.
       # Meta auth rate limit (per API key, per minute) — raised for load tests
       # and CI so the single shared `test-api-key` isn't throttled by the
       # anti-abuse counter the auth middleware uses against brute-force

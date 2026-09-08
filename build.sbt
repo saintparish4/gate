@@ -82,6 +82,10 @@ addCommandAlias(
 lazy val loadSim = project.in(file("loadSim")).settings(
   name := "gate-load-sim",
   scalaVersion := scala3Version,
+  // Forked so the simulator's exit code reaches sbt. Unforked, an invariant
+  // that reports ExitCode.Error still ends the task with [success], which
+  // makes the CI correctness job green no matter what it measured.
+  Compile / run / fork := true,
   libraryDependencies ++= Seq(
     "org.typelevel" %% "cats-effect" % CatsEffectVersion,
     "org.typelevel" %% "cats-effect-std" % CatsEffectVersion,

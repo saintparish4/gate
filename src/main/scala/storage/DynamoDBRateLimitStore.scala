@@ -38,10 +38,11 @@ import DynamoDBOps.*
   *
   * ==OCC (optimistic concurrency control)==
   * Conditional write: first write uses attribute_not_exists(pk); updates use
-  * version = :expectedVersion. Retry policy: 1 ms fixed delay, max 10 attempts
-  * total (initial + up to 9 retries) on ConditionalCheckFailedException. High
-  * contention: after 10 failed attempts we reject the request (no over-issuing
-  * of tokens).
+  * version = :expectedVersion. Retry policy: RetryPolicy.occRetry (jittered
+  * exponential backoff from 1 ms, up to 10 retries) on
+  * ConditionalCheckFailedException. High contention: once retries are exhausted
+  * the request is rejected (no over-issuing of tokens). Any other failure
+  * propagates unchanged so the resilience layer can classify it.
   *
   * Table Schema:
   *   - pk (S): Partition key - "ratelimit#<key>"
@@ -68,10 +69,12 @@ class DynamoDBRateLimitStore[F[_]: Async: Logger](
       singleAttempt(key, cost, profile),
     ).flatMap(r =>
       metrics.gauge("RateLimitOCCAttempts", r.attempts.toDouble).as(r.result),
-    ).handleErrorWith { case _: OCCConflictException =>
-      Clock[F].realTime.map(_.toMillis).map(now =>
-        RateLimitDecision.Rejected(1, TokenBucket.resetAt(now, 0, profile)),
-      )
+    ).handleErrorWith {
+      case _: OCCConflictException => Clock[F].realTime.map(_.toMillis)
+          .map(now =>
+            RateLimitDecision.Rejected(1, TokenBucket.resetAt(now, 0, profile)),
+          )
+      case other => Async[F].raiseError(other)
     }
 
   /** Single attempt: read state, refill, try consume+write. On OCC conflict

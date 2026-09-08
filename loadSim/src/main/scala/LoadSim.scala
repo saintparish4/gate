@@ -323,7 +323,7 @@ object Scenarios:
     }
 
   // ------------------------------------------------------------------
-  // Correctness scenario: two invariants, CI-gated
+  // Correctness scenario: three invariants, CI-gated
   // ------------------------------------------------------------------
 
   /**
@@ -331,9 +331,12 @@ object Scenarios:
    *
    * Invariant A — token-bucket non-over-issue:
    *   Server must never issue more tokens than capacity + refillRate * duration.
-   *   Default profile: capacity=100 tokens, refillRate=10 tokens/s.
+   *   Uses free-api-key (Free tier): capacity=20 tokens, refillRate=2 tokens/s.
    *   N=50 parallel clients target a single unique key for T=30s.
-   *   Assert: allowed_count <= 100 + ceil(10 * 30) + epsilon (epsilon=2 for clock skew).
+   *   Assert: allowed_count <= 20 + 2 * 30 + epsilon (epsilon=2 for clock skew),
+   *   allowed_count >= a quarter of that budget (a limiter that goes dark also fails),
+   *   at least one request was blocked (otherwise the run proved nothing), and
+   *   no HTTP errors.
    *
    * Invariant B — idempotency exactly-one-Created:
    *   For K=10 shared keys, N=50 parallel clients must never observe more than
@@ -350,6 +353,7 @@ object Scenarios:
     val runId = System.currentTimeMillis.toString
     for
       _  <- Console[IO].println(s"=== correctness — run $runId ===")
+      _  <- warmUp(client, baseUrl, runId)
       a  <- invariantA_tokenBucketNonOverIssue(client, baseUrl, runId)
       b  <- invariantB_idempotencyExactlyOneCreated(client, baseUrl, runId)
       c  <- invariantC_quotaNonOverAdmission(client, baseUrl, runId)
@@ -371,6 +375,30 @@ object Scenarios:
 
   private case class InvariantResult(passed: Boolean, details: String)
 
+  /**
+   * Ramps 1 -> 5 -> 20 workers over ~15 s on throwaway keys before any invariant
+   * runs. A cold JVM answering a 50-way burst exceeds the server's 2 s check
+   * timeout, which trips its circuit breaker and blacks out the whole window; the
+   * invariants are about correctness, not cold-start latency, so I warm the hot
+   * path first the way real traffic would.
+   */
+  private def warmUp(client: Client[IO], baseUrl: String, runId: String): IO[Unit] =
+    val stages = List((1, 5), (5, 5), (20, 5)) // (workers, seconds)
+    Console[IO].println("-- Warm-up — ramping 1 -> 5 -> 20 workers on throwaway keys --") *>
+    stages.zipWithIndex.traverse_ { case ((workers, secs), stage) =>
+      val ok  = new AtomicLong(0)
+      val bad = new AtomicLong(0)
+      IO.race(
+        IO.sleep(secs.seconds),
+        (0 until workers).toList.parTraverse_ { w =>
+          sendRateLimitCheck(client, baseUrl, s"warmup:$runId:$stage:$w").flatMap {
+            case Right(_) => IO(ok.incrementAndGet()).void
+            case Left(_)  => IO(bad.incrementAndGet()).void
+          }.loop
+        },
+      ).flatMap(_ => Console[IO].println(f"  [warmup] stage ${stage + 1} — $workers%2d workers x ${secs}s  |  ok=${ok.get}  errors=${bad.get}"))
+    }
+
   private def invariantA_tokenBucketNonOverIssue(
     client:  Client[IO],
     baseUrl: String,
@@ -378,10 +406,15 @@ object Scenarios:
   ): IO[InvariantResult] =
     val concurrency   = 50
     val durationSecs  = 30
-    val capacity      = 100      // default profile
-    val refillPerSec  = 10       // default profile
+    // free-api-key maps to the Free tier (20 tokens, 2 tokens/s in application.conf).
+    // Premium refills faster than this driver can send against LocalStack, so it
+    // would never block and prove nothing.
+    val apiKey        = "free-api-key"
+    val capacity      = 20
+    val refillPerSec  = 2
     val epsilon       = 2        // small slack for clock skew
     val maxAllowed    = capacity + (refillPerSec * durationSecs) + epsilon
+    val minAllowed    = (capacity + (refillPerSec * durationSecs)) / 4
     val key           = s"correctness:A:$runId"  // fresh key so prior state doesn't bias
 
     val total   = new AtomicLong(0)
@@ -393,17 +426,19 @@ object Scenarios:
     Console[IO].println(
       s"""-- Invariant A — token-bucket non-over-issue --
          |  key           = $key
+         |  apiKey        = $apiKey (Free tier)
          |  concurrency   = $concurrency
          |  duration      = ${durationSecs}s
          |  capacity      = $capacity
          |  refillPerSec  = $refillPerSec
          |  maxAllowed    = $maxAllowed  (capacity + refill*duration + $epsilon)
+         |  minAllowed    = $minAllowed  (a quarter of the budget; catches a limiter that rejects everything)
          |""".stripMargin
     ) *>
     IO.race(
       progressTicker("invariantA", durationSecs, total, allowed, blocked, errors),
       (0 until concurrency).toList.parTraverse_ { _ =>
-        sendRateLimitCheck(client, baseUrl, key).flatMap {
+        sendRateLimitCheck(client, baseUrl, key, apiKey).flatMap {
           case Right(true)  => IO { total.incrementAndGet(); allowed.incrementAndGet() }
           case Right(false) => IO { total.incrementAndGet(); blocked.incrementAndGet() }
           case Left(msg)    => IO { total.incrementAndGet(); errors.incrementAndGet(); sampler.record(msg) }
@@ -411,13 +446,16 @@ object Scenarios:
       }
     ) *> IO.defer {
       val a     = allowed.get
+      val b     = blocked.get
       val t     = total.get
       val e     = errors.get
-      val pass  = a <= maxAllowed && e == 0
+      val pass  = a <= maxAllowed && a >= minAllowed && b > 0 && e == 0
       val why   =
-        if pass then s"allowed=$a <= maxAllowed=$maxAllowed (total=$t, blocked=${blocked.get}, errors=$e)"
-        else if e > 0 then s"errors=$e (total=$t, allowed=$a, blocked=${blocked.get})\n     Sample errors:\n${sampler.render}"
-        else s"OVER-ISSUE: allowed=$a > maxAllowed=$maxAllowed (total=$t, blocked=${blocked.get}, errors=$e)"
+        if pass then s"minAllowed=$minAllowed <= allowed=$a <= maxAllowed=$maxAllowed (total=$t, blocked=$b, errors=$e)"
+        else if e > 0 then s"errors=$e (total=$t, allowed=$a, blocked=$b)\n     Sample errors:\n${sampler.render}"
+        else if b == 0 then s"VACUOUS: never blocked (total=$t, allowed=$a) — the bucket was never exhausted"
+        else if a < minAllowed then s"UNDER-ISSUE: allowed=$a < minAllowed=$minAllowed (total=$t, blocked=$b) — the limiter went dark"
+        else s"OVER-ISSUE: allowed=$a > maxAllowed=$maxAllowed (total=$t, blocked=$b, errors=$e)"
       IO.pure(InvariantResult(pass, why))
     }
 
@@ -458,7 +496,7 @@ object Scenarios:
             case Right("conflict")    => IO { total.incrementAndGet(); conflict.incrementAndGet() }
             case Right(other)         => IO { total.incrementAndGet(); errors.incrementAndGet(); sampler.record(s"unexpected status: $other") }
             case Left(msg)            => IO { total.incrementAndGet(); errors.incrementAndGet(); sampler.record(msg) }
-          } *> step(i + 1)
+          } >> step(i + 1)
         step(0)
       }
     ) *> IO.defer {
@@ -762,20 +800,28 @@ object Http:
       .run(req)
       .use { resp =>
         resp.as[String].map { body =>
-          if resp.status.code == 200 then Right(())
+          // Any web app answers 200 on /health; only Gate answers with this body.
+          val isGate = io.circe.parser.parse(body)
+            .flatMap(_.hcursor.get[String]("status")).toOption.contains("healthy")
+          if resp.status.code == 200 && isGate then Right(())
           else Left(s"HTTP ${resp.status.code}: ${body.take(200)}")
         }
       }
       .handleError(e => Left(Option(e.getMessage).getOrElse(e.getClass.getSimpleName)))
 
-  def sendRateLimitCheck(client: Client[IO], baseUrl: String, key: String): IO[Either[String, Boolean]] =
+  def sendRateLimitCheck(
+    client:  Client[IO],
+    baseUrl: String,
+    key:     String,
+    apiKey:  String = LoadSim.defaultApiKey,
+  ): IO[Either[String, Boolean]] =
     val body = Json.obj("key" := key, "cost" := 1)
     val req  = Request[IO](
       method  = Method.POST,
       uri     = Uri.unsafeFromString(s"$baseUrl/v1/ratelimit/check"),
       headers = Headers(
         "Content-Type"  -> "application/json",
-        "Authorization" -> s"Bearer ${LoadSim.defaultApiKey}",
+        "Authorization" -> s"Bearer $apiKey",
       ),
     ).withEntity(body.noSpaces)
 
@@ -803,7 +849,8 @@ object Http:
 
     client.run(req).use { resp =>
       resp.as[String].map { body =>
-        if resp.status.code == 200 then
+        // 200 = new/duplicate, 202 = in_progress; both carry a status field.
+        if resp.status.code == 200 || resp.status.code == 202 then
           io.circe.parser.parse(body)
             .flatMap(_.hcursor.get[String]("status"))
             .left.map(_.getMessage)
