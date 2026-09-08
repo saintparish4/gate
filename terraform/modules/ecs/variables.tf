@@ -84,3 +84,9 @@ variable "scale_down_threshold" {
   type    = number
   default = 30
 }
+
+variable "health_check_grace_period_seconds" {
+  description = "Seconds to let a task boot before failed ALB health checks count against it"
+  type        = number
+  default     = 180
+}

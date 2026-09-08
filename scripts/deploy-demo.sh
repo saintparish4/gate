@@ -47,15 +47,19 @@ INTERVAL=10   # Check every 10 seconds
 ELAPSED=0
 
 while [ $ELAPSED -lt $MAX_WAIT ]; do
-  # Check if ALB is responding
-  if curl -sf --max-time 5 "http://$ALB_DNS/health" > /dev/null 2>&1; then
-    echo "Service is healthy!"
+  # /ready, not /health: /health returns 200 as soon as the process is up, even
+  # with every backend unreachable, so waiting on it would report success on a
+  # deployment that cannot serve a single request.
+  if curl -sf --max-time 5 "http://$ALB_DNS/ready" > /dev/null 2>&1; then
+    echo "Service is ready (dependencies reachable)!"
     break
   fi
 
-  # Check if ALB is responding at all (even if not healthy)
-  if curl -sf --max-time 5 "http://$ALB_DNS" > /dev/null 2>&1; then
-    echo "Service is responding but not yet healthy, waiting..."
+  # Distinguish "not up yet" from "up but dependencies unreachable". /health
+  # answering while /ready does not means the process is fine and DynamoDB or
+  # Kinesis is not -- usually IAM or the VPC endpoints, not a slow boot.
+  if curl -sf --max-time 5 "http://$ALB_DNS/health" > /dev/null 2>&1; then
+    echo "Process is up but dependencies are not ready yet... (${ELAPSED}s/${MAX_WAIT}s)"
   else
     echo "Service not yet available, waiting... (${ELAPSED}s/${MAX_WAIT}s)"
   fi
@@ -65,8 +69,10 @@ while [ $ELAPSED -lt $MAX_WAIT ]; do
 done
 
 if [ $ELAPSED -ge $MAX_WAIT ]; then
-  echo "Timeout: Service did not become healthy within ${MAX_WAIT} seconds"
-  echo "   Check ECS service status and CloudWatch logs"
+  echo "Timeout: Service did not become ready within ${MAX_WAIT} seconds"
+  echo "   Check ECS service status and CloudWatch logs. If /health answers but"
+  echo "   /ready does not, the component list says which backend is failing:"
+  echo "     curl -s http://$ALB_DNS/ready"
   exit 1
 fi
 
@@ -80,4 +86,8 @@ echo ""
 echo "TEAR IT DOWN WHEN DONE:  ./scripts/teardown-demo.sh"
 echo ""
 echo "Quick test:"
-echo "   curl http://$ALB_DNS/health"
+echo "   curl http://$ALB_DNS/ready"
+echo "   curl -X POST http://$ALB_DNS/v1/ratelimit/check \\"
+echo "     -H 'Content-Type: application/json' \\"
+echo "     -H 'Authorization: Bearer test-api-key' \\"
+echo "     -d '{\"key\":\"demo\",\"cost\":1}'"
