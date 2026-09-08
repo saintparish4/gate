@@ -9,9 +9,10 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 echo "Deploying rate limiter demo environment..."
 
 # Check for required environment variable
-if [ -z "$ECR_IMAGE" ]; then
+if [ -z "${ECR_IMAGE:-}" ]; then
   echo "Error: ECR_IMAGE environment variable is required"
-  echo "   Example: export ECR_IMAGE=123456789.dkr.ecr.us-east-1.amazonaws.com/rate-limiter:latest"
+  echo "   Build and push it first (this also creates the ECR repository):"
+  echo "     export ECR_IMAGE=\$(./scripts/publish-image.sh)"
   exit 1
 fi
 
@@ -71,8 +72,12 @@ fi
 
 echo ""
 echo "Demo ready at: http://$ALB_DNS"
-echo "Estimated cost: ~\$0.50/hour"
-echo "Remember to run: ./scripts/teardown-demo.sh when done"
+echo ""
+echo "Cost: roughly \$0.25/hour in us-east-1 - 2 NAT gateways (\$0.09), five"
+echo "interface VPC endpoints across 2 AZs (\$0.10), ALB (\$0.023), Fargate"
+echo "256/512 (\$0.012), one Kinesis shard (\$0.015). About \$6/day if left up."
+echo ""
+echo "TEAR IT DOWN WHEN DONE:  ./scripts/teardown-demo.sh"
 echo ""
 echo "Quick test:"
 echo "   curl http://$ALB_DNS/health"
