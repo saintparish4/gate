@@ -140,3 +140,17 @@ variable "alarm_sns_topic_arn" {
   type        = string
   default     = ""
 }
+
+variable "enable_secrets_manager" {
+  description = <<-DESC
+    Load API keys from Secrets Manager instead of the built-in keys.
+
+    Off by default on purpose: modules/secrets seeds the api-keys secret with a
+    single placeholder entry whose "active" flag is false, so turning this on
+    before writing real keys into the secret leaves the service with zero usable
+    API keys and every request answers 401. Populate the secret first, then set
+    this to true.
+  DESC
+  type        = bool
+  default     = false
+}

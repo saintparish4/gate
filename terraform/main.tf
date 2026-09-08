@@ -119,16 +119,22 @@ module "ecs" {
 
   # Environment variables for the container
   environment_variables = {
-    AWS_REGION           = var.aws_region
-    RATE_LIMIT_TABLE     = module.dynamodb.rate_limit_table_name
-    IDEMPOTENCY_TABLE    = module.dynamodb.idempotency_table_name
-    TOKEN_QUOTA_TABLE    = module.dynamodb.token_quota_table_name
-    KINESIS_STREAM       = module.kinesis.stream_name
-    KINESIS_ENABLED      = "true"
-    METRICS_ENABLED      = "true"
-    METRICS_NAMESPACE    = "RateLimiter/${var.environment}"
-    SECRETS_ENABLED      = "true"
-    API_KEYS_SECRET_NAME = module.secrets.api_keys_secret_name
+    AWS_REGION        = var.aws_region
+    RATE_LIMIT_TABLE  = module.dynamodb.rate_limit_table_name
+    IDEMPOTENCY_TABLE = module.dynamodb.idempotency_table_name
+    TOKEN_QUOTA_TABLE = module.dynamodb.token_quota_table_name
+    KINESIS_STREAM    = module.kinesis.stream_name
+    KINESIS_ENABLED   = "true"
+    METRICS_ENABLED   = "true"
+    METRICS_NAMESPACE = "RateLimiter/${var.environment}"
+    # These three compose the Secrets Manager lookup key and must agree with the
+    # secret's name in modules/secrets/main.tf. SECRETS_ENABLED/SECRETS_MANAGER
+    # naming matters: the app reads SECRETS_MANAGER_ENABLED, and the previous
+    # SECRETS_ENABLED was silently ignored.
+    SECRETS_MANAGER_ENABLED = var.enable_secrets_manager ? "true" : "false"
+    SECRETS_PREFIX          = var.project_name
+    SECRETS_ENVIRONMENT     = var.environment
+    API_KEYS_SECRET_NAME    = "api-keys"
   }
 
   # IAM permissions

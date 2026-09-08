@@ -23,7 +23,7 @@ object SecurityModule:
           for
             secretsClient <- SecretsManagerStore.clientResource[F](config.aws)
             secretsConfig = SecretsConfig(
-              environment = "dev",
+              environment = config.security.secrets.environment,
               secretPrefix = config.security.secrets.secretPrefix,
               cacheTtl = config.security.secrets.cacheTtl,
               apiKeysSecretName = config.security.secrets.apiKeysSecretName,
