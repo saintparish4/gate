@@ -241,6 +241,18 @@ case class RateLimitCheckRequest(
     endpoint: Option[String] = None,
 )
 
+object RateLimitCheckRequest:
+  // Circe's auto derivation ignores Scala default values, so a body that
+  // legitimately omits `cost` would fail to decode. I decode it explicitly so
+  // the wire contract matches what docs/API.md documents as optional.
+  given io.circe.Decoder[RateLimitCheckRequest] = c =>
+    for
+      key <- c.get[String]("key")
+      cost <- c.getOrElse[Int]("cost")(1)
+      profile <- c.get[Option[String]]("profile")
+      endpoint <- c.get[Option[String]]("endpoint")
+    yield RateLimitCheckRequest(key, cost, profile, endpoint)
+
 case class RateLimitCheckResponse(
     allowed: Boolean,
     tokensRemaining: Option[Int],

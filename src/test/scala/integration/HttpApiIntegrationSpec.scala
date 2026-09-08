@@ -458,4 +458,42 @@ class HttpApiIntegrationSpec
       }
     }
   }
+
+  "Request body contract" - {
+
+    def post(path: Uri, body: String): Request[IO] =
+      Request[IO](Method.POST, path).withEntity(body).putHeaders(
+        headers.`Content-Type`(MediaType.application.json),
+        headers.Authorization(Credentials.Token(ci"Bearer", "test-key")),
+      )
+
+    "POST /v1/ratelimit/check accepts a body that omits the optional cost" in {
+      val request = post(uri"/v1/ratelimit/check", """{"key": "default-cost"}""")
+      for {
+        response <- httpApp.run(request)
+        body <- response.as[String]
+        json <- IO.fromEither(parse(body))
+      } yield {
+        response.status shouldBe Status.Ok
+        // capacity 10, default cost 1
+        json.hcursor.get[Int]("tokensRemaining").toOption shouldBe Some(9)
+      }
+    }
+
+    "POST /v1/quota/check accepts a body that omits estimatedOutputTokens" in {
+      val request = post(
+        uri"/v1/quota/check",
+        """{"userId": "default-output", "estimatedInputTokens": 10}""",
+      )
+      httpApp.run(request).asserting(_.status shouldBe Status.Ok)
+    }
+
+    "an undecodable body is a 400, not a 500" in
+      httpApp.run(post(uri"/v1/ratelimit/check", "not json"))
+        .asserting(_.status shouldBe Status.BadRequest)
+
+    "a body missing a required field is a 422, not a 500" in
+      httpApp.run(post(uri"/v1/ratelimit/check", """{"cost": 1}"""))
+        .asserting(_.status shouldBe Status.UnprocessableEntity)
+  }
 }

@@ -132,8 +132,11 @@ object Main extends IOApp:
 
       appWithCorrelation = CorrelationIdMiddleware
         .middleware(correlationLocal)(routes.routes)
-      httpApp: org.http4s.HttpApp[IO] = Router("/" -> appWithCorrelation)
-        .orNotFound
+      // ErrorHandling turns a MessageFailure into a 4xx (400 for a body that
+      // is not JSON, 422 for one that does not match the schema); without it
+      // an undecodable body surfaces as an empty 500.
+      httpApp: org.http4s.HttpApp[IO] = org.http4s.server.middleware
+        .ErrorHandling.httpApp(Router("/" -> appWithCorrelation).orNotFound)
 
       _ <- Resource.make(Async[IO].unit)(_ =>
         summon[Logger[IO]]

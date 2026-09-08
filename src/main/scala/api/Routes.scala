@@ -138,7 +138,8 @@ class Routes[F[_]: Async: Tracer](
     publicRoutes <+> dashboardApi.routes <+> authMiddleware(authedRoutes),
   )
 
-  def httpApp: HttpApp[F] = Router("/" -> routes).orNotFound
+  def httpApp: HttpApp[F] = org.http4s.server.middleware.ErrorHandling
+    .httpApp(Router("/" -> routes).orNotFound)
 
 // API models
 case class HealthResponse(status: String, version: String)

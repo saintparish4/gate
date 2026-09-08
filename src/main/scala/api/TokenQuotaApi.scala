@@ -226,6 +226,25 @@ case class TokenQuotaCheckRequest(
     estimatedOutputTokens: Long = 0,
 )
 
+object TokenQuotaCheckRequest:
+  // See RateLimitCheckRequest: default values are not part of the derived
+  // decoder, so `estimatedOutputTokens` has to be read explicitly to stay
+  // optional on the wire.
+  given io.circe.Decoder[TokenQuotaCheckRequest] = c =>
+    for
+      userId <- c.get[String]("userId")
+      agentId <- c.get[Option[String]]("agentId")
+      orgId <- c.get[Option[String]]("orgId")
+      estimatedInputTokens <- c.get[Long]("estimatedInputTokens")
+      estimatedOutputTokens <- c.getOrElse[Long]("estimatedOutputTokens")(0L)
+    yield TokenQuotaCheckRequest(
+      userId,
+      agentId,
+      orgId,
+      estimatedInputTokens,
+      estimatedOutputTokens,
+    )
+
 case class TokenQuotaCheckResponse(
     allowed: Boolean,
     remainingTokens: Map[String, Long],
