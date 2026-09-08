@@ -150,7 +150,7 @@ case class ReadyResponse(
 )
 
 object BuildInfo:
-  val version = "0.2.0"
+  val version = buildinfo.BuildInfo.version
 
 object Routes:
   def apply[F[_]: Async: Tracer](
