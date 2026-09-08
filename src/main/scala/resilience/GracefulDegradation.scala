@@ -203,20 +203,24 @@ object Bulkhead:
     yield new Bulkhead[F]:
       private val logger = Logger[F]
 
-      override def execute[A](fa: F[A]): F[A] = queuedRef.update(_ + 1) *>
-        Temporal[F].timeout(
-          semaphore.permit.use(_ =>
+      // Only the wait for a permit is bounded by maxWait. The operation itself
+      // runs to completion once admitted, otherwise a slow backend turns the
+      // bulkhead into a hard timeout that cancels writes already in flight.
+      override def execute[A](fa: F[A]): F[A] =
+        val acquire = Temporal[F].timeout(semaphore.acquire, config.maxWait)
+          .adaptError { case _: java.util.concurrent.TimeoutException =>
+            core.GateError.BulkheadFull(name)
+          }
+        queuedRef.update(_ + 1) *>
+          Temporal[F].bracketFull(poll => poll(acquire))(_ =>
             queuedRef.update(_ - 1) *> inFlightRef.update(_ + 1) *>
               fa.guarantee(inFlightRef.update(_ - 1)),
-          ),
-          config.maxWait,
-        ).handleErrorWith {
-          case _: java.util.concurrent.TimeoutException => queuedRef
-              .update(_ - 1) *> logger.warn(
-              s"Bulkhead '$name' rejected request - wait timeout exceeded",
-            ) *> Temporal[F].raiseError(core.GateError.BulkheadFull(name))
-          case e => Temporal[F].raiseError(e)
-        }
+          )((_, _) => semaphore.release).onError {
+            case _: core.GateError.BulkheadFull => queuedRef.update(_ - 1) *>
+                logger.warn(
+                  s"Bulkhead '$name' rejected request - wait timeout exceeded",
+                )
+          }
 
       override def inFlight: F[Int] = inFlightRef.get
       override def queued: F[Int] = queuedRef.get

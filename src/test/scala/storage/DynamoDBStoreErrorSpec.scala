@@ -294,3 +294,40 @@ class DynamoDBStoreErrorSpec
         }
     }
   }
+
+  // ── DynamoDBRateLimitStore: non-OCC failures ───────────────────────────────
+
+  /** A client whose getItem fails with `ex`; every other call is unexpected. */
+  private def failingGetItemClient(ex: Throwable): DynamoDbAsyncClient = Proxy
+    .newProxyInstance(
+      classOf[DynamoDbAsyncClient].getClassLoader,
+      Array(classOf[DynamoDbAsyncClient]),
+      new InvocationHandler:
+        override def invoke(
+            proxy: Object,
+            method: java.lang.reflect.Method,
+            args: Array[Object],
+        ): Object = method.getName match
+          case "getItem" => CompletableFuture.failedFuture[Object](ex)
+          case "serviceName" => "DynamoDB"
+          case "close" => null
+          case other => CompletableFuture
+              .failedFuture[Object](new UnsupportedOperationException(
+                s"Stub does not implement: $other",
+              )),
+    ).asInstanceOf[DynamoDbAsyncClient]
+
+  "DynamoDBRateLimitStore — non-OCC failures" - {
+    "propagates an SDK client failure as itself, not as a MatchError" in {
+      val ex = software.amazon.awssdk.core.exception.SdkClientException.builder()
+        .message("Maximum pending connection acquisitions exceeded").build()
+      val store = new DynamoDBRateLimitStore[IO](
+        failingGetItemClient(ex),
+        "rate-limits",
+        MetricsPublisher.noop[IO],
+      )
+
+      store.checkAndConsume("k", 1, testProfile).attempt
+        .asserting(_ shouldBe Left(ex))
+    }
+  }

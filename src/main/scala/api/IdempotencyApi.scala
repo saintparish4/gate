@@ -78,16 +78,7 @@ class IdempotencyApi[F[_]: Async: Tracer](
 
       // Build response
       response <- buildCheckResponse(result)
-    yield response).handleErrorWith {
-      case e: CorruptIdempotencyRecordException => logger
-          .error(e)(s"Corrupt idempotency record for key=${e.key}") *>
-          ServiceUnavailable(io.circe.Json.obj(
-            "error" -> io.circe.Json.fromString("storage_corruption"),
-            "message" ->
-              io.circe.Json
-                .fromString(s"Idempotency record corrupted: ${e.detail}"),
-          ))
-    }
+    yield response).handleErrorWith(storageFailure("check"))
 
   /** POST /v1/idempotency/:key/complete
     *
@@ -97,41 +88,60 @@ class IdempotencyApi[F[_]: Async: Tracer](
       key: String,
       request: Request[F],
       client: AuthenticatedClient,
-  ): F[Response[F]] =
-    for
-      completeReq <- request.as[IdempotencyCompleteRequest]
-      now <- Clock[F].realTime.map(d => Instant.ofEpochMilli(d.toMillis))
+  ): F[Response[F]] = (for
+    completeReq <- request.as[IdempotencyCompleteRequest]
+    now <- Clock[F].realTime.map(d => Instant.ofEpochMilli(d.toMillis))
 
-      storedResponse = StoredResponse(
-        statusCode = completeReq.statusCode,
-        body = completeReq.body,
-        headers = completeReq.headers.getOrElse(Map.empty),
-        completedAt = now,
-      )
+    storedResponse = StoredResponse(
+      statusCode = completeReq.statusCode,
+      body = completeReq.body,
+      headers = completeReq.headers.getOrElse(Map.empty),
+      completedAt = now,
+    )
 
-      _ <- logger
-        .debug(s"Completing idempotency key: $key, client=${client.apiKeyId}")
-      success <- store.storeResponse(key, storedResponse)
+    _ <- logger
+      .debug(s"Completing idempotency key: $key, client=${client.apiKeyId}")
+    success <- store.storeResponse(key, storedResponse)
 
-      response <-
-        if success then
-          Ok(
-            IdempotencyCompleteResponse(
-              idempotencyKey = key,
-              status = "completed",
-            ).asJson,
-          )
-        else
-          Conflict(
-            IdempotencyCompleteResponse(
-              idempotencyKey = key,
-              status = "failed",
-              message = Some(
-                "Could not store response - key may not exist or is not pending",
-              ),
-            ).asJson,
-          )
-    yield response
+    response <-
+      if success then
+        Ok(
+          IdempotencyCompleteResponse(idempotencyKey = key, status = "completed")
+            .asJson,
+        )
+      else
+        Conflict(
+          IdempotencyCompleteResponse(
+            idempotencyKey = key,
+            status = "failed",
+            message = Some(
+              "Could not store response - key may not exist or is not pending",
+            ),
+          ).asJson,
+        )
+  yield response).handleErrorWith(storageFailure("complete"))
+
+  /** Corrupt records and unexpected store failures both become a structured 503
+    * so the caller knows not to proceed; body decoding failures pass through so
+    * http4s can answer 4xx as usual.
+    */
+  private def storageFailure(op: String): Throwable => F[Response[F]] =
+    case e: CorruptIdempotencyRecordException => logger
+        .error(e)(s"Corrupt idempotency record for key=${e.key}") *>
+        ServiceUnavailable(io.circe.Json.obj(
+          "error" -> io.circe.Json.fromString("storage_corruption"),
+          "message" ->
+            io.circe.Json
+              .fromString(s"Idempotency record corrupted: ${e.detail}"),
+        ))
+    case e: MessageFailure => Async[F].raiseError(e)
+    case e => logger.error(e)(s"Idempotency $op failed") *>
+        ServiceUnavailable(io.circe.Json.obj(
+          "error" -> io.circe.Json.fromString("storage_unavailable"),
+          "message" -> io.circe.Json.fromString(
+            s"Idempotency store failed during $op; retry the request",
+          ),
+        ))
 
   private def buildCheckResponse(result: IdempotencyResult): F[Response[F]] =
     result match
