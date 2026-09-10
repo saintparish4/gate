@@ -835,6 +835,36 @@ logger.info(
 )
 ```
 
+## Measured on AWS
+
+Every performance figure elsewhere in this README and in
+[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) is a **LocalStack** measurement.
+LocalStack does not model DynamoDB's real conditional-write latency, its
+throttling behaviour, or cross-AZ network cost, so those numbers establish that
+the system is correct — not what it costs or how fast it is.
+
+The table below is reserved for figures from a real deployment. It is empty
+because the stack has not been applied yet, and an empty table is more honest
+than a LocalStack number presented as an AWS one.
+
+| | LocalStack | AWS (`demo` profile) |
+|---|---|---|
+| p50 rate-limit check | see `docs/PERFORMANCE.md` | _pending_ |
+| p95 | " | _pending_ |
+| p99 | " | _pending_ |
+| Sustained req/s, 1 task | " | _pending_ |
+| Over-issue count, 50 concurrent on one key | 0 | _pending_ |
+| DynamoDB cost per 1M decisions | estimated | _pending_ |
+
+[`docs/DEPLOY-RUNBOOK.md`](docs/DEPLOY-RUNBOOK.md) is the procedure that fills
+it in: push the image, apply, prove the limiter is actually in the request path,
+load test, capture the over-issue count under real contention, then destroy
+everything. Roughly 90 minutes and under $5.
+
+The row that matters most is **over-issue count**. Latency is a property of the
+hardware; the token-bucket invariant holding on real DynamoDB, under real
+concurrent conditional writes, is a property of the design.
+
 ## Status
 
 Gate is at **0.1.0**. Rate limiting, LLM token quotas, and idempotency are
@@ -844,8 +874,9 @@ token-bucket non-over-issue, idempotency exactly-one-Created, and token-quota
 non-over-admission.
 
 Not yet proven: the Terraform stack has never been applied, so there are no
-numbers from a real AWS deployment. Treat the performance figures here as
-LocalStack measurements.
+numbers from a real AWS deployment — see [Measured on AWS](#measured-on-aws)
+for what that would take and what is reserved for it. Treat every performance
+figure here as a LocalStack measurement until that table is filled in.
 
 ## Contributing
 
