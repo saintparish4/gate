@@ -1,5 +1,7 @@
 package integration
 
+import java.util.concurrent.ExecutionException
+
 import scala.jdk.CollectionConverters.*
 
 import org.scalatest.{BeforeAndAfterAll, Suite}
@@ -19,7 +21,7 @@ import software.amazon.awssdk.services.dynamodb.model.*
 import software.amazon.awssdk.services.kinesis.KinesisAsyncClient
 import software.amazon.awssdk.services.kinesis.model.{
   CreateStreamRequest, DescribeStreamRequest as KinesisDescribeStreamRequest,
-  StreamStatus,
+  ResourceInUseException as KinesisResourceInUseException, StreamStatus,
 }
 
 /** Base trait for integration tests using LocalStack
@@ -120,7 +122,15 @@ trait LocalStackIntegrationSpec extends BeforeAndAfterAll {
           .build(),
       ).billingMode(BillingMode.PAY_PER_REQUEST).build()
 
-    dynamoDbClient.createTable(request).get()
+    // Suites share one LocalStack container and sbt runs them in parallel, so
+    // several can race to create the same table. Losing that race is not a
+    // failure -- the table exists, which is all the caller wanted.
+    try dynamoDbClient.createTable(request).get()
+    catch {
+      case e: ExecutionException
+          if e.getCause.isInstanceOf[ResourceInUseException] => ()
+      case _: ResourceInUseException => ()
+    }
     waitForTableActive(tableName)
 
     val ttlRequest = UpdateTimeToLiveRequest.builder().tableName(tableName)
@@ -128,7 +138,13 @@ trait LocalStackIntegrationSpec extends BeforeAndAfterAll {
         TimeToLiveSpecification.builder().attributeName("ttl").enabled(true)
           .build(),
       ).build()
-    dynamoDbClient.updateTimeToLive(ttlRequest).get()
+    // TTL is already enabled if another suite got there first.
+    try dynamoDbClient.updateTimeToLive(ttlRequest).get()
+    catch {
+      case e: ExecutionException
+          if e.getCause.isInstanceOf[ResourceInUseException] => ()
+      case _: ResourceInUseException => ()
+    }
   }
 
   protected def waitForTableActive(tableName: String): Unit = {
@@ -151,7 +167,13 @@ trait LocalStackIntegrationSpec extends BeforeAndAfterAll {
   protected def createKinesisStream(streamName: String): Unit = {
     val request = CreateStreamRequest.builder().streamName(streamName)
       .shardCount(1).build()
-    kinesisClient.createStream(request).get()
+    // Same race as createDynamoDBTable: a parallel suite may have created it.
+    try kinesisClient.createStream(request).get()
+    catch {
+      case e: ExecutionException
+          if e.getCause.isInstanceOf[KinesisResourceInUseException] => ()
+      case _: KinesisResourceInUseException => ()
+    }
     waitForStreamActive(streamName)
   }
 

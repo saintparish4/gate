@@ -90,6 +90,13 @@ resource "aws_ecs_service" "app" {
   desired_count   = var.desired_count
   launch_type     = "FARGATE"
 
+  # The target group polls /ready, which answers 503 until DynamoDB and Kinesis
+  # are reachable. A JVM cold start plus client warm-up takes longer than the
+  # first health check, and with deployment_circuit_breaker rollback enabled a
+  # task killed during start-up would roll the whole deployment back. Give it
+  # room to finish booting before failed checks start counting.
+  health_check_grace_period_seconds = var.health_check_grace_period_seconds
+
   network_configuration {
     subnets          = var.private_subnet_ids
     security_groups  = [aws_security_group.app.id]
@@ -133,8 +140,13 @@ resource "aws_lb_target_group" "app" {
   vpc_id      = var.vpc_id
   target_type = "ip"
 
+  # /ready, not /health. /health is a liveness probe that returns 200 as soon as
+  # the process is accepting connections -- it stays "healthy" even when
+  # DynamoDB and Kinesis are unreachable, so routing on it puts tasks into
+  # service that cannot serve a single rate-limit check. /ready aggregates
+  # dependency health and answers 503 until they are actually reachable.
   health_check {
-    path                = "/health"
+    path                = "/ready"
     healthy_threshold   = 2
     unhealthy_threshold = 3
     timeout             = 5

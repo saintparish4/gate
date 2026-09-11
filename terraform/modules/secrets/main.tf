@@ -14,8 +14,13 @@ locals {
 # API Keys Secret
 # -----------------------------------------------------------------------------
 
+# The app looks this secret up as "<secret-prefix>/<environment>/<name>" (see
+# SecretsConfig.fullSecretName), so the slashes here are load-bearing: with
+# "${project}-${environment}/api-keys" the app would search for
+# "<project>/<environment>/api-keys" and never find it. main.tf feeds the same
+# three values in as SECRETS_PREFIX / SECRETS_ENVIRONMENT / API_KEYS_SECRET_NAME.
 resource "aws_secretsmanager_secret" "api_keys" {
-  name        = "${local.name_prefix}/api-keys"
+  name        = "${var.project_name}/${var.environment}/api-keys"
   description = "API keys for rate limiter authentication"
   
   recovery_window_in_days = var.environment == "prod" ? 30 : 0

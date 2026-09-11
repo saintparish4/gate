@@ -90,6 +90,7 @@ case class AuthenticationConfig(
 case class SecretsConfig(
     enabled: Boolean = false,
     secretPrefix: String = "rate-limiter",
+    environment: String = "dev",
     apiKeysSecretName: String = "api-keys",
     cacheTtl: FiniteDuration = scala.concurrent.duration.Duration(5, "minutes"),
 ) derives ConfigReader

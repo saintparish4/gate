@@ -41,7 +41,7 @@ Run locally with LocalStack; see [Quickstart](#quickstart-in-5-minutes) below.
 
 ---
 
-**Note:** AWS deployment and performance have not been tested end-to-end; the stack is designed for AWS but validated locally with LocalStack/Docker.
+**Note:** AWS deployment and performance have not been tested end-to-end; the stack is designed for AWS but validated locally with LocalStack/Docker. The deployment path is scripted and documented under [Demo environment](#demo-environment-scripted), but `terraform apply` has not yet been run against a real account.
 
 ## Architecture
 
@@ -124,6 +124,14 @@ make start
 
 Expected output: LocalStack container starts; the init script creates the DynamoDB tables and Kinesis stream automatically. The LocalStack image is built from `localstack.Dockerfile`, which installs scripts from `localstack-init/` (`init-aws.sh` creates the tables and stream; `gate-entrypoint.sh` runs at container start). If you see `FileNotFoundError: ... init-aws.sh`, run `make start-clean` to rebuild the LocalStack image and try again.
 
+> **Returning to an older checkout?** Both images bake in code — the app image
+> its jar, the LocalStack image `init-aws.sh` — and `docker compose up` reuses
+> whatever it already built, while `localstack-data` survives `docker compose
+> down` without `-v`. A stale stack fails in confusing ways: table names from a
+> previous naming scheme make the correctness invariants fail with a flood of
+> HTTP 500s. Reset all three with
+> `docker compose build && docker compose down -v && docker compose up -d`.
+
 **Step 2 — Verify the service is alive**
 
 ```bash
@@ -133,6 +141,13 @@ curl http://localhost:8080/health
 ```json
 { "status": "healthy", "version": "0.1.0" }
 ```
+
+The reported version comes from `build.sbt`. If it disagrees, you are talking to
+a stale image and need the reset above.
+
+`/health` is liveness only — it answers 200 whenever the process is up, even if
+DynamoDB and Kinesis are unreachable. Use `/ready` for dependency status; it is
+what the ALB target group and `deploy-demo.sh` wait on.
 
 **Step 3 — Check a rate limit (allowed)**
 
@@ -316,7 +331,53 @@ All variables are in [`terraform/variables.tf`](terraform/variables.tf). `contai
 | `dynamodb_billing_mode` | `PAY_PER_REQUEST` | `PAY_PER_REQUEST` or `PROVISIONED` |
 | `kinesis_shard_count` | `1` | Number of Kinesis shards |
 | `enable_autoscaling` | `true` | ECS target-tracking autoscaling (min 2, max 10 tasks) |
+| `enable_secrets_manager` | `false` | Load API keys from Secrets Manager (see [API keys](#api-keys-on-aws)) |
 | `alarm_sns_topic_arn` | `""` | SNS topic for CloudWatch alarms (optional) |
+
+### Demo environment (scripted)
+
+Three scripts cover the whole round trip. The image has to exist in ECR before
+Terraform runs, because `container_image` is required and has no default:
+
+```bash
+export ECR_IMAGE=$(./scripts/publish-image.sh)   # builds linux/amd64, creates the ECR repo, pushes
+./scripts/deploy-demo.sh                          # terraform apply + wait for /ready
+./scripts/teardown-demo.sh                        # destroy, then verify state is empty
+```
+
+The demo runs about **$0.25/hour** (~$6/day) in `us-east-1` — two NAT gateways,
+five interface VPC endpoints across two AZs, an ALB, one Fargate task and one
+Kinesis shard. `teardown-demo.sh` fails loudly and exits non-zero if anything is
+left in Terraform state, and prints the CLI commands to double-check that no NAT
+gateway or ALB survived.
+
+Terraform state is local, so tear down from the same machine you deployed from.
+
+`deploy-demo.sh` waits on `/ready`, not `/health`: `/health` is a liveness probe
+that answers 200 as soon as the process accepts connections, even when every
+backend is unreachable. `/ready` reports per-dependency status, so if a deploy
+times out, `curl http://$ALB_DNS/ready` names the failing component.
+
+### API keys on AWS
+
+`enable_secrets_manager` is **off by default**, and the deployed service falls
+back to the built-in development keys — fine for a demo, not for anything real.
+Terraform does create the secret, but seeds it with a placeholder entry whose
+`active` flag is `false`, so enabling Secrets Manager before writing real keys
+leaves zero usable keys and every request answers 401. Write keys first:
+
+```bash
+aws secretsmanager put-secret-value \
+  --secret-id "rate-limiter/demo/api-keys" \
+  --secret-string '[{"apiKey":"...","apiKeyId":"key_001","clientName":"Demo","tier":"basic","permissions":["ratelimit_check","ratelimit_status","idempotency_check"],"active":true}]'
+```
+
+then redeploy with `-var="enable_secrets_manager=true"`. The secret name is
+`<project_name>/<environment>/api-keys` because the app composes its lookup key
+from `SECRETS_PREFIX`, `SECRETS_ENVIRONMENT` and `API_KEYS_SECRET_NAME`; the
+three must agree with the name Terraform gives the secret. `project_name`
+defaults to `rate-limiter` and `demo.tfvars` does not override it, so the demo
+environment's resources are all named `rate-limiter-demo-*`.
 
 **Deploy to dev**
 
@@ -692,7 +753,9 @@ sbt "loadSim/run --scenario highContention"  # 50 VUs, 1 fixed key — OCC stres
 
 See [Benchmark Results](#benchmark-results) for observed numbers from each scenario.
 
-**Note:** AWS deployment instructions are not yet available as deployment has not been tested. Terraform configuration exists but requires validation.
+**Note:** these numbers come from the local Docker stack. The Terraform stack has
+never been applied, so there are no figures from a real AWS deployment. Scripted
+deployment instructions are in [Demo environment](#demo-environment-scripted).
 
 <a name="benchmark-results"></a>
 
