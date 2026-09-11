@@ -492,11 +492,11 @@ Returns `200 OK` whenever the process is alive. No dependency checks are perform
 
 ### `GET /ready` — readiness
 
-Pings all upstream dependencies and returns `200 OK` only when all pass. Returns `503 Service Unavailable` with a `failing` list on any failure. Use for load-balancer health checks and Kubernetes readiness probes — failure removes the instance from rotation without restarting it.
+Pings all upstream dependencies and returns `200 OK` only when every component reports `ok`. Returns `503 Service Unavailable` with `"status": "degraded"` when any of them fails, and the failing component carries the error in `details`. Use for load-balancer health checks and Kubernetes readiness probes — failure removes the instance from rotation without restarting it.
 
-**Dependencies checked:**
+**Components checked:**
 
-| Check key | Dependency |
+| `name` | Dependency |
 |---|---|
 | `dynamodb_ratelimit` | DynamoDB rate-limits table |
 | `dynamodb_idempotency` | DynamoDB idempotency table |
@@ -504,15 +504,25 @@ Pings all upstream dependencies and returns `200 OK` only when all pass. Returns
 
 **200 response:**
 ```json
-{ "status": "ready", "checks": { "dynamodb_ratelimit": true, "dynamodb_idempotency": true, "kinesis": true } }
+{
+  "status": "ok",
+  "components": [
+    { "name": "dynamodb_ratelimit", "status": "ok", "details": null },
+    { "name": "dynamodb_idempotency", "status": "ok", "details": null },
+    { "name": "kinesis", "status": "ok", "details": null }
+  ]
+}
 ```
 
 **503 response (one or more dependencies failing):**
 ```json
 {
-  "status": "not ready",
-  "checks": { "dynamodb_ratelimit": false, "dynamodb_idempotency": true, "kinesis": true },
-  "failing": ["DynamoDB (rate-limit): Connection refused"]
+  "status": "degraded",
+  "components": [
+    { "name": "dynamodb_ratelimit", "status": "error", "details": "Received an UnknownHostException when attempting to interact with a service..." },
+    { "name": "dynamodb_idempotency", "status": "ok", "details": null },
+    { "name": "kinesis", "status": "ok", "details": null }
+  ]
 }
 ```
 
