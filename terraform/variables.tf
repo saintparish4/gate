@@ -154,3 +154,39 @@ variable "enable_secrets_manager" {
   type        = bool
   default     = false
 }
+
+# ---------------------------------------------------------------------------
+# Resilience posture
+#
+# These were previously unset, so the container inherited application.conf's
+# defaults by accident. Both decide what happens to *all* traffic when the
+# shared DynamoDB circuit breaker opens, so they are pinned explicitly here.
+# ---------------------------------------------------------------------------
+
+variable "degradation_mode" {
+  description = "Behaviour when the circuit breaker opens or the bulkhead sheds a request. reject-all fails closed (429 for every caller, no runaway downstream spend); allow-all fails open (admits everything while the breaker is open); use-cached has no cache wired yet and currently behaves as allow-all."
+  type        = string
+  default     = "reject-all"
+
+  validation {
+    condition     = contains(["reject-all", "allow-all", "use-cached"], var.degradation_mode)
+    error_message = "degradation_mode must be one of: reject-all, allow-all, use-cached."
+  }
+}
+
+variable "circuit_breaker_max_failures" {
+  description = "Consecutive unanswered DynamoDB calls before the shared circuit breaker opens. The count resets on the next success. Low values are hazardous: the breaker is process-wide, so tripping it applies degradation_mode to every tenant."
+  type        = number
+  default     = 20
+
+  validation {
+    condition     = var.circuit_breaker_max_failures >= 5
+    error_message = "circuit_breaker_max_failures below 5 will trip on routine latency blips."
+  }
+}
+
+variable "circuit_breaker_reset_timeout" {
+  description = "How long the circuit breaker stays open before it admits a probe request. HOCON duration string."
+  type        = string
+  default     = "30 seconds"
+}

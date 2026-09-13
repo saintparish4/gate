@@ -267,6 +267,26 @@ case class AppConfig(
 ) derives ConfigReader
 
 object AppConfig:
+
+  val validDegradationModes: Set[String] =
+    Set("allow-all", "reject-all", "use-cached")
+
+  /** An unrecognised degradation-mode used to fall through to reject-all in
+    * ResilienceConfig.parsedDegradationMode, so a typo in DEGRADATION_MODE
+    * silently armed a full outage for the first time the circuit breaker
+    * opened. Rejected at startup instead.
+    *
+    * @return
+    *   Some(message) when the value is not usable.
+    */
+  def validateDegradationMode(mode: String): Option[String] =
+    if validDegradationModes.contains(mode) then None
+    else
+      Some(
+        s"resilience.degradation-mode '$mode' is not one of ${validDegradationModes
+            .toList.sorted.mkString(", ")}",
+      )
+
   def load[F[_]: Sync]: F[AppConfig] = Sync[F]
     .delay(ConfigSource.default.loadOrThrow[AppConfig]).flatMap { config =>
       val profileErrors = config.rateLimit.profiles.toList
@@ -278,7 +298,9 @@ object AppConfig:
           List(s"agentLimit (${config.tokenQuota
               .agentLimit}) exceeds 80% of userLimit ($agentCap)")
         else Nil
-      val allErrors = profileErrors ++ quotaErrors
+      val degradationErrors =
+        validateDegradationMode(config.resilience.degradationMode).toList
+      val allErrors = profileErrors ++ quotaErrors ++ degradationErrors
       if allErrors.nonEmpty then
         Sync[F]
           .raiseError(new IllegalArgumentException(s"Invalid config: ${allErrors

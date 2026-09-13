@@ -52,6 +52,10 @@ object LoadSim extends IOApp:
     val baseUrl  = Args.string(args, "--url", defaultBaseUrl)
     val rps      = Args.intOpt(args, "--rps")
     val duration = Args.intOpt(args, "--duration")
+    // Invariant A's contention level. Kept low enough that LocalStack can
+    // actually answer, since a target that cannot serve the load degrades and
+    // the invariant then measures degradation instead of the token bucket.
+    val concurrency = Args.intOpt(args, "--concurrency")
 
     // Larger connection pool so workers don't queue waiting for a connection
     // at high RPS, and an explicit per-request timeout so a hung server fails
@@ -86,7 +90,7 @@ object LoadSim extends IOApp:
         case "idempotency"    => withPreflight(Scenarios.idempotency(client, baseUrl).as(ExitCode.Success))
         case "realistic"      => withPreflight(Scenarios.realistic(client, baseUrl).as(ExitCode.Success))
         case "highContention" => withPreflight(Scenarios.highContention(client, baseUrl).as(ExitCode.Success))
-        case "correctness"    => withPreflight(Scenarios.correctness(client, baseUrl))
+        case "correctness"    => withPreflight(Scenarios.correctness(client, baseUrl, concurrency.getOrElse(20)))
         case "latency"        => withPreflight(Scenarios.latency(client, baseUrl, rps.getOrElse(1000), duration.getOrElse(60)))
         case unknown =>
           Console[IO].errorln(
@@ -333,7 +337,11 @@ object Scenarios:
    *   Server must never issue more tokens than capacity + refillRate * duration.
    *   Uses free-api-key (Free tier): capacity=20 tokens, refillRate=2 tokens/s.
    *   N=50 parallel clients target a single unique key for T=30s.
-   *   Assert: allowed_count <= 20 + 2 * 30 + epsilon (epsilon=2 for clock skew),
+   *   Assert: allowed_count <= capacity + refillRate * measured_elapsed + epsilon
+   *   (epsilon=2 for clock skew). The elapsed window is measured rather than assumed:
+   *   the server refills on its own clock, and the run always outlives the nominal
+   *   30s by however long it takes to cancel 50 in-flight requests. A ceiling pinned
+   *   to the nominal duration failed correct limiters on slow or cold hosts.
    *   allowed_count >= a quarter of that budget (a limiter that goes dark also fails),
    *   at least one request was blocked (otherwise the run proved nothing), and
    *   no HTTP errors.
@@ -349,12 +357,16 @@ object Scenarios:
    *   Requires TOKEN_QUOTA_ENABLED=true on the server.
    *   Assert: admitted * 25,000 <= 1,000,000, at least one 429, no HTTP errors.
    */
-  def correctness(client: Client[IO], baseUrl: String): IO[ExitCode] =
+  def correctness(
+    client:      Client[IO],
+    baseUrl:     String,
+    concurrency: Int = 20,
+  ): IO[ExitCode] =
     val runId = System.currentTimeMillis.toString
     for
       _  <- Console[IO].println(s"=== correctness — run $runId ===")
       _  <- warmUp(client, baseUrl, runId)
-      a  <- invariantA_tokenBucketNonOverIssue(client, baseUrl, runId)
+      a  <- invariantA_tokenBucketNonOverIssue(client, baseUrl, runId, concurrency)
       b  <- invariantB_idempotencyExactlyOneCreated(client, baseUrl, runId)
       c  <- invariantC_quotaNonOverAdmission(client, baseUrl, runId)
       ok  = a.passed && b.passed && c.passed
@@ -400,11 +412,11 @@ object Scenarios:
     }
 
   private def invariantA_tokenBucketNonOverIssue(
-    client:  Client[IO],
-    baseUrl: String,
-    runId:   String,
+    client:      Client[IO],
+    baseUrl:     String,
+    runId:       String,
+    concurrency: Int,
   ): IO[InvariantResult] =
-    val concurrency   = 50
     val durationSecs  = 30
     // free-api-key maps to the Free tier (20 tokens, 2 tokens/s in application.conf).
     // Premium refills faster than this driver can send against LocalStack, so it
@@ -413,7 +425,7 @@ object Scenarios:
     val capacity      = 20
     val refillPerSec  = 2
     val epsilon       = 2        // small slack for clock skew
-    val maxAllowed    = capacity + (refillPerSec * durationSecs) + epsilon
+    // maxAllowed is computed after the run, from the measured window (see below).
     val minAllowed    = (capacity + (refillPerSec * durationSecs)) / 4
     val key           = s"correctness:A:$runId"  // fresh key so prior state doesn't bias
 
@@ -431,31 +443,53 @@ object Scenarios:
          |  duration      = ${durationSecs}s
          |  capacity      = $capacity
          |  refillPerSec  = $refillPerSec
-         |  maxAllowed    = $maxAllowed  (capacity + refill*duration + $epsilon)
-         |  minAllowed    = $minAllowed  (a quarter of the budget; catches a limiter that rejects everything)
+         |  maxAllowed    = capacity + refill*elapsed + $epsilon  (elapsed is measured, reported below)
+         |  minAllowed    = $minAllowed  (a quarter of the nominal budget; catches a limiter that rejects everything)
          |""".stripMargin
     ) *>
-    IO.race(
-      progressTicker("invariantA", durationSecs, total, allowed, blocked, errors),
-      (0 until concurrency).toList.parTraverse_ { _ =>
-        sendRateLimitCheck(client, baseUrl, key, apiKey).flatMap {
-          case Right(true)  => IO { total.incrementAndGet(); allowed.incrementAndGet() }
-          case Right(false) => IO { total.incrementAndGet(); blocked.incrementAndGet() }
-          case Left(msg)    => IO { total.incrementAndGet(); errors.incrementAndGet(); sampler.record(msg) }
-        }.loop
-      }
-    ) *> IO.defer {
-      val a     = allowed.get
-      val b     = blocked.get
-      val t     = total.get
-      val e     = errors.get
-      val pass  = a <= maxAllowed && a >= minAllowed && b > 0 && e == 0
+    readDegradedTotal(client, baseUrl).flatMap { degradedBefore =>
+    IO.monotonic.flatMap { startedAt =>
+      IO.race(
+        progressTicker("invariantA", durationSecs, total, allowed, blocked, errors),
+        (0 until concurrency).toList.parTraverse_ { _ =>
+          sendRateLimitCheck(client, baseUrl, key, apiKey).flatMap {
+            case Right(true)  => IO { total.incrementAndGet(); allowed.incrementAndGet() }
+            case Right(false) => IO { total.incrementAndGet(); blocked.incrementAndGet() }
+            case Left(msg)    => IO { total.incrementAndGet(); errors.incrementAndGet(); sampler.record(msg) }
+          }.loop
+        }
+      ) *> IO.monotonic.map(_ - startedAt)
+    }.flatMap { elapsed =>
+      readDegradedTotal(client, baseUrl)
+        .map(after => (elapsed, after - degradedBefore))
+    }
+    }.flatMap { case (elapsed, degraded) =>
+      val a = allowed.get
+      val b = blocked.get
+      val t = total.get
+      val e = errors.get
+      // The bucket refills on the server's real clock, so the ceiling has to be
+      // measured. This window is wider than durationSecs on purpose: the ticker's
+      // IO.sleep calls only promise a lower bound, and losing the race cancels 50
+      // in-flight requests whose responses are still counted. At 2 tokens/s that
+      // tail is worth more than the old epsilon=2 could absorb, so a correct
+      // limiter reported OVER-ISSUE whenever the host was slow enough to stretch it.
+      val elapsedSecs = elapsed.toMillis / 1000.0
+      val maxAllowed  = capacity + math.ceil(refillPerSec * elapsedSecs).toLong + epsilon
+      val window      = f"elapsed=$elapsedSecs%.1fs"
+      val pass =
+        a <= maxAllowed && a >= minAllowed && b > 0 && e == 0 && degraded <= 0.0
       val why   =
-        if pass then s"minAllowed=$minAllowed <= allowed=$a <= maxAllowed=$maxAllowed (total=$t, blocked=$b, errors=$e)"
+        if pass then s"minAllowed=$minAllowed <= allowed=$a <= maxAllowed=$maxAllowed ($window, total=$t, blocked=$b, errors=$e)"
         else if e > 0 then s"errors=$e (total=$t, allowed=$a, blocked=$b)\n     Sample errors:\n${sampler.render}"
+        // Degradation mode answers without consulting the bucket, so allowed/
+        // blocked stop describing the limiter. Reject-all in particular pins
+        // allowed and inflates blocked, which reads exactly like a healthy
+        // limiter holding the line.
+        else if degraded > 0.0 then s"DEGRADED: ${degraded.toLong} decision(s) came from degradation mode, not the token bucket (circuit breaker open, bulkhead full, or store errors) — allowed=$a measures nothing. Check gate_degraded_total and gate_circuit_breaker_state."
         else if b == 0 then s"VACUOUS: never blocked (total=$t, allowed=$a) — the bucket was never exhausted"
         else if a < minAllowed then s"UNDER-ISSUE: allowed=$a < minAllowed=$minAllowed (total=$t, blocked=$b) — the limiter went dark"
-        else s"OVER-ISSUE: allowed=$a > maxAllowed=$maxAllowed (total=$t, blocked=$b, errors=$e)"
+        else s"OVER-ISSUE: allowed=$a > maxAllowed=$maxAllowed ($window, total=$t, blocked=$b, errors=$e)"
       IO.pure(InvariantResult(pass, why))
     }
 
@@ -808,6 +842,25 @@ object Http:
         }
       }
       .handleError(e => Left(Option(e.getMessage).getOrElse(e.getClass.getSimpleName)))
+
+  /** Sum of gate_degraded_total across reasons, or 0.0 if /metrics cannot be
+    * read. The counter is monotonic, so a before/after delta says whether the
+    * server served any decision from degradation mode -- circuit breaker open,
+    * bulkhead full, or store error -- during a run.
+    *
+    * Matching on the "{" excludes the gate_degraded_total_created line the
+    * Prometheus client also emits, whose value is a unix timestamp.
+    */
+  def readDegradedTotal(client: Client[IO], baseUrl: String): IO[Double] =
+    val req = Request[IO](
+      method = Method.GET,
+      uri    = Uri.unsafeFromString(s"$baseUrl/metrics"),
+    )
+    client.run(req).use(_.as[String]).map { body =>
+      body.linesIterator.filter(_.startsWith("gate_degraded_total{")).flatMap {
+        line => line.split(' ').lastOption.flatMap(v => scala.util.Try(v.toDouble).toOption)
+      }.sum
+    }.handleError(_ => 0.0)
 
   def sendRateLimitCheck(
     client:  Client[IO],

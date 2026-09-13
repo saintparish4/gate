@@ -138,6 +138,14 @@ module "ecs" {
     SECRETS_PREFIX          = var.project_name
     SECRETS_ENVIRONMENT     = var.environment
     API_KEYS_SECRET_NAME    = "api-keys"
+
+    # Pinned rather than inherited. The application default is reject-all, so
+    # leaving these unset meant one tripped breaker returned 429 to every
+    # tenant for reset_timeout, and there was no way to retune without a
+    # rebuild. See variables.tf for the trade-off.
+    DEGRADATION_MODE              = var.degradation_mode
+    CIRCUIT_BREAKER_MAX_FAILURES  = tostring(var.circuit_breaker_max_failures)
+    CIRCUIT_BREAKER_RESET_TIMEOUT = var.circuit_breaker_reset_timeout
   }
 
   # IAM permissions
