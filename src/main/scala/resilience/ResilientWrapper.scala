@@ -28,6 +28,33 @@ import observability.MetricsPublisher
   */
 object ResilientRateLimitStore:
 
+  /** Whether an error is evidence that DynamoDB itself is unhealthy, and so
+    * should count toward opening the shared circuit breaker.
+    *
+    * This breaker is process-wide: one instance guards every key. Counting
+    * caller-scoped failures therefore lets a single contended key open it for
+    * all tenants, and with degradation-mode=reject-all that is a full outage
+    * caused by one noisy neighbour. An OCC conflict or a corrupt item is also
+    * positive evidence the dependency is alive -- DynamoDB answered us, this
+    * key just lost a race -- so it must not be counted against it.
+    *
+    * Timeouts and transport faults stay counted. They mean we got no answer at
+    * all, which is exactly what the breaker exists to detect.
+    */
+  private[resilience] def dependencyFailure(error: Throwable): Boolean =
+    error match
+      // Caller- or key-scoped: the dependency responded.
+      case _: core.GateError.OCCConflict => false
+      case _: core.GateError.CorruptState => false
+      case _: software.amazon.awssdk.services.dynamodb.model.ConditionalCheckFailedException =>
+        false
+      // Load we already shed. Counting these would let the breaker feed itself.
+      case _: core.GateError.CircuitOpen => false
+      case _: core.GateError.BulkheadFull => false
+      // A misconfiguration is not something a breaker can ride out.
+      case _: core.GateError.ConfigError => false
+      case _ => true
+
   /** Wrap a rate limit store with production resilience patterns.
     */
   def apply[F[_]: Temporal: Logger](
@@ -41,7 +68,7 @@ object ResilientRateLimitStore:
   ): Resource[F, RateLimitStore[F]] =
     for
       // Create circuit breaker
-      circuitBreaker <- Resource.eval(
+      circuitBreaker <- Resource.eval {
         if config.circuitBreaker.enabled then
           CircuitBreaker[F](
             "dynamodb-ratelimit",
@@ -50,9 +77,10 @@ object ResilientRateLimitStore:
               resetTimeout = config.circuitBreaker.dynamodb.resetTimeout,
               halfOpenMaxCalls = config.circuitBreaker.dynamodb.halfOpenMaxCalls,
             ),
+            countsAsFailure = dependencyFailure,
           ).map(Some(_))
-        else Temporal[F].pure(None),
-      )
+        else Temporal[F].pure(None)
+      }
 
       // Create bulkhead
       bulkhead <- Resource.eval(

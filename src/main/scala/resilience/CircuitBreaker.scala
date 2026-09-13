@@ -104,9 +104,16 @@ object CircuitBreaker:
       halfOpenCalls = 0,
     )
 
+  /** @param countsAsFailure
+    *   Which errors count toward opening the breaker. Defaults to "all of
+    *   them". A breaker shared across callers should pass a classifier that
+    *   excludes caller-scoped failures -- see
+    *   ResilientRateLimitStore.dependencyFailure.
+    */
   def apply[F[_]: Temporal: Logger](
       name: String,
       config: CircuitBreakerConfig = CircuitBreakerConfig.default,
+      countsAsFailure: Throwable => Boolean = _ => true,
   ): F[CircuitBreaker[F]] =
     for
       stateRef <- Ref.of[F, InternalState](InternalState.initial)
@@ -149,6 +156,10 @@ object CircuitBreaker:
       private def executeAndRecord[A](fa: F[A], now: Long): F[A] = fa.attempt
         .flatMap {
           case Right(result) => recordSuccess(now).as(result)
+          // Not evidence either way about the dependency: leave the counters
+          // alone and hand the caller its original error.
+          case Left(error) if !countsAsFailure(error) =>
+            Temporal[F].raiseError(error)
           case Left(error) => recordFailure(now) *> checkAndMaybeOpen(now) *>
               Temporal[F].raiseError(error)
         }
@@ -166,6 +177,13 @@ object CircuitBreaker:
                     case Right(result) => transitionToClosed(now) *> logger.info(
                         s"Circuit breaker '$name' closed after successful probe",
                       ) *> Temporal[F].pure(result)
+                    // The probe told us nothing about the dependency. Return the
+                    // slot, or a run of these strands the breaker in half-open
+                    // with no probes left and it never recovers.
+                    case Left(error) if !countsAsFailure(error) =>
+                      stateRef.update(st =>
+                        st.copy(halfOpenCalls = math.max(0, st.halfOpenCalls - 1)),
+                      ) *> Temporal[F].raiseError(error)
                     case Left(error) => transitionToOpen(now) *> logger.warn(
                         s"Circuit breaker '$name' reopened after failed probe",
                       ) *> Temporal[F].raiseError(error)
@@ -193,14 +211,28 @@ object CircuitBreaker:
       private def recordRejection: F[Unit] = stateRef
         .update(s => s.copy(rejectedCount = s.rejectedCount + 1))
 
-      private def checkAndMaybeOpen(now: Long): F[Unit] = stateRef.get
-        .flatMap(s =>
-          if s.failures >= config.maxFailures then
-            transitionToOpen(now) *>
-              logger.warn(s"Circuit breaker '$name' opened after ${s
-                  .failures} failures")
-          else Temporal[F].unit,
-        )
+      // Transition atomically and log exactly once. Reading state and then
+      // writing it let all 50 concurrent callers each see failures >= threshold
+      // and log their own "opened after N failures", which is how one tripped
+      // breaker produced 60k log lines in a 30s run.
+      private def checkAndMaybeOpen(now: Long): F[Unit] = stateRef.modify(s =>
+        if s.circuitState == CircuitState.Closed &&
+          s.failures >= config.maxFailures
+        then
+          (
+            s.copy(
+              circuitState = CircuitState.Open,
+              openedAt = Some(now),
+              halfOpenCalls = 0,
+            ),
+            Some(s.failures),
+          )
+        else (s, None),
+      ).flatMap {
+        case Some(failures) => logger
+            .warn(s"Circuit breaker '$name' opened after $failures failures")
+        case None => Temporal[F].unit
+      }
 
       private def checkAndMaybeTransitionToHalfOpen(now: Long): F[Unit] =
         stateRef.get.flatMap(s =>
