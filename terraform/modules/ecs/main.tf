@@ -300,10 +300,13 @@ resource "aws_iam_role_policy" "ecs_task" {
       },
       {
         Effect = "Allow"
+        # I grant DescribeStreamSummary separately: /ready calls it, and
+        # DescribeStream does not cover it.
         Action = [
           "kinesis:PutRecord",
           "kinesis:PutRecords",
-          "kinesis:DescribeStream"
+          "kinesis:DescribeStream",
+          "kinesis:DescribeStreamSummary"
         ]
         Resource = [var.kinesis_stream_arn]
       },

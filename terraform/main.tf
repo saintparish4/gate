@@ -127,6 +127,9 @@ module "ecs" {
     KINESIS_ENABLED   = "true"
     METRICS_ENABLED   = "true"
     METRICS_NAMESPACE = "RateLimiter/${var.environment}"
+    # I set this explicitly: application.conf defaults it off, and without it
+    # /v1/quota/check answers 404 even though its table and IAM are provisioned.
+    TOKEN_QUOTA_ENABLED = "true"
     # These three compose the Secrets Manager lookup key and must agree with the
     # secret's name in modules/secrets/main.tf. SECRETS_ENABLED/SECRETS_MANAGER
     # naming matters: the app reads SECRETS_MANAGER_ENABLED, and the previous

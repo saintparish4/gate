@@ -458,31 +458,31 @@ Returns service health status.
 
 ### Readiness Check
 
-Checks if service is ready to accept traffic (validates dependencies).
+Checks if service is ready to accept traffic (validates dependencies). Answers 200 only when every component reports `ok`; otherwise 503 with `"status": "degraded"` and the error in the failing component's `details`.
 
 **Endpoint:** `GET /ready`
 
 **Success Response (200):**
 ```json
 {
-  "status": "ready",
-  "checks": {
-    "dynamodb_ratelimit": true,
-    "dynamodb_idempotency": true,
-    "kinesis": true
-  }
+  "status": "ok",
+  "components": [
+    { "name": "dynamodb_ratelimit", "status": "ok", "details": null },
+    { "name": "dynamodb_idempotency", "status": "ok", "details": null },
+    { "name": "kinesis", "status": "ok", "details": null }
+  ]
 }
 ```
 
 **Not Ready Response (503):**
 ```json
 {
-  "status": "not ready",
-  "checks": {
-    "dynamodb_ratelimit": true,
-    "dynamodb_idempotency": true,
-    "kinesis": false
-  }
+  "status": "degraded",
+  "components": [
+    { "name": "dynamodb_ratelimit", "status": "ok", "details": null },
+    { "name": "dynamodb_idempotency", "status": "ok", "details": null },
+    { "name": "kinesis", "status": "error", "details": "Received an UnknownHostException when attempting to interact with a service..." }
+  ]
 }
 ```
 
