@@ -40,6 +40,10 @@ class PrometheusMetrics[F[_]: Sync](val registry: CollectorRegistry):
   val eventsDropped: Counter = Counter.build().name("gate_events_dropped_total")
     .help("Kinesis events dropped after retry exhaustion").register(registry)
 
+  val degradedTotal: Counter = Counter.build().name("gate_degraded_total")
+    .help("Decisions served by degradation mode instead of the store (breaker open, bulkhead full, or store error)")
+    .labelNames("reason").register(registry)
+
   // -- Gauges --
 
   val tokensConsumed: Gauge = Gauge.build().name("gate_tokens_consumed")
@@ -113,6 +117,8 @@ object PrometheusMetrics:
             .inc()
         case "TokenQuotaExceeded" => prom.tokenQuotaTotal
             .labels(dimensions.getOrElse("level", "unknown"), "exceeded").inc()
+        case "RateLimitDegraded" => prom.degradedTotal
+            .labels(dimensions.getOrElse("reason", "unknown")).inc()
         case "TokenQuotaContended" => prom.tokenQuotaTotal
             .labels("all", "contended").inc()
         case "TokenQuotaReconcileFailed" => prom.tokenQuotaTotal
@@ -180,7 +186,14 @@ object PrometheusMetrics:
         name: String,
         state: String,
         failureCount: Int,
-    ): F[Unit] = primary.recordCircuitBreakerState(name, state, failureCount)
+    ): F[Unit] = primary.recordCircuitBreakerState(name, state, failureCount) *>
+      Sync[F].delay(prom.circuitBreakerState.labels(name).set(
+        state.toLowerCase match
+          case "closed" => 0.0
+          case "halfopen" | "half_open" => 0.5
+          case "open" => 1.0
+          case _ => -1.0,
+      ))
 
     override def recordCacheMetrics(
         cacheName: String,
