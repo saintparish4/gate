@@ -1,243 +1,136 @@
-.PHONY: help start start-clean stop logs run test integration status clean \
-       docker-build docker-run docker-run-detached docker-stop docker-logs \
-       curl-check curl-status curl-health curl-ready all-tests dev dev-docker docker-restart \
-       tf-validate
+# Gate — developer entry points. Run `make` for the grouped target list.
+#
+# Docker Compose v2 is required (the `--wait` flag replaces hand-rolled polling
+# loops). Override any of these on the command line, e.g. `make APP_URL=... smoke`.
+COMPOSE ?= docker compose
+APP_URL ?= http://localhost:8080
+LOCALSTACK_URL ?= http://localhost:4566
+API_KEY ?= test-api-key
 
-# Unique suffix per make invocation (for curl-check key). Works when recipe shell lacks date +%s (e.g. Windows).
-CURL_CHECK_ID := $(shell date +%s 2>/dev/null || echo $$RANDOM 2>/dev/null || echo 0)
+# Unique-per-invocation suffix for the smoke test key, so repeat runs never
+# land on a bucket a previous run already drained. Falls back when the recipe
+# shell has no `date +%s` (e.g. some Windows shells).
+SMOKE_ID := $(shell date +%s 2>/dev/null || echo 0)
 
-# Default target
+# Every sbt target opens with this, so a missing sbt gives instructions instead
+# of "command not found".
+NEED_SBT = @command -v sbt >/dev/null 2>&1 || { echo "Error: sbt not found in PATH."; echo "  Install it: https://www.scala-sbt.org/download.html"; echo "  Or skip sbt entirely and use Docker: make stack"; exit 1; }
+
 .DEFAULT_GOAL := help
+.PHONY: help up up-clean down clean logs status run dev stack obs \
+        fmt test test-it test-all smoke health correctness tf-validate
 
-help: ## Show this help message
-	@echo "Usage: make <command>"
+help: ## Show this help
+	@awk 'BEGIN { FS = ":.*##"; printf "Usage: make <target>\n" } \
+	     /^##@/      { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } \
+	     /^[a-z][a-z0-9-]*:.*##/ { printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2 }' \
+	     $(MAKEFILE_LIST)
 	@echo ""
-	@echo "Local Development (sbt + LocalStack):"
-	@echo "  make start        Start LocalStack only (for sbt development)"
-	@echo "  make start-clean  Rebuild LocalStack image (no cache) then start"
-	@echo "  make stop         Stop LocalStack"
-	@echo "  make logs         Follow LocalStack logs"
-	@echo "  make run          Run the application with sbt (requires LocalStack)"
-	@echo "  make dev          Start LocalStack + run app with sbt"
-	@echo "  make dev-docker   Start LocalStack + run app in Docker (no sbt)"
-	@echo "  make test         Run unit tests"
-	@echo "  make integration  Run integration tests"
-	@echo "  make status       Check LocalStack and AWS resource status"
-	@echo "  make clean        Stop all containers and clean build artifacts"
-	@echo ""
-	@echo "Docker (full containerized stack):"
-	@echo "  make docker-build         Build the application Docker image"
-	@echo "  make docker-run           Start full stack (LocalStack + App)"
-	@echo "  make docker-run-detached  Start full stack in background"
-	@echo "  make docker-stop          Stop Docker services"
-	@echo "  make docker-logs          Follow Docker logs"
-	@echo "  make docker-restart       Restart Docker stack"
-	@echo ""
-	@echo "API Testing:"
-	@echo "  make curl-check   Smoke test: 100 requests, verify X-RateLimit-* headers"
-	@echo "  make curl-status  Test GET /v1/ratelimit/status/:key"
-	@echo "  make curl-health  Test GET /health"
-	@echo "  make curl-ready   Test GET /ready"
-	@echo ""
-	@echo "Terraform:"
-	@echo "  make tf-validate  Validate Terraform configuration"
 
-# =============================================================================
-# Local Development (sbt + LocalStack)
-# =============================================================================
+##@ Stack
 
-start: ## Start LocalStack only (for sbt development)
-	@echo "Starting LocalStack..."
-	docker-compose up -d --build localstack
+up: ## Start LocalStack alone and wait until its tables/streams exist
+	$(COMPOSE) up -d --build --wait localstack
 
-start-clean: ## Rebuild LocalStack image without cache, then start (use if init script is missing)
-	@echo "Rebuilding LocalStack image (no cache)..."
-	docker-compose build --no-cache localstack
-	@$(MAKE) start
-	@echo "Waiting for LocalStack to be ready..."
-	@timeout=120; \
-	while [ $$timeout -gt 0 ]; do \
-		if curl -s http://localhost:4566/_localstack/health | grep -q '"dynamodb": "running"'; then \
-			echo "LocalStack is ready!"; \
-			echo ""; \
-			echo "To run the application:"; \
-			echo "  make run"; \
-			exit 0; \
-		fi; \
-		echo "  Waiting for DynamoDB..."; \
-		sleep 2; \
-		timeout=$$((timeout-2)); \
-	done; \
-	echo "LocalStack failed to start within timeout period"; \
-	exit 1
+up-clean: ## Rebuild the LocalStack image from scratch, then start it
+	$(COMPOSE) build --no-cache localstack
+	$(COMPOSE) up -d --wait localstack
 
-stop: ## Stop LocalStack
-	@echo "Stopping LocalStack..."
-	docker-compose down
+stack: ## Start the whole stack in Docker (LocalStack + app) — no sbt needed
+	$(COMPOSE) up -d --build --wait
+	@echo "Gate is up at $(APP_URL). Follow it with 'make logs'."
 
-logs: ## Follow LocalStack logs
-	docker-compose logs -f localstack
+obs: ## Start the stack plus Prometheus, Grafana and Jaeger
+	$(COMPOSE) --profile obs up -d --build --wait
+	@echo "Grafana http://localhost:3000 | Prometheus http://localhost:9090 | Jaeger http://localhost:16686"
 
-run: ## Run the application with sbt (requires LocalStack)
-	@echo "Starting Gate..."
-	@echo ""
-	@command -v sbt >/dev/null 2>&1 || { \
-		echo "Error: sbt not found in PATH."; \
-		echo "  Install sbt: https://www.scala-sbt.org/download.html"; \
-		echo "  Or run app in Docker: make dev-docker   (LocalStack + app, no sbt)"; \
-		echo "  Or full stack:         make docker-run"; \
-		exit 1; \
-	}
+down: ## Stop every container, keeping volumes
+	-$(COMPOSE) --profile obs down
+
+clean: ## Stop everything, drop volumes, and delete build artifacts
+	-$(COMPOSE) --profile obs down -v
+	rm -rf target project/target loadSim/target .bsp .metals
+
+logs: ## Follow container logs (SERVICE=localstack to narrow to one)
+	$(COMPOSE) --profile obs logs -f $(SERVICE)
+
+status: ## Show LocalStack health plus the DynamoDB tables and Kinesis streams
+	@echo "LocalStack health:"
+	@curl -s $(LOCALSTACK_URL)/_localstack/health | python3 -m json.tool 2>/dev/null || echo "  not running — start it with 'make up'"
+	@echo ""; echo "DynamoDB tables:"
+	@$(COMPOSE) exec -T localstack awslocal dynamodb list-tables 2>/dev/null || echo "  (unavailable)"
+	@echo ""; echo "Kinesis streams:"
+	@$(COMPOSE) exec -T localstack awslocal kinesis list-streams 2>/dev/null || echo "  (unavailable)"
+
+##@ Application
+
+run: ## Run the app with sbt against a running LocalStack
+	$(NEED_SBT)
 	USE_LOCALSTACK=true \
-	DYNAMODB_ENDPOINT=http://localhost:4566 \
-	KINESIS_ENDPOINT=http://localhost:4566 \
+	DYNAMODB_ENDPOINT=$(LOCALSTACK_URL) \
+	KINESIS_ENDPOINT=$(LOCALSTACK_URL) \
 	AWS_ACCESS_KEY_ID=test \
 	AWS_SECRET_ACCESS_KEY=test \
 	AWS_REGION=us-east-1 \
 	sbt run
 
-dev: start run ## Start LocalStack and run the application with sbt
+dev: up run ## Start LocalStack, then run the app with sbt
 
-dev-docker: start ## Start LocalStack, then run the app in Docker (no sbt required)
-	@echo "Starting rate-limiter container (LocalStack already running)..."
-	docker-compose up --build rate-limiter
+##@ Tests
+
+fmt: ## Format all Scala sources (CI fails on unformatted code)
+	$(NEED_SBT)
+	sbt scalafmtAll
 
 test: ## Run unit tests
-	@echo "Running unit tests..."
-	@command -v sbt >/dev/null 2>&1 || { \
-		echo "Error: sbt not found. Install sbt or use Docker."; \
-		exit 1; \
-	}
-	sbt test
+	$(NEED_SBT)
+	sbt unitTest
 
-integration: ## Run integration tests (uses TestContainers, no LocalStack needed)
-	@echo "Running integration tests..."
-	@command -v sbt >/dev/null 2>&1 || { \
-		echo "Error: sbt not found. Install sbt or use Docker."; \
-		exit 1; \
-	}
+test-it: ## Run integration tests (TestContainers — needs Docker, not LocalStack)
+	$(NEED_SBT)
 	sbt "testOnly *IntegrationSpec"
 
-all-tests: test integration ## Run all tests (unit + integration)
-	@echo "All tests completed!"
+test-all: test test-it ## Run unit and integration tests
 
-status: ## Check LocalStack and AWS resource status
-	@echo "Checking LocalStack status..."
-	@curl -s http://localhost:4566/_localstack/health 2>/dev/null | python3 -m json.tool 2>/dev/null | \
-		perl -pe 's/": "running"/": "\e[0;32mrunning\e[0m"/g; \
-		          s/": "available"/": "\e[0;32mavailable\e[0m"/g; \
-		          s/": "disabled"/": "\e[0;31mdisabled\e[0m"/g' || echo "  (LocalStack not running)"
-	@echo ""
-	@if command -v aws >/dev/null 2>&1; then \
-		echo "DynamoDB Tables:"; \
-		aws --endpoint-url=http://localhost:4566 dynamodb list-tables 2>/dev/null || echo "  (Unable to query - check LocalStack is running)"; \
-		echo ""; \
-		echo "Kinesis Streams:"; \
-		aws --endpoint-url=http://localhost:4566 kinesis list-streams 2>/dev/null || echo "  (Unable to query - check LocalStack is running)"; \
-	else \
-		echo "Note: AWS CLI not installed (optional - not required for the application)"; \
-		echo "  To list tables/streams, install AWS CLI or check via Docker:"; \
-		echo "    docker-compose exec localstack awslocal dynamodb list-tables"; \
-		echo "    docker-compose exec localstack awslocal kinesis list-streams"; \
-	fi
+correctness: ## Check the correctness invariants against a running stack
+	$(NEED_SBT)
+	sbt "loadSim/run --scenario correctness"
 
-clean: ## Stop all containers and clean build artifacts
-	@echo "Cleaning up..."
-	-docker-compose --profile app down -v 2>/dev/null
-	-docker-compose down -v 2>/dev/null
-	rm -rf target project/target .bsp .metals
+##@ Probes
 
-# =============================================================================
-# Docker (full containerized stack)
-# =============================================================================
+health: ## Print /health, /ready and a sample rate-limit status
+	@for path in /health /ready /v1/ratelimit/status/user:123; do \
+		echo "GET $$path"; \
+		curl -s -H 'Authorization: Bearer $(API_KEY)' $(APP_URL)$$path \
+			| python3 -m json.tool 2>/dev/null \
+			|| echo "  no JSON response — is the service up? ('make dev' or 'make stack')"; \
+	done
 
-docker-build: ## Build the application Docker image
-	@echo "Building Docker image..."
-	docker build -t rate-limiter-platform:latest .
-	@echo ""
-	@echo "Image built: rate-limiter-platform:latest"
-	@echo "Run with: make docker-run"
-
-docker-run: ## Start full stack (LocalStack + App) with Docker
-	@echo "Starting full stack with Docker..."
-	@echo "This will build the app image and start LocalStack + Application"
-	@echo ""
-	docker-compose --profile app up --build
-
-docker-run-detached: ## Start full stack in background
-	@echo "Starting full stack with Docker (detached)..."
-	docker-compose --profile app up --build -d
-	@echo ""
-	@echo "Services started. Useful commands:"
-	@echo "  make docker-logs   - Follow logs"
-	@echo "  make curl-health   - Check health"
-	@echo "  make docker-stop   - Stop services"
-
-docker-stop: ## Stop Docker services
-	@echo "Stopping Docker services..."
-	-docker-compose --profile app down
-
-docker-logs: ## Follow Docker logs
-	docker-compose --profile app logs -f
-
-docker-restart: docker-stop docker-run ## Restart Docker stack
-
-# =============================================================================
-# API Testing
-# =============================================================================
-
-curl-check: ## Smoke test: 100 requests, verify X-RateLimit-* headers
-	@echo "Smoke test: sending 100 requests, verifying X-RateLimit-* headers..."
-	@key="smoke-$(CURL_CHECK_ID)-$$$$"; \
-	first_headers="/tmp/curl-check-headers.$$$$"; \
-	first_status="/tmp/curl-check-status.$$$$"; \
-	for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99 100; do \
-	  if [ "$$i" = "1" ]; then \
-	    curl -s -D "$$first_headers" -w "%{http_code}" -o /dev/null -X POST http://localhost:8080/v1/ratelimit/check \
-	      -H "Content-Type: application/json" \
-	      -H "Authorization: Bearer test-api-key" \
-	      -d "{\"key\":\"$$key\",\"cost\":1}" > "$$first_status" || { echo "Error: Service not available at http://localhost:8080"; echo "Start with: make dev  OR  make docker-run"; rm -f "$$first_headers" "$$first_status"; exit 1; }; \
-	  else \
-	    curl -s -o /dev/null -X POST http://localhost:8080/v1/ratelimit/check \
-	      -H "Content-Type: application/json" \
-	      -H "Authorization: Bearer test-api-key" \
-	      -d "{\"key\":\"$$key\",\"cost\":1}" || { echo "Error: Service not available"; rm -f "$$first_headers" "$$first_status"; exit 1; }; \
-	  fi; \
+smoke: ## Send 100 rate-limit checks and verify the X-RateLimit-* headers
+	@echo "Smoke test: 100 requests to $(APP_URL)/v1/ratelimit/check"
+	@key="smoke-$(SMOKE_ID)-$$$$"; hdr=$$(mktemp); trap 'rm -f "$$hdr"' EXIT; \
+	post() { curl -s -X POST $(APP_URL)/v1/ratelimit/check \
+	           -H 'Content-Type: application/json' \
+	           -H 'Authorization: Bearer $(API_KEY)' \
+	           -d "{\"key\":\"$$key\",\"cost\":1}" "$$@"; }; \
+	code=$$(post -D "$$hdr" -o /dev/null -w '%{http_code}'); \
+	case "$$code" in \
+	  000) echo "FAIL: nothing listening on $(APP_URL). Start it with 'make dev' or 'make stack'."; exit 1 ;; \
+	  200) ;; \
+	  *)   echo "FAIL: first request returned HTTP $$code (expected 200). X-RateLimit-* headers only appear on allowed responses."; exit 1 ;; \
+	esac; \
+	for h in Limit Remaining Reset; do \
+		grep -qi "X-RateLimit-$$h" "$$hdr" || { echo "FAIL: response is missing the X-RateLimit-$$h header."; exit 1; }; \
 	done; \
-	read code < "$$first_status"; \
-	[ "$$code" = "000" ] && { echo "Error: Service not available"; rm -f "$$first_headers" "$$first_status"; exit 1; }; \
-	[ "$$code" != "200" ] && { echo "FAIL: First request returned HTTP $$code (expected 200). X-RateLimit-* headers only appear on allowed responses."; rm -f "$$first_headers" "$$first_status"; exit 1; }; \
-	grep -qi 'X-RateLimit-Limit' "$$first_headers" && grep -qi 'X-RateLimit-Remaining' "$$first_headers" && grep -qi 'X-RateLimit-Reset' "$$first_headers" || { echo "FAIL: Missing X-RateLimit-* headers (first response was 200)"; rm -f "$$first_headers" "$$first_status"; exit 1; }; \
-	rm -f "$$first_headers" "$$first_status"; \
-	echo "Smoke test OK: 100 requests sent, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset verified."
+	i=1; \
+	while [ $$i -lt 100 ]; do \
+		post -o /dev/null || { echo "FAIL: service stopped responding after $$i requests."; exit 1; }; \
+		i=$$((i + 1)); \
+	done; \
+	echo "OK: 100 requests sent; X-RateLimit-Limit, -Remaining and -Reset all present."
 
-curl-status: ## Test GET /v1/ratelimit/status/:key
-	@echo "Testing rate limit status endpoint..."
-	@curl -s http://localhost:8080/v1/ratelimit/status/user:123 | python3 -m json.tool 2>/dev/null || \
-		echo "Error: Service not available"
+##@ Infrastructure
 
-curl-health: ## Test GET /health
-	@echo "Testing health endpoint..."
-	@curl -s http://localhost:8080/health | python3 -m json.tool 2>/dev/null || \
-		echo "Error: Service not available"
-
-curl-ready: ## Test GET /ready
-	@echo "Testing readiness endpoint..."
-	@curl -s http://localhost:8080/ready | python3 -m json.tool 2>/dev/null || \
-		echo "Error: Service not available"
-
-# =============================================================================
-# Terraform
-# =============================================================================
-
-tf-validate: ## Validate Terraform configuration
-	@echo "Validating Terraform configuration..."
-	@command -v terraform >/dev/null 2>&1 || { \
-		echo "Error: terraform not found in PATH."; \
-		echo "Install Terraform: https://www.terraform.io/downloads"; \
-		exit 1; \
-	}
-	@echo "Initializing Terraform providers..."
-	cd terraform && terraform init -upgrade
-	@echo "Validating Terraform configuration..."
-	cd terraform && terraform validate
+tf-validate: ## Initialise providers and validate the Terraform config
+	@command -v terraform >/dev/null 2>&1 || { echo "Error: terraform not found in PATH."; echo "  Install it: https://www.terraform.io/downloads"; exit 1; }
+	cd terraform && terraform init -upgrade && terraform validate
