@@ -190,3 +190,15 @@ variable "circuit_breaker_reset_timeout" {
   type        = string
   default     = "30 seconds"
 }
+
+variable "otel_exporter_otlp_endpoint" {
+  description = <<-EOT
+    OTLP endpoint for traces, e.g. http://my-collector:4317. Empty disables
+    tracing outright (TRACING_ENABLED=false and OTEL_SDK_DISABLED=true), which
+    is the right default: the application enables tracing by default, and an
+    exporter with no collector retries localhost:4317 and burns connections on
+    every span.
+  EOT
+  type        = string
+  default     = ""
+}
