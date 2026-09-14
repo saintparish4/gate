@@ -92,9 +92,9 @@ test-it: ## Run integration tests (TestContainers — needs Docker, not LocalSta
 
 test-all: test test-it ## Run unit and integration tests
 
-correctness: ## Check the correctness invariants against a running stack
+correctness: ## Check the correctness invariants (APP_URL=... to target a deployed stack)
 	$(NEED_SBT)
-	sbt "loadSim/run --scenario correctness"
+	sbt "loadSim/run --scenario correctness --url $(APP_URL)"
 
 ##@ Probes
 
