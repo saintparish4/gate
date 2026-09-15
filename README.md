@@ -763,9 +763,10 @@ sbt "loadSim/run --scenario highContention"  # 50 VUs, 1 fixed key — OCC stres
 
 See [Benchmark Results](#benchmark-results) for observed numbers from each scenario.
 
-**Note:** these numbers come from the local Docker stack. The Terraform stack has
-never been applied, so there are no figures from a real AWS deployment. Scripted
-deployment instructions are in [Demo environment](#demo-environment-scripted).
+**Note:** the scenario numbers come from the local Docker stack. The correctness
+invariants have also been run against the deployed AWS stack -- see
+[Correctness on AWS](#correctness-on-aws) below. Scripted deployment
+instructions are in [Demo environment](#demo-environment-scripted).
 
 <a name="benchmark-results"></a>
 
@@ -773,7 +774,38 @@ deployment instructions are in [Demo environment](#demo-environment-scripted).
 
 > For **fixed-RPS latency numbers** (p50/p95/p99 at a stated input RPS) and a DynamoDB cost-per-decision breakdown, see [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md). The numbers below are from ad-hoc runs at whatever RPS the loop produced and are kept for the OCC-contention story (Scenario 2), not as authoritative throughput figures.
 
-> Numbers are from local testing with LocalStack + Docker on a 6-core dev machine. AWS production performance will differ based on region and DynamoDB configuration.
+> The scenario tables below are from local testing with LocalStack + Docker on a 6-core dev machine. The section immediately below is from real AWS.
+
+<a name="correctness-on-aws"></a>
+
+### Correctness on AWS — Fargate, real DynamoDB
+
+The three correctness invariants, run from a laptop over the internet against
+the Terraform-deployed demo stack: one Fargate task (1024 CPU units / 2048 MB),
+DynamoDB on-demand, us-east-1. Run `1789440743789`, 2026-09-14. Zero errors,
+no degradation-mode decisions, every request served by the token bucket.
+
+| Invariant | Result | Detail | Throughput |
+|-----------|--------|--------|------------|
+| A — token bucket never over-issues | **PASS** | `allowed=80` against a physical ceiling of `20 + 2.0 × 30.0s = 80` — exact. 5,951 blocked, 0 errors. | ~201 RPS |
+| B — idempotency, exactly one `created` per key | **PASS** | `created=10` of 10 keys under 50 concurrent writers; 8,076 duplicates, 0 conflicts, 0 errors. | ~269 RPS |
+| C — token quota never over-admits | **PASS** | `admitted=40 × 25,000 = 1,000,000` — the limit, not a token over. 7,541 rejected, 0 errors. | ~379 RPS |
+
+`make APP_URL=http://<alb> correctness` reproduces it. Invariant A reports
+`server-excess`, the seconds of refill the server saw beyond the client's
+window; this run measured `-0.0s`. A previous run measured `+2.9s` from a
+wall-clock correction on the task — the reason the invariant carries a 5s
+allowance rather than a token epsilon. The token bucket refills on wall clock
+because its state is shared across tasks, and wall clocks get corrected; the
+guards in `core.TokenBucket` bound what a correction can do.
+
+**Takeaway:** the properties the limiter exists to guarantee hold on real
+DynamoDB under contention, not just on the emulator. Throughput here is bounded
+by the client and the WAN, not the service — treat it as a floor. This is a
+correctness run, not a latency benchmark; for p50/p95/p99 at a fixed RPS see
+[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
+
+---
 
 ### Scenario 1 — Many keys (normal load)
 
@@ -916,9 +948,10 @@ gated in CI by three invariants that run against a live stack on every change:
 token-bucket non-over-issue, idempotency exactly-one-Created, and token-quota
 non-over-admission.
 
-Not yet proven: the Terraform stack has never been applied, so there are no
-numbers from a real AWS deployment. Treat the performance figures here as
-LocalStack measurements.
+Proven on AWS as well: all three invariants passed against the deployed Fargate
+stack with real DynamoDB on 2026-09-14, zero errors, no degradation — see
+[Correctness on AWS](#correctness-on-aws). The performance *scenarios* remain
+LocalStack measurements; the correctness *properties* are not.
 
 ## Contributing
 
