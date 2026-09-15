@@ -13,13 +13,12 @@ class DegradationModeSpec extends AnyFreeSpec with Matchers:
 
   "validateDegradationMode" - {
 
-    "accepts every mode parsedDegradationMode can actually map" in {
-      AppConfig.validDegradationModes.foreach { mode =>
-        withClue(s"mode '$mode': ") {
-          AppConfig.validateDegradationMode(mode) shouldBe None
-        }
-      }
-    }
+    "accepts every mode parsedDegradationMode can actually map" in
+      AppConfig.validDegradationModes.foreach(mode =>
+        withClue(s"mode '$mode': ")(
+          AppConfig.validateDegradationMode(mode) shouldBe None,
+        ),
+      )
 
     "rejects a typo instead of letting it become reject-all" in {
       // The underscore form is the plausible slip, and the old catch-all turned

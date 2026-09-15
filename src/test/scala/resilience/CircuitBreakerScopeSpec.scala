@@ -16,9 +16,7 @@ import cats.effect.testing.scalatest.AsyncIOSpec
   * tenant.
   */
 class CircuitBreakerScopeSpec
-    extends AsyncFreeSpec
-    with AsyncIOSpec
-    with Matchers:
+    extends AsyncFreeSpec with AsyncIOSpec with Matchers:
 
   given Logger[IO] = NoOpLogger[IO]
 
@@ -52,32 +50,31 @@ class CircuitBreakerScopeSpec
     "still surfaces the original error to the caller when it does not count" in
       breaker.flatMap { cb =>
         val conflict = core.GateError.OCCConflict("hot-key", 3)
-        cb.protect(IO.raiseError(conflict)).attempt.map { result =>
-          result shouldBe Left(conflict)
-        }
+        cb.protect(IO.raiseError(conflict)).attempt
+          .map(result => result shouldBe Left(conflict))
       }
 
-    "opens on store timeouts, which mean no answer came back" in breaker
-      .flatMap { cb =>
+    "opens on store timeouts, which mean no answer came back" in breaker.flatMap {
+      cb =>
         val timeout = core.GateError.StoreTimeout("checkAndConsume", 2.seconds)
         for
           _ <- cb.protect(IO.raiseError(timeout)).attempt
           _ <- cb.protect(IO.raiseError(timeout)).attempt
           state <- cb.state
         yield state shouldBe CircuitState.Open
-      }
-
-    "does not let already-shed load feed itself" in breaker.flatMap { cb =>
-      for
-        _ <- List
-          .fill(10)(cb.protect(IO.raiseError(core.GateError.CircuitOpen("x"))).attempt)
-          .sequence
-        _ <- List
-          .fill(10)(cb.protect(IO.raiseError(core.GateError.BulkheadFull("y"))).attempt)
-          .sequence
-        state <- cb.state
-      yield state shouldBe CircuitState.Closed
     }
+
+    "does not let already-shed load feed itself" in breaker.flatMap(cb =>
+      for
+        _ <- List.fill(10)(
+          cb.protect(IO.raiseError(core.GateError.CircuitOpen("x"))).attempt,
+        ).sequence
+        _ <- List.fill(10)(
+          cb.protect(IO.raiseError(core.GateError.BulkheadFull("y"))).attempt,
+        ).sequence
+        state <- cb.state
+      yield state shouldBe CircuitState.Closed,
+    )
 
     "counts a dependency failure even when contention is interleaved with it" in
       breaker.flatMap { cb =>
