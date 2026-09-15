@@ -99,3 +99,6 @@ base/
 
 # Windows alternate-data-stream markers that WSL exposes as files
 *:Zone.Identifier
+
+# Build-in-public drafts (unpublished)
+notes/

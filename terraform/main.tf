@@ -18,6 +18,11 @@ terraform {
   # }
 }
 
+locals {
+  # Only enable tracing when there is somewhere to send it.
+  tracing_enabled = var.otel_exporter_otlp_endpoint != ""
+}
+
 provider "aws" {
   region = var.aws_region
 
@@ -146,6 +151,17 @@ module "ecs" {
     DEGRADATION_MODE              = var.degradation_mode
     CIRCUIT_BREAKER_MAX_FAILURES  = tostring(var.circuit_breaker_max_failures)
     CIRCUIT_BREAKER_RESET_TIMEOUT = var.circuit_breaker_reset_timeout
+
+    # Tracing follows the endpoint. The application default is enabled = true,
+    # so leaving these unset pointed the exporter at its own default of
+    # localhost:4317, where no collector runs on Fargate: 73 connection
+    # failures in a single load run, each opening a doomed socket on a task
+    # that was already starving for CPU. OTEL_SDK_DISABLED is set as well
+    # because it is honoured by the SDK itself, not just our config.
+    TRACING_ENABLED             = local.tracing_enabled ? "true" : "false"
+    OTEL_SDK_DISABLED           = local.tracing_enabled ? "false" : "true"
+    OTEL_EXPORTER_OTLP_ENDPOINT = var.otel_exporter_otlp_endpoint
+    OTEL_SERVICE_NAME           = var.project_name
   }
 
   # IAM permissions

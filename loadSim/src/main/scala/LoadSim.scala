@@ -41,6 +41,10 @@ import org.HdrHistogram.ConcurrentHistogram
  *   --url http://localhost:8080   base URL (default)
  *   --rps N                       target RPS for latency scenario (default 1000)
  *   --duration N                  duration in seconds for latency scenario (default 60)
+ *   --concurrency N               workers for the correctness scenario; scales all
+ *                                 three invariants (defaults A=20, B=50, C=50).
+ *                                 Lower it to match a small target -- a deployment
+ *                                 that cannot serve the load measures nothing.
  */
 object LoadSim extends IOApp:
 
@@ -90,7 +94,7 @@ object LoadSim extends IOApp:
         case "idempotency"    => withPreflight(Scenarios.idempotency(client, baseUrl).as(ExitCode.Success))
         case "realistic"      => withPreflight(Scenarios.realistic(client, baseUrl).as(ExitCode.Success))
         case "highContention" => withPreflight(Scenarios.highContention(client, baseUrl).as(ExitCode.Success))
-        case "correctness"    => withPreflight(Scenarios.correctness(client, baseUrl, concurrency.getOrElse(20)))
+        case "correctness"    => withPreflight(Scenarios.correctness(client, baseUrl, concurrency))
         case "latency"        => withPreflight(Scenarios.latency(client, baseUrl, rps.getOrElse(1000), duration.getOrElse(60)))
         case unknown =>
           Console[IO].errorln(
@@ -360,15 +364,17 @@ object Scenarios:
   def correctness(
     client:      Client[IO],
     baseUrl:     String,
-    concurrency: Int = 20,
+    concurrency: Option[Int] = None,
   ): IO[ExitCode] =
     val runId = System.currentTimeMillis.toString
+    // One --concurrency scales all three invariants. Absent, each keeps its own
+    // default: B and C need more contention than A to prove anything.
     for
       _  <- Console[IO].println(s"=== correctness — run $runId ===")
       _  <- warmUp(client, baseUrl, runId)
-      a  <- invariantA_tokenBucketNonOverIssue(client, baseUrl, runId, concurrency)
-      b  <- invariantB_idempotencyExactlyOneCreated(client, baseUrl, runId)
-      c  <- invariantC_quotaNonOverAdmission(client, baseUrl, runId)
+      a  <- invariantA_tokenBucketNonOverIssue(client, baseUrl, runId, concurrency.getOrElse(20))
+      b  <- invariantB_idempotencyExactlyOneCreated(client, baseUrl, runId, concurrency.getOrElse(50))
+      c  <- invariantC_quotaNonOverAdmission(client, baseUrl, runId, concurrency.getOrElse(50))
       ok  = a.passed && b.passed && c.passed
       _  <- Console[IO].println(
               s"""
@@ -494,12 +500,12 @@ object Scenarios:
     }
 
   private def invariantB_idempotencyExactlyOneCreated(
-    client:  Client[IO],
-    baseUrl: String,
-    runId:   String,
+    client:      Client[IO],
+    baseUrl:     String,
+    runId:       String,
+    concurrency: Int,
   ): IO[InvariantResult] =
     val K             = 10
-    val concurrency   = 50
     val durationSecs  = 30
     val keys          = (0 until K).map(i => s"correctness:B:$runId:key-$i").toVector
 
@@ -547,11 +553,11 @@ object Scenarios:
     }
 
   private def invariantC_quotaNonOverAdmission(
-    client:  Client[IO],
-    baseUrl: String,
-    runId:   String,
+    client:      Client[IO],
+    baseUrl:     String,
+    runId:       String,
+    concurrency: Int,
   ): IO[InvariantResult] =
-    val concurrency  = 50
     val durationSecs = 20
     val userLimit    = 1_000_000L   // TOKEN_QUOTA_USER_LIMIT default
     val perRequest   = 25_000L      // 40 admissions fill the window exactly

@@ -8,10 +8,16 @@ environment = "demo"
 # AWS Configuration
 aws_region = "us-east-1"
 
-# ECS Configuration (minimal for cost savings)
+# ECS Configuration.
+# Raised from 256/512 after the first real AWS validation: a quarter-vCPU JVM
+# could serve the enforcement demo but saturated under the correctness
+# scenario's concurrency, logging cats-effect starvation warnings and dropping
+# requests at the connection layer before they reached the app. 25 RPS on AWS
+# against 77 locally. 1024/2048 is the smallest valid Fargate pairing that
+# leaves headroom to actually measure the invariants.
 ecs_desired_count = 1
-ecs_cpu           = 256
-ecs_memory        = 512
+ecs_cpu           = 1024
+ecs_memory        = 2048
 enable_autoscaling = false
 ecs_min_capacity  = 1
 ecs_max_capacity  = 1

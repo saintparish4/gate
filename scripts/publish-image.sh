@@ -30,6 +30,40 @@ if ! aws ecr describe-repositories --repository-names "$REPO" --region "$REGION"
     --image-scanning-configuration scanOnPush=true >/dev/null
 fi
 
+# The repository lives outside Terraform state, so `terraform destroy` and
+# teardown-demo.sh both leave it behind and it gains an image per deploy. I
+# reapply this every run rather than only on create, so repositories made
+# before the policy existed pick it up too.
+log "Applying ECR lifecycle policy (expire untagged >1d, keep last 10)..."
+aws ecr put-lifecycle-policy \
+  --repository-name "$REPO" \
+  --region "$REGION" \
+  --lifecycle-policy-text '{
+    "rules": [
+      {
+        "rulePriority": 1,
+        "description": "Expire untagged images after 1 day",
+        "selection": {
+          "tagStatus": "untagged",
+          "countType": "sinceImagePushed",
+          "countUnit": "days",
+          "countNumber": 1
+        },
+        "action": { "type": "expire" }
+      },
+      {
+        "rulePriority": 2,
+        "description": "Keep only the 10 most recent images",
+        "selection": {
+          "tagStatus": "any",
+          "countType": "imageCountMoreThan",
+          "countNumber": 10
+        },
+        "action": { "type": "expire" }
+      }
+    ]
+  }' >/dev/null
+
 log "Logging Docker in to ECR..."
 aws ecr get-login-password --region "$REGION" \
   | docker login --username AWS --password-stdin "$REGISTRY" >/dev/null 2>&1
