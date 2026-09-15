@@ -40,6 +40,20 @@ LOCAL_ONLY=(
   TIMEOUT_IDEMPOTENCY_CHECK   # widened locally, same reason
 )
 
+# Variables Terraform sets that application.conf never reads because another
+# library consumes them straight from the environment. Named here so the CHECK
+# section only ever lists something unexplained; a check that fires on every
+# run is a check nobody reads.
+KNOWN_EXTERNAL=(
+  OTEL_SDK_DISABLED           # opentelemetry-sdk-extension-autoconfigure; Main uses OtelJava.autoConfigured
+)
+
+is_known_external() {
+  local v="$1"
+  for k in "${KNOWN_EXTERNAL[@]}"; do [ "$v" = "$k" ] && return 0; done
+  return 1
+}
+
 # ── extraction ───────────────────────────────────────────────────────────────
 
 # Every ${?VAR} override in application.conf: the variables the app honours.
@@ -131,7 +145,7 @@ fi
 orphans=""
 while read -r v; do
   [ -n "$v" ] || continue
-  if ! echo "$APP" | grep -qx "$v"; then
+  if ! echo "$APP" | grep -qx "$v" && ! is_known_external "$v"; then
     orphans+="  $v"$'\n'
   fi
 done <<< "$TF"
