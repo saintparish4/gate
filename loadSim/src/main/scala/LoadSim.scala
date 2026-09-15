@@ -341,8 +341,15 @@ object Scenarios:
    *   Server must never issue more tokens than capacity + refillRate * duration.
    *   Uses free-api-key (Free tier): capacity=20 tokens, refillRate=2 tokens/s.
    *   N=50 parallel clients target a single unique key for T=30s.
-   *   Assert: allowed_count <= capacity + refillRate * measured_elapsed + epsilon
-   *   (epsilon=2 for clock skew). The elapsed window is measured rather than assumed:
+   *   Assert: allowed_count <= capacity + refillRate * (measured_elapsed + 5s).
+   *   The 5s is a clock-correction allowance, not slack for the algorithm: the
+   *   server refills on its wall clock and this bound uses the client's monotonic
+   *   window, so a forward wall-clock correction on the server (a WSL2/Docker
+   *   step, a chrony slew on Fargate) is refill for time the client never saw.
+   *   Excess is printed in seconds -- a correction is a bounded one-off, an
+   *   algorithmic over-issue grows with duration. Measured 2.9s on both real
+   *   DynamoDB and LocalStack; see issue #10. The elapsed window is measured
+   *   rather than assumed:
    *   the server refills on its own clock, and the run always outlives the nominal
    *   30s by however long it takes to cancel 50 in-flight requests. A ceiling pinned
    *   to the nominal duration failed correct limiters on slow or cold hosts.
@@ -430,7 +437,14 @@ object Scenarios:
     val apiKey        = "free-api-key"
     val capacity      = 20
     val refillPerSec  = 2
-    val epsilon       = 2        // small slack for clock skew
+    // The server refills on its wall clock; this bound uses the client's
+    // monotonic window. A wall-clock correction on the server -- WSL2/Docker
+    // clocks step, Fargate's chrony slews -- shows up as refill for time the
+    // client never saw, at rate * seconds corrected. Allow a few seconds of
+    // that. A real algorithmic over-issue grows with duration and blows
+    // through any fixed allowance; a clock correction is a bounded one-off.
+    // Excess is reported in seconds so the two stay distinguishable.
+    val clockSkewAllowanceSec = 5
     // maxAllowed is computed after the run, from the measured window (see below).
     val minAllowed    = (capacity + (refillPerSec * durationSecs)) / 4
     val key           = s"correctness:A:$runId"  // fresh key so prior state doesn't bias
@@ -449,7 +463,7 @@ object Scenarios:
          |  duration      = ${durationSecs}s
          |  capacity      = $capacity
          |  refillPerSec  = $refillPerSec
-         |  maxAllowed    = capacity + refill*elapsed + $epsilon  (elapsed is measured, reported below)
+         |  maxAllowed    = capacity + refill*(elapsed + ${clockSkewAllowanceSec}s)  (elapsed is measured, reported below)
          |  minAllowed    = $minAllowed  (a quarter of the nominal budget; catches a limiter that rejects everything)
          |""".stripMargin
     ) *>
@@ -481,8 +495,11 @@ object Scenarios:
       // tail is worth more than the old epsilon=2 could absorb, so a correct
       // limiter reported OVER-ISSUE whenever the host was slow enough to stretch it.
       val elapsedSecs = elapsed.toMillis / 1000.0
-      val maxAllowed  = capacity + math.ceil(refillPerSec * elapsedSecs).toLong + epsilon
-      val window      = f"elapsed=$elapsedSecs%.1fs"
+      val maxAllowed  = capacity + math.ceil(refillPerSec * (elapsedSecs + clockSkewAllowanceSec)).toLong
+      // How many seconds of refill the server saw beyond the client's window.
+      // Positive and small: clock correction. Growing with duration: a bug.
+      val excessSecs  = (a - capacity) / refillPerSec.toDouble - elapsedSecs
+      val window      = f"elapsed=$elapsedSecs%.1fs, server-excess=$excessSecs%+.1fs"
       val pass =
         a <= maxAllowed && a >= minAllowed && b > 0 && e == 0 && degraded <= 0.0
       val why   =
