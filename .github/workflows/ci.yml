@@ -3,8 +3,18 @@ name: CI
 on:
   push:
     branches: [ master, main, develop ]
+    paths-ignore:
+      - '**/*.md'
+      - 'LICENSE'
+      - 'LICENSE.*'
+      - 'CHANGELOG*'
   pull_request:
     branches: [ master, main, develop ]
+    paths-ignore:
+      - '**/*.md'
+      - 'LICENSE'
+      - 'LICENSE.*'
+      - 'CHANGELOG*'
   workflow_dispatch:
 
 jobs:
