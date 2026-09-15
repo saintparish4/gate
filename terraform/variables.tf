@@ -202,3 +202,15 @@ variable "otel_exporter_otlp_endpoint" {
   type        = string
   default     = ""
 }
+
+variable "auth_rate_limit_per_minute" {
+  description = <<-EOT
+    Per-API-key request ceiling for the auth middleware's anti-brute-force
+    counter. Defaults to the application's 1000/min. Raise it for environments
+    that run load or correctness scenarios, which drive far more than that
+    through a single shared key.
+  EOT
+  type        = number
+  default     = 1000
+}
+

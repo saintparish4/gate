@@ -158,6 +158,14 @@ module "ecs" {
     # failures in a single load run, each opening a doomed socket on a task
     # that was already starving for CPU. OTEL_SDK_DISABLED is set as well
     # because it is honoured by the SDK itself, not just our config.
+    # Per-key ceiling on the auth middleware's anti-brute-force counter. The
+    # application default is 1000/min and Terraform set nothing, so the deployed
+    # task inherited it while docker-compose raises it to 10,000,000 for load
+    # tests. Any correctness run therefore died at ~1000 requests into the
+    # minute with HTTP 401 -- on AWS only, and looking exactly like an auth
+    # failure rather than a throttle.
+    AUTH_RATE_LIMIT_PER_MINUTE = tostring(var.auth_rate_limit_per_minute)
+
     TRACING_ENABLED             = local.tracing_enabled ? "true" : "false"
     OTEL_SDK_DISABLED           = local.tracing_enabled ? "false" : "true"
     OTEL_EXPORTER_OTLP_ENDPOINT = var.otel_exporter_otlp_endpoint
