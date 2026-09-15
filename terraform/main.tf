@@ -117,13 +117,21 @@ module "ecs" {
   public_subnet_ids  = module.networking.public_subnet_ids
 
   container_image = var.container_image
-  container_port  = 8080
+  container_port  = var.container_port
   desired_count   = var.ecs_desired_count
   cpu             = var.ecs_cpu
   memory          = var.ecs_memory
 
   # Environment variables for the container
   environment_variables = {
+    # Pinned so the bind address and port cannot silently disagree with the
+    # task definition, health check, target group and listener -- all of which
+    # derive from var.container_port. The application defaults (0.0.0.0:8080)
+    # happen to match today, so a mismatch would only surface as failing health
+    # checks with no stated cause.
+    SERVER_HOST = "0.0.0.0"
+    SERVER_PORT = tostring(var.container_port)
+
     AWS_REGION        = var.aws_region
     RATE_LIMIT_TABLE  = module.dynamodb.rate_limit_table_name
     IDEMPOTENCY_TABLE = module.dynamodb.idempotency_table_name

@@ -214,3 +214,13 @@ variable "auth_rate_limit_per_minute" {
   default     = 1000
 }
 
+variable "container_port" {
+  description = <<-EOT
+    Port the container listens on. Single source of truth: the task definition,
+    container health check, target group, listener and the application's own
+    SERVER_PORT all derive from this, so they cannot drift apart.
+  EOT
+  type        = number
+  default     = 8080
+}
+
