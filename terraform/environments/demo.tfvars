@@ -41,3 +41,10 @@ private_subnet_cidrs = ["10.0.1.0/24", "10.0.2.0/24"]
 
 # Container image - set via -var flag in deploy script
 # container_image = "123456789.dkr.ecr.us-east-1.amazonaws.com/rate-limiter:latest"
+
+# The demo is what the correctness scenario runs against, and that drives tens of
+# thousands of requests per minute through one shared key. At the application
+# default of 1000/min the auth middleware throttles it and every invariant fails
+# with HTTP 401 partway through the first one. Matches docker-compose.
+auth_rate_limit_per_minute = 10000000
+

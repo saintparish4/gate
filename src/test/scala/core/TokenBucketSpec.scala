@@ -158,6 +158,51 @@ class TokenBucketSpec extends AnyFreeSpec with Matchers:
     }
   }
 
+  "TokenBucket under clock corrections" - {
+    // nowMs is wall clock and has to be -- lastRefillMs is shared across tasks.
+    // Wall clocks get corrected. These pin what a correction may and may not do.
+
+    "a backward correction adds no tokens and deducts none" in {
+      // Clock stepped back 3s: now is earlier than the last refill mark.
+      val state =
+        TokenBucketState(tokens = 5.0, lastRefillMs = 10_000L, version = 1L)
+      val result = TokenBucket.refill(state, nowMs = 7_000L, profile)
+      result.tokens shouldBe 5.0
+    }
+
+    "consume never moves lastRefillMs backward" in {
+      val state =
+        TokenBucketState(tokens = 5.0, lastRefillMs = 10_000L, version = 1L)
+      val result = TokenBucket.consume(state, cost = 1, nowMs = 7_000L)
+      result shouldBe defined
+      result.get.lastRefillMs shouldBe 10_000L
+    }
+
+    "consume still advances lastRefillMs to now when the clock is monotone" in {
+      val state =
+        TokenBucketState(tokens = 5.0, lastRefillMs = 10_000L, version = 1L)
+      val result = TokenBucket.consume(state, cost = 1, nowMs = 12_000L)
+      result shouldBe defined
+      result.get.lastRefillMs shouldBe 12_000L
+    }
+
+    "a backward step followed by catch-up does not mint the step" in {
+      // Without the guards a 3s backward step plants lastRefillMs=7_000; the
+      // next request at 12_000 then refills 5s instead of 2s and mints the
+      // 3s difference. Issue #10 measured exactly this class of excess.
+      val before =
+        TokenBucketState(tokens = 5.0, lastRefillMs = 10_000L, version = 1L)
+      val stepped = TokenBucket
+        .consume(TokenBucket.refill(before, 7_000L, profile), 1, 7_000L).get
+      stepped.lastRefillMs shouldBe 10_000L
+      stepped.tokens shouldBe 4.0
+
+      val later = TokenBucket.refill(stepped, nowMs = 12_000L, profile)
+      // 2s of real refill at 1/s from the un-regressed mark, not 5s.
+      later.tokens shouldBe 6.0
+    }
+  }
+
   "TokenBucket.retryAfterSeconds" - {
 
     "should return 1 as the minimum retry delay" in {
