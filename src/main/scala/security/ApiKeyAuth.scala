@@ -3,6 +3,7 @@ package security
 import scala.concurrent.duration.*
 
 import org.http4s.*
+import org.http4s.circe.*
 import org.http4s.dsl.io.*
 import org.http4s.headers.Authorization
 import org.http4s.server.AuthMiddleware
@@ -12,6 +13,8 @@ import org.typelevel.log4cats.Logger
 import cats.data.{Kleisli, OptionT}
 import cats.effect.*
 import cats.syntax.all.*
+import io.circe.Json
+import io.circe.syntax.*
 
 /** API key authentication for securing rate limiter endpoints.
   *
@@ -145,7 +148,19 @@ object AuthError:
   */
 object ApiKeyAuth:
 
+  private type AuthResult = Either[AuthError, AuthenticatedClient]
+
   /** Create authentication middleware.
+    *
+    * Every failure used to collapse to `None`, which http4s renders as a bare
+    * 401. That put the auth-layer throttle -- a valid key sending too fast --
+    * in the same bucket as a missing or invalid key, and the two demand
+    * opposite client behaviour: fix your credentials versus back off and retry.
+    * A correctness run against AWS reported thousands of `HTTP 401` and was
+    * first diagnosed as capacity exhaustion; it was this throttle.
+    *
+    * The throttle now answers 429 with `Retry-After`. Missing and invalid keys
+    * keep the bare 401 they always had.
     */
   def middleware[F[_]: Temporal: Logger](
       apiKeyStore: ApiKeyStore[F],
@@ -153,41 +168,48 @@ object ApiKeyAuth:
   ): AuthMiddleware[F, AuthenticatedClient] =
     val logger = Logger[F]
 
-    val authUser
-        : Kleisli[[X] =>> OptionT[F, X], Request[F], AuthenticatedClient] =
-      Kleisli { request =>
-        OptionT {
-          extractApiKey(request).flatMap {
-            case None => logger.debug("Request missing API key") *>
-                Temporal[F].pure(None)
+    def fail(e: AuthError): AuthResult = Left(e)
+    def ok(c: AuthenticatedClient): AuthResult = Right(c)
 
-            case Some(apiKey) =>
-              // Look up the client
-              apiKeyStore.findByKey(apiKey).flatMap {
-                case None => logger
-                    .warn(s"Invalid API key attempted: ${maskKey(apiKey)}") *>
-                    Temporal[F].pure(None)
+    val authUser: Kleisli[F, Request[F], AuthResult] = Kleisli { request =>
+      extractApiKey(request).flatMap {
+        case None => logger.debug("Request missing API key")
+            .as(fail(AuthError.MissingApiKey))
 
-                case Some(client) =>
-                  // Check rate limit on the rate limiter itself
-                  authRateLimiter match
-                    case Some(limiter) => limiter.checkLimit(client.apiKeyId)
-                        .flatMap {
-                          case true => logger
-                              .debug(s"Authenticated client: ${client
-                                  .clientName}") *> Temporal[F].pure(Some(client))
-                          case false => logger.warn(s"Client ${client
-                                .clientName} hit auth rate limit") *>
-                              Temporal[F].pure(None)
-                        }
-                    case None => logger.debug(s"Authenticated client: ${client
-                          .clientName}") *> Temporal[F].pure(Some(client))
-              }
+        case Some(apiKey) => apiKeyStore.findByKey(apiKey).flatMap {
+            case None => logger
+                .warn(s"Invalid API key attempted: ${maskKey(apiKey)}")
+                .as(fail(AuthError.InvalidApiKey))
+
+            case Some(client) => authRateLimiter match
+                case None => logger.debug(s"Authenticated client: ${client
+                      .clientName}").as(ok(client))
+
+                case Some(limiter) => limiter.checkLimit(client.apiKeyId)
+                    .flatMap {
+                      case AuthLimitDecision.Allowed => logger
+                          .debug(s"Authenticated client: ${client.clientName}")
+                          .as(ok(client))
+                      case AuthLimitDecision.Throttled(retryAfter) =>
+                        logger.warn(s"Client ${client.clientName} hit auth rate limit; retry after ${retryAfter}s")
+                          .as(fail(AuthError.RateLimited(retryAfter)))
+                    }
           }
-        }
       }
+    }
 
-    AuthMiddleware(authUser)
+    val onFailure: AuthedRoutes[AuthError, F] = Kleisli(authed =>
+      OptionT.liftF(Temporal[F].pure(
+        authed.context match
+          case AuthError.RateLimited(retryAfter) =>
+            Response[F](Status.TooManyRequests).withEntity(
+              Json.obj("error" := "Rate limited", "retryAfter" := retryAfter),
+            ).putHeaders(Header.Raw(ci"Retry-After", retryAfter.toString))
+          case _ => Response[F](Status.Unauthorized),
+      )),
+    )
+
+    AuthMiddleware(authUser, onFailure)
 
   /** Extract API key from Authorization header. Supports "Bearer <key>" and
     * "ApiKey <key>" formats.
@@ -224,17 +246,27 @@ object ApiKeyAuth:
       ),
     )
 
+/** Outcome of the auth-layer throttle. `Throttled` carries the seconds until
+  * this client's per-minute window resets, so the response can say so.
+  */
+enum AuthLimitDecision:
+  case Allowed
+  case Throttled(retryAfterSeconds: Int)
+
 /** Rate limiter for authentication attempts. Protects against brute-force API
   * key guessing.
   */
 trait AuthRateLimiter[F[_]]:
   /** Check if a client can make a request */
-  def checkLimit(clientId: String): F[Boolean]
+  def checkLimit(clientId: String): F[AuthLimitDecision]
 
 object AuthRateLimiter:
   import java.util.concurrent.atomic.AtomicInteger
 
   import com.github.benmanes.caffeine.cache.Caffeine
+
+  private def toOption[A](o: java.util.Optional[A]): Option[A] =
+    if o.isPresent then Some(o.get) else None
 
   /** Simple in-memory rate limiter for auth attempts.
     */
@@ -242,17 +274,33 @@ object AuthRateLimiter:
       maxRequestsPerMinute: Int = 100,
       maxFailedAttemptsPerMinute: Int = 10,
   ): F[AuthRateLimiter[F]] = Sync[F].delay {
-    // Cache for tracking request counts per client
-    val requestCounts = Caffeine.newBuilder()
-      .expireAfterWrite(java.time.Duration.ofMinutes(1))
+    val window = java.time.Duration.ofMinutes(1)
+    // Cache for tracking request counts per client. The window is
+    // expireAfterWrite from the entry's creation: the counter is mutated in
+    // place, never rewritten, so a client's minute starts at its first request.
+    val requestCounts = Caffeine.newBuilder().expireAfterWrite(window)
       .build[String, AtomicInteger]()
 
     new AuthRateLimiter[F]:
-      override def checkLimit(clientId: String): F[Boolean] = Sync[F].delay {
-        val counter = requestCounts.get(clientId, _ => new AtomicInteger(0))
-        val count = counter.incrementAndGet()
-        count <= maxRequestsPerMinute
-      }
+      override def checkLimit(clientId: String): F[AuthLimitDecision] = Sync[F]
+        .delay {
+          val counter = requestCounts.get(clientId, _ => new AtomicInteger(0))
+          val count = counter.incrementAndGet()
+          if count <= maxRequestsPerMinute then AuthLimitDecision.Allowed
+          else AuthLimitDecision.Throttled(secondsUntilReset(clientId))
+        }
+
+      // Caffeine reports the entry's age against the fixed expiry, which is
+      // exactly the time left in the window. Whole window if it cannot -- the
+      // entry expired between the increment and this read.
+      private def secondsUntilReset(clientId: String): Int =
+        val remaining =
+          for
+            policy <- toOption(requestCounts.policy().expireAfterWrite())
+            age <- toOption(policy.ageOf(clientId))
+          yield window.minus(age)
+        remaining.map(d => math.max(1, math.ceil(d.toMillis / 1000.0).toInt))
+          .getOrElse(window.toSeconds.toInt)
   }
 
 /** Request context enriched with authentication info.

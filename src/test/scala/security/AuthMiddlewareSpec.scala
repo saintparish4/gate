@@ -13,6 +13,7 @@ import org.typelevel.log4cats.noop.NoOpLogger
 import cats.data.{Kleisli, OptionT}
 import cats.effect.IO
 import cats.effect.testing.scalatest.AsyncIOSpec
+import cats.syntax.all.*
 
 /** Unit tests for ApiKeyAuth middleware.
   *
@@ -148,4 +149,77 @@ class AuthMiddlewareSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
       ClientTier.fromString("enterprise") shouldBe Some(ClientTier.Enterprise)
       ClientTier.fromString("unknown") shouldBe None
     }.asserting(_ => succeed)
+  }
+
+  "ApiKeyAuth middleware — auth-layer throttle" - {
+    // The throttle is the one failure that is not an auth failure: a valid key
+    // sending too fast. It must read as 429 with Retry-After, and it must not
+    // change what a missing or invalid key gets.
+
+    def throttled(limit: Int): IO[HttpRoutes[IO]] = AuthRateLimiter
+      .inMemory[IO](maxRequestsPerMinute = limit)
+      .map(l => ApiKeyAuth.middleware[IO](keyStore, Some(l))(protectedRoutes))
+
+    def statusAndBody(
+        r: HttpRoutes[IO],
+        req: Request[IO],
+    ): IO[Option[(Status, String)]] = r.run(req).value
+      .flatMap(_.traverse(resp => resp.as[String].map(b => (resp.status, b))))
+
+    "under the limit every request is 200" in throttled(3).flatMap(r =>
+      List.fill(3)(requestWithBearer("test-api-key"))
+        .traverse(req => r.run(req).value.map(_.map(_.status))),
+    ).asserting(_ shouldBe List.fill(3)(Some(Status.Ok)))
+
+    "over the limit is 429 with Retry-After and a body that says so, not 401" in
+      throttled(2).flatMap { r =>
+        val req = requestWithBearer("test-api-key")
+        for
+          _ <- r.run(req).value
+          _ <- r.run(req).value
+          third <- r.run(req).value
+          body <- third.traverse(_.as[String])
+        yield (
+          third.map(_.status),
+          third.flatMap(_.headers.get(ci"Retry-After").map(_.head.value)),
+          body.getOrElse(""),
+        )
+      }.asserting { case (status, retryAfter, body) =>
+        status shouldBe Some(Status.TooManyRequests)
+        retryAfter.flatMap(_.toIntOption)
+          .exists(n => n >= 1 && n <= 60) shouldBe true
+        body should include("retryAfter")
+        body should include("Rate limited")
+      }
+
+    "a missing key is still a bare 401" in throttled(2)
+      .flatMap(r => statusAndBody(r, requestWithNoAuth))
+      .asserting(_ shouldBe Some((Status.Unauthorized, "")))
+
+    "an invalid key is still a bare 401" in throttled(2)
+      .flatMap(r => statusAndBody(r, requestWithBearer("not-a-real-key")))
+      .asserting(_ shouldBe Some((Status.Unauthorized, "")))
+
+    "the throttle is per client: one key over the limit does not affect another" in
+      throttled(1).flatMap(r =>
+        for
+          _ <- r.run(requestWithBearer("test-api-key")).value
+          second <- r.run(requestWithBearer("test-api-key")).value
+          other <- r.run(requestWithBearer("free-api-key")).value
+        yield (second.map(_.status), other.map(_.status)),
+      ).asserting(_ shouldBe (Some(Status.TooManyRequests), Some(Status.Ok)))
+  }
+
+  "AuthRateLimiter.inMemory" - {
+
+    "allows up to the limit, then throttles with a retry-after inside the window" in
+      AuthRateLimiter.inMemory[IO](maxRequestsPerMinute = 2)
+        .flatMap(l => List.fill(3)("client-a").traverse(l.checkLimit)).asserting {
+          ds =>
+            ds.take(2) shouldBe
+              List(AuthLimitDecision.Allowed, AuthLimitDecision.Allowed)
+            ds(2) should matchPattern {
+              case AuthLimitDecision.Throttled(n) if n >= 1 && n <= 60 =>
+            }
+        }
   }
