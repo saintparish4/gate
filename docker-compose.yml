@@ -68,7 +68,7 @@ services:
       # and CI so the single shared `test-api-key` isn't throttled by the
       # anti-abuse counter the auth middleware uses against brute-force
       # key-guessing. Production keeps the default (1000).
-      - AUTH_RATE_LIMIT_PER_MINUTE=10000000
+      - AUTH_RATE_LIMIT_PER_MINUTE=${AUTH_RATE_LIMIT_PER_MINUTE:-10000000}
     depends_on:
       localstack:
         condition: service_healthy
