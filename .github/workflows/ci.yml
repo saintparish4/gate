@@ -14,7 +14,13 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-      
+
+    # Before the JDK: needs only bash and awk, and a drift is cheaper to learn
+    # here than on a deploy. Four env vars shipped set in compose and absent from
+    # Terraform before this existed; each cost a deploy cycle to find.
+    - name: Check compose/Terraform env drift
+      run: ./scripts/check-env-drift.sh
+
     - name: Set up JDK 17
       uses: actions/setup-java@v4
       with:
