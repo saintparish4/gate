@@ -10,6 +10,7 @@ import org.http4s.server.AuthMiddleware
 import org.typelevel.ci.*
 import org.typelevel.log4cats.Logger
 
+import cats.Applicative
 import cats.data.{Kleisli, OptionT}
 import cats.effect.*
 import cats.syntax.all.*
@@ -233,18 +234,22 @@ object ApiKeyAuth:
   private def maskKey(key: String): String =
     if key.length > 8 then s"${key.take(4)}...${key.takeRight(4)}" else "****"
 
-  /** Permission-checking middleware wrapper.
+  /** Run `route` only when the client holds `permission`; answer 403 otherwise.
+    *
+    * The Kleisli this replaces was never wired into any route, so every
+    * permission was decorative: `/metrics` sat public next to an unused
+    * `AdminMetrics`. A 403, not a 404, so a key missing a grant is told why.
     */
-  def requirePermission[F[_]: Temporal](
+  def requirePermission[F[_]: Applicative](
+      client: AuthenticatedClient,
       permission: Permission,
-  ): Kleisli[[X] =>> OptionT[F, X], AuthenticatedClient, AuthenticatedClient] =
-    Kleisli(client =>
-      OptionT(
-        if client.permissions.contains(permission) then
-          Temporal[F].pure(Some(client))
-        else Temporal[F].pure(None),
-      ),
-    )
+  )(route: => F[Response[F]]): F[Response[F]] =
+    if client.permissions.contains(permission) then route
+    else
+      Response[F](Status.Forbidden).withEntity(Json.obj(
+        "error" := "forbidden",
+        "message" := AuthError.InsufficientPermissions(permission).getMessage,
+      )).pure[F]
 
 /** Outcome of the auth-layer throttle. `Throttled` carries the seconds until
   * this client's per-minute window resets, so the response can say so.

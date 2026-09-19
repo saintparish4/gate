@@ -8,6 +8,11 @@ global:
 scrape_configs:
   - job_name: gate
     metrics_path: /metrics
+    # /metrics needs a key holding AdminMetrics. This is the built-in
+    # development admin key; it only exists when Secrets Manager is off.
+    authorization:
+      type: Bearer
+      credentials: admin-api-key
     static_configs:
       - targets: ["rate-limiter:8080"]
 

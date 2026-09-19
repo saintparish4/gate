@@ -174,6 +174,11 @@ module "ecs" {
     # failure rather than a throttle.
     AUTH_RATE_LIMIT_PER_MINUTE = tostring(var.auth_rate_limit_per_minute)
 
+    # Pinned off. Every dashboard route is unauthenticated: its config POST
+    # rewrites the live demo profile and its decision stream carries every
+    # client's key ID, and the ALB forwards every path to the task.
+    DASHBOARD_ENABLED = "false"
+
     TRACING_ENABLED             = local.tracing_enabled ? "true" : "false"
     OTEL_SDK_DISABLED           = local.tracing_enabled ? "false" : "true"
     OTEL_EXPORTER_OTLP_ENDPOINT = var.otel_exporter_otlp_endpoint

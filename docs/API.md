@@ -54,7 +54,7 @@ Checks if a request is allowed under the configured rate limit.
 |-------|------|----------|-------------|
 | `key` | string | Yes | Unique identifier for rate limit bucket (e.g., user ID, API key) |
 | `cost` | integer | No | Number of tokens to consume (default: 1) |
-| `profile` | string | No | Rate limit profile name (optional, uses tier-based defaults) |
+| `profile` | string | No | Rate limit profile name. Defaults to the client tier's profile, and may only narrow it: a profile with a higher capacity or refill than the tier's answers 403, an unknown name answers 400 |
 | `endpoint` | string | No | Endpoint identifier for tracking (optional) |
 
 **Note:** The `algorithm` field is not currently used - only token bucket algorithm is implemented.
@@ -86,6 +86,22 @@ Checks if a request is allowed under the configured rate limit.
 ```
 HTTP/1.1 429 Too Many Requests
 Retry-After: 5
+```
+
+**Profile Above the Client's Tier (403):** nothing is consumed.
+```json
+{
+  "error": "profile_not_permitted",
+  "message": "profile 'enterprise' exceeds the free tier's limits"
+}
+```
+
+**Unknown Profile (400):**
+```json
+{
+  "error": "validation_error",
+  "message": "unknown profile 'gold'"
+}
 ```
 
 **Response Fields:**
@@ -494,15 +510,17 @@ Scrape endpoint for Prometheus-compatible metrics.
 
 **Endpoint:** `GET /metrics`
 
+**Authentication:** a key holding the `AdminMetrics` permission (the development `admin-api-key`). No key answers 401; a key without the permission answers 403.
+
 Returns metrics in Prometheus text exposition format. Includes counters, gauges, and histograms for rate-limit decisions, idempotency checks, token quotas, DynamoDB latency, circuit breaker state, and event publishing. See the main README for the full metric list.
 
 **Response:** `200 OK` with `Content-Type: text/plain`
 
 ```bash
-curl http://localhost:8080/metrics
+curl -H "Authorization: Bearer admin-api-key" http://localhost:8080/metrics
 ```
 
-**Note:** Requires `PROMETHEUS_ENABLED=true` (default). Returns 404 if Prometheus is disabled.
+**Note:** Requires `PROMETHEUS_ENABLED=true` (default). Returns 404 to an authorized key if Prometheus is disabled.
 
 ---
 
@@ -526,6 +544,7 @@ All error responses follow this format:
 |--------|------------|-------------|
 | 400 | `bad_request` | Body is not valid JSON, or a parameter is invalid |
 | 401 | `unauthorized` | Missing or invalid authentication |
+| 403 | `forbidden` / `profile_not_permitted` | The key lacks the permission the route needs, or a rate-limit check named a profile above the key's tier |
 | 422 | — | Body is valid JSON but does not match the endpoint's schema (e.g. a required field is missing) |
 | 404 | `not_found` | Resource not found |
 | 429 | `rate_limit_exceeded` | Rate limit exceeded |

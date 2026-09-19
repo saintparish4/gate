@@ -1,3 +1,4 @@
+import cats.data.EitherT
 import cats.effect.*
 import cats.effect.std.Console
 import cats.syntax.all.*
@@ -45,11 +46,14 @@ import org.HdrHistogram.ConcurrentHistogram
  *                                 three invariants (defaults A=20, B=50, C=50).
  *                                 Lower it to match a small target -- a deployment
  *                                 that cannot serve the load measures nothing.
+ *   --admin-key KEY               key holding AdminMetrics, used to read /metrics
+ *                                 for invariant A (default admin-api-key)
  */
 object LoadSim extends IOApp:
 
   val defaultBaseUrl = "http://localhost:8080"
   val defaultApiKey  = "test-api-key"
+  val defaultAdminKey = "admin-api-key"
 
   override def run(args: List[String]): IO[ExitCode] =
     val scenario = Args.string(args, "--scenario", "normal")
@@ -60,6 +64,7 @@ object LoadSim extends IOApp:
     // actually answer, since a target that cannot serve the load degrades and
     // the invariant then measures degradation instead of the token bucket.
     val concurrency = Args.intOpt(args, "--concurrency")
+    val adminKey    = Args.string(args, "--admin-key", defaultAdminKey)
 
     // Larger connection pool so workers don't queue waiting for a connection
     // at high RPS, and an explicit per-request timeout so a hung server fails
@@ -94,7 +99,7 @@ object LoadSim extends IOApp:
         case "idempotency"    => withPreflight(Scenarios.idempotency(client, baseUrl).as(ExitCode.Success))
         case "realistic"      => withPreflight(Scenarios.realistic(client, baseUrl).as(ExitCode.Success))
         case "highContention" => withPreflight(Scenarios.highContention(client, baseUrl).as(ExitCode.Success))
-        case "correctness"    => withPreflight(Scenarios.correctness(client, baseUrl, concurrency))
+        case "correctness"    => withPreflight(Scenarios.correctness(client, baseUrl, concurrency, adminKey))
         case "latency"        => withPreflight(Scenarios.latency(client, baseUrl, rps.getOrElse(1000), duration.getOrElse(60)))
         case unknown =>
           Console[IO].errorln(
@@ -372,6 +377,7 @@ object Scenarios:
     client:      Client[IO],
     baseUrl:     String,
     concurrency: Option[Int] = None,
+    adminKey:    String = LoadSim.defaultAdminKey,
   ): IO[ExitCode] =
     val runId = System.currentTimeMillis.toString
     // One --concurrency scales all three invariants. Absent, each keeps its own
@@ -379,7 +385,7 @@ object Scenarios:
     for
       _  <- Console[IO].println(s"=== correctness — run $runId ===")
       _  <- warmUp(client, baseUrl, runId)
-      a  <- invariantA_tokenBucketNonOverIssue(client, baseUrl, runId, concurrency.getOrElse(20))
+      a  <- invariantA_tokenBucketNonOverIssue(client, baseUrl, runId, concurrency.getOrElse(20), adminKey)
       b  <- invariantB_idempotencyExactlyOneCreated(client, baseUrl, runId, concurrency.getOrElse(50))
       c  <- invariantC_quotaNonOverAdmission(client, baseUrl, runId, concurrency.getOrElse(50))
       ok  = a.passed && b.passed && c.passed
@@ -429,6 +435,7 @@ object Scenarios:
     baseUrl:     String,
     runId:       String,
     concurrency: Int,
+    adminKey:    String,
   ): IO[InvariantResult] =
     val durationSecs  = 30
     // free-api-key maps to the Free tier (20 tokens, 2 tokens/s in application.conf).
@@ -455,35 +462,22 @@ object Scenarios:
     val errors  = new AtomicLong(0)
     val sampler = new ErrorSampler(5)
 
-    Console[IO].println(
-      s"""-- Invariant A — token-bucket non-over-issue --
-         |  key           = $key
-         |  apiKey        = $apiKey (Free tier)
-         |  concurrency   = $concurrency
-         |  duration      = ${durationSecs}s
-         |  capacity      = $capacity
-         |  refillPerSec  = $refillPerSec
-         |  maxAllowed    = capacity + refill*(elapsed + ${clockSkewAllowanceSec}s)  (elapsed is measured, reported below)
-         |  minAllowed    = $minAllowed  (a quarter of the nominal budget; catches a limiter that rejects everything)
-         |""".stripMargin
-    ) *>
-    readDegradedTotal(client, baseUrl).flatMap { degradedBefore =>
-    IO.monotonic.flatMap { startedAt =>
-      IO.race(
-        progressTicker("invariantA", durationSecs, total, allowed, blocked, errors),
-        (0 until concurrency).toList.parTraverse_ { _ =>
-          sendRateLimitCheck(client, baseUrl, key, apiKey).flatMap {
-            case Right(true)  => IO { total.incrementAndGet(); allowed.incrementAndGet() }
-            case Right(false) => IO { total.incrementAndGet(); blocked.incrementAndGet() }
-            case Left(msg)    => IO { total.incrementAndGet(); errors.incrementAndGet(); sampler.record(msg) }
-          }.loop
-        }
-      ) *> IO.monotonic.map(_ - startedAt)
-    }.flatMap { elapsed =>
-      readDegradedTotal(client, baseUrl)
-        .map(after => (elapsed, after - degradedBefore))
-    }
-    }.flatMap { case (elapsed, degraded) =>
+    // Returns how long the workers ran.
+    def drive: IO[FiniteDuration] =
+      IO.monotonic.flatMap { startedAt =>
+        IO.race(
+          progressTicker("invariantA", durationSecs, total, allowed, blocked, errors),
+          (0 until concurrency).toList.parTraverse_ { _ =>
+            sendRateLimitCheck(client, baseUrl, key, apiKey).flatMap {
+              case Right(true)  => IO { total.incrementAndGet(); allowed.incrementAndGet() }
+              case Right(false) => IO { total.incrementAndGet(); blocked.incrementAndGet() }
+              case Left(msg)    => IO { total.incrementAndGet(); errors.incrementAndGet(); sampler.record(msg) }
+            }.loop
+          }
+        ) *> IO.monotonic.map(_ - startedAt)
+      }
+
+    def verdict(elapsed: FiniteDuration, degraded: Double): IO[InvariantResult] =
       val a = allowed.get
       val b = blocked.get
       val t = total.get
@@ -514,7 +508,33 @@ object Scenarios:
         else if a < minAllowed then s"UNDER-ISSUE: allowed=$a < minAllowed=$minAllowed (total=$t, blocked=$b) — the limiter went dark"
         else s"OVER-ISSUE: allowed=$a > maxAllowed=$maxAllowed ($window, total=$t, blocked=$b, errors=$e)"
       IO.pure(InvariantResult(pass, why))
-    }
+
+    // Without /metrics there is no telling a token-bucket decision from a
+    // degraded one, so the run is refused rather than trusted.
+    val run =
+      for
+        before  <- EitherT(readDegradedTotal(client, baseUrl, adminKey))
+        elapsed <- EitherT.liftF(drive)
+        after   <- EitherT(readDegradedTotal(client, baseUrl, adminKey))
+        res     <- EitherT.liftF(verdict(elapsed, after - before))
+      yield res
+
+    Console[IO].println(
+      s"""-- Invariant A — token-bucket non-over-issue --
+         |  key           = $key
+         |  apiKey        = $apiKey (Free tier)
+         |  concurrency   = $concurrency
+         |  duration      = ${durationSecs}s
+         |  capacity      = $capacity
+         |  refillPerSec  = $refillPerSec
+         |  maxAllowed    = capacity + refill*(elapsed + ${clockSkewAllowanceSec}s)  (elapsed is measured, reported below)
+         |  minAllowed    = $minAllowed  (a quarter of the nominal budget; catches a limiter that rejects everything)
+         |""".stripMargin
+    ) *>
+    run.valueOr(err => InvariantResult(false, metricsUnreadable(err)))
+
+  private def metricsUnreadable(err: String): String =
+    s"METRICS UNREADABLE: $err — without gate_degraded_total a degraded decision looks like a token-bucket one. Pass --admin-key with a key holding AdminMetrics."
 
   private def invariantB_idempotencyExactlyOneCreated(
     client:      Client[IO],
@@ -866,24 +886,40 @@ object Http:
       }
       .handleError(e => Left(Option(e.getMessage).getOrElse(e.getClass.getSimpleName)))
 
-  /** Sum of gate_degraded_total across reasons, or 0.0 if /metrics cannot be
-    * read. The counter is monotonic, so a before/after delta says whether the
-    * server served any decision from degradation mode -- circuit breaker open,
-    * bulkhead full, or store error -- during a run.
+  /** Sum of gate_degraded_total across reasons. The counter is monotonic, so a
+    * before/after delta says whether the server served any decision from
+    * degradation mode -- circuit breaker open, bulkhead full, or store error --
+    * during a run.
+    *
+    * An unreadable /metrics is a Left, not 0.0. It used to be 0.0, which read
+    * as "never degraded"; once /metrics went behind AdminMetrics, a keyless
+    * scrape would have 401'd and quietly passed every run.
     *
     * Matching on the "{" excludes the gate_degraded_total_created line the
-    * Prometheus client also emits, whose value is a unix timestamp.
+    * Prometheus client also emits, whose value is a unix timestamp. No
+    * matching line is a genuine zero: the labelled counter has no samples
+    * until its first increment.
     */
-  def readDegradedTotal(client: Client[IO], baseUrl: String): IO[Double] =
+  def readDegradedTotal(
+    client:   Client[IO],
+    baseUrl:  String,
+    adminKey: String,
+  ): IO[Either[String, Double]] =
     val req = Request[IO](
-      method = Method.GET,
-      uri    = Uri.unsafeFromString(s"$baseUrl/metrics"),
+      method  = Method.GET,
+      uri     = Uri.unsafeFromString(s"$baseUrl/metrics"),
+      headers = Headers("Authorization" -> s"Bearer $adminKey"),
     )
-    client.run(req).use(_.as[String]).map { body =>
-      body.linesIterator.filter(_.startsWith("gate_degraded_total{")).flatMap {
-        line => line.split(' ').lastOption.flatMap(v => scala.util.Try(v.toDouble).toOption)
-      }.sum
-    }.handleError(_ => 0.0)
+    client.run(req).use { resp =>
+      resp.as[String].map { body =>
+        if resp.status.code != 200 then Left(s"GET /metrics -> HTTP ${resp.status.code}")
+        else Right(
+          body.linesIterator.filter(_.startsWith("gate_degraded_total{")).flatMap {
+            line => line.split(' ').lastOption.flatMap(v => scala.util.Try(v.toDouble).toOption)
+          }.sum
+        )
+      }
+    }.handleError(e => Left(s"GET /metrics failed: ${Option(e.getMessage).getOrElse(e.getClass.getSimpleName)}"))
 
   def sendRateLimitCheck(
     client:  Client[IO],

@@ -72,6 +72,11 @@ case class MetricsConfig(
 
 case class PrometheusConfig(enabled: Boolean = true) derives ConfigReader
 
+// Off by default: every dashboard route is unauthenticated, the config POST
+// rewrites the live demo profile, and the decision stream carries every
+// client's key ID. Compose turns it on; Terraform pins it off.
+case class DashboardConfig(enabled: Boolean = false) derives ConfigReader
+
 case class TracingConfig(
     enabled: Boolean = false,
     serviceName: String = "gate",
@@ -255,6 +260,7 @@ case class AppConfig(
     idempotency: IdempotencyConfig = IdempotencyConfig(),
     metrics: MetricsConfig = MetricsConfig(),
     prometheus: PrometheusConfig = PrometheusConfig(),
+    dashboard: DashboardConfig = DashboardConfig(),
     tracing: TracingConfig = TracingConfig(),
     security: SecurityConfig = SecurityConfig(
       authentication = AuthenticationConfig(),
