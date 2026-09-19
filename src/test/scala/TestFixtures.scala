@@ -24,6 +24,11 @@ package object testutil:
           name: String,
           dims: Map[String, String] = Map.empty,
       ): IO[Unit] = ref.update(_ :+ name)
+      def count(
+          name: String,
+          amount: Double,
+          dims: Map[String, String] = Map.empty,
+      ): IO[Unit] = ref.update(_ :+ name)
       def gauge(
           name: String,
           value: Double,

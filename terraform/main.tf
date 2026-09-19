@@ -140,6 +140,9 @@ module "ecs" {
     KINESIS_ENABLED   = "true"
     METRICS_ENABLED   = "true"
     METRICS_NAMESPACE = "RateLimiter/${var.environment}"
+    # The Environment dimension on every datum; it read "dev" everywhere until
+    # the app honoured it.
+    METRICS_ENVIRONMENT = var.environment
     # I set this explicitly: application.conf defaults it off, and without it
     # /v1/quota/check answers 404 even though its table and IAM are provisioned.
     TOKEN_QUOTA_ENABLED = "true"

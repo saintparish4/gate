@@ -82,8 +82,10 @@ class HttpApiIntegrationSpec
   // No-op event publisher for tests
   lazy val eventPublisher: EventPublisher[IO] = EventPublisher.noop[IO]
 
-  // No-op metrics publisher for tests
-  lazy val metricsPublisher: MetricsPublisher[IO] = MetricsPublisher.noop[IO]
+  // Mirrored into Prometheus, the way Main wires it, so /metrics shows what
+  // the requests in these tests did.
+  lazy val metricsPublisher: MetricsPublisher[IO] = PrometheusMetrics
+    .dual(MetricsPublisher.noop[IO], prometheusMetrics)
 
   // Test API key store
   lazy val testApiKeyStore: ApiKeyStore[IO] = ApiKeyStore.inMemory[IO] {
@@ -597,6 +599,40 @@ class HttpApiIntegrationSpec
         anonymous.status shouldBe Status.Unauthorized
         authed.status shouldBe Status.NotFound
       }
+    }
+
+    "GET /metrics reflects the traffic that went through the API" in {
+      def post(path: Uri, body: String): Request[IO] = withKey(
+        Request[IO](Method.POST, path).withEntity(body)
+          .putHeaders(headers.`Content-Type`(MediaType.application.json)),
+        "test-key",
+      )
+      // simpleclient writes `name{a="x",b="y",} 3.0`; the series is identified
+      // by everything before the value.
+      def value(body: String, series: String): Double = body.linesIterator
+        .find(_.startsWith(series)).flatMap(_.split(' ').lastOption)
+        .map(_.toDouble).getOrElse(0.0)
+      val series = List(
+        "gate_requests_total{tier=\"free\",result=\"allowed\",}",
+        "gate_idempotency_total{result=\"new\",}",
+        "gate_quota_tokens_admitted_total{level=\"user\",}",
+      )
+      def snapshot: IO[List[Double]] = metrics(Some("admin-key"))
+        .flatMap(_.as[String]).map(body => series.map(value(body, _)))
+      for {
+        before <- snapshot
+        _ <- httpApp
+          .run(post(uri"/v1/ratelimit/check", """{"key": "metrics-e2e"}"""))
+        _ <- httpApp.run(post(
+          uri"/v1/idempotency/check",
+          """{"idempotencyKey": "metrics-e2e"}""",
+        ))
+        _ <- httpApp.run(post(
+          uri"/v1/quota/check",
+          """{"userId": "metrics-e2e", "estimatedInputTokens": 10, "estimatedOutputTokens": 5}""",
+        ))
+        after <- snapshot
+      } yield after.zip(before).map(_ - _) shouldBe List(1.0, 1.0, 15.0)
     }
 
     "with the dashboard queue, dashboard routes are served" in {

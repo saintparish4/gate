@@ -60,16 +60,22 @@ class IdempotencyApi[F[_]: Async: Tracer](
       _ <- logger.debug(s"Idempotency check: key=${checkReq
           .idempotencyKey}, client=${client.apiKeyId}, hasHash=${requestHash
           .isDefined}")
-      result <- TracingMiddleware.traced("executeIdempotent")(store.check(
-        checkReq.idempotencyKey,
-        client.apiKeyId,
-        ttlSeconds,
-        requestHash,
-      ))
+      result <- TracingMiddleware.traced("executeIdempotent")(
+        metricsPublisher.timed(
+          "IdempotencyStoreLatency",
+          Map("operation" -> "idempotency_check"),
+        )(store.check(
+          checkReq.idempotencyKey,
+          client.apiKeyId,
+          ttlSeconds,
+          requestHash,
+        )),
+      )
 
       // Record metrics
       latency <- Clock[F].realTime.map(_.toMillis - startTime)
       _ <- metricsPublisher.recordLatency("idempotency_check", latency.toDouble)
+      _ <- countCheck(resultLabel(result))
 
       // Publish event (fire and forget)
       now <- Clock[F].realTime.map(d => Instant.ofEpochMilli(d.toMillis))
@@ -136,12 +142,22 @@ class IdempotencyApi[F[_]: Async: Tracer](
         ))
     case e: MessageFailure => Async[F].raiseError(e)
     case e => logger.error(e)(s"Idempotency $op failed") *>
+        (if op == "check" then countCheck("error") else Async[F].unit) *>
         ServiceUnavailable(io.circe.Json.obj(
           "error" -> io.circe.Json.fromString("storage_unavailable"),
           "message" -> io.circe.Json.fromString(
             s"Idempotency store failed during $op; retry the request",
           ),
         ))
+
+  private def countCheck(result: String): F[Unit] = metricsPublisher
+    .increment("IdempotencyCheck", Map("result" -> result))
+
+  private def resultLabel(result: IdempotencyResult): String = result match
+    case _: IdempotencyResult.New => "new"
+    case _: IdempotencyResult.InProgress => "in_progress"
+    case _: IdempotencyResult.Duplicate => "duplicate"
+    case _: IdempotencyResult.KeyConflict => "conflict"
 
   private def buildCheckResponse(result: IdempotencyResult): F[Response[F]] =
     result match

@@ -201,6 +201,37 @@ class IdempotencyApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
           .asserting(_.status shouldBe Status.ServiceUnavailable)
       }
 
+      "counts each check by result, including a store failure as error" in {
+        given Logger[IO] = org.typelevel.log4cats.noop.NoOpLogger[IO]
+        def countOf(prom: observability.PrometheusMetrics[IO], result: String) =
+          prom.registry.getSampleValue(
+            "gate_idempotency_total",
+            Array("result"),
+            Array(result),
+          ).doubleValue
+        def api(
+            store: IdempotencyStore[IO],
+            prom: observability.PrometheusMetrics[IO],
+        ) = IdempotencyApi[IO](
+          store,
+          IdempotencyConfig(defaultTtlSeconds = 3600, maxTtlSeconds = 86400),
+          EventPublisher.noop[IO],
+          observability.PrometheusMetrics.dual(MetricsPublisher.noop[IO], prom),
+          org.typelevel.log4cats.noop.NoOpLogger[IO],
+          () => IO.pure("test-request-id"),
+        )
+        val body = """{"idempotencyKey": "k-count"}"""
+        for
+          prom <- observability.PrometheusMetrics[IO]
+          healthy <- IdempotencyStore.inMemory[IO]
+          _ <- api(healthy, prom).check(checkRequest(body), testClient)
+          _ <- api(healthy, prom).check(checkRequest(body), testClient)
+          broken = failingStore(new RuntimeException("pool exhausted"))
+          _ <- api(broken, prom).check(checkRequest(body), testClient)
+        yield List("new", "in_progress", "error").map(countOf(prom, _)) shouldBe
+          List(1.0, 1.0, 1.0)
+      }
+
       "lets a malformed body propagate so http4s can answer 4xx" in {
         val api = apiWith(failingStore(new RuntimeException("unused")))
         api.check(checkRequest("not json"), testClient).attempt.asserting {

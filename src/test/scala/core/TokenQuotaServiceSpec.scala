@@ -55,6 +55,39 @@ class TokenQuotaServiceSpec
       ): IO[ReserveOutcome] = IO.pure(ReserveOutcome.Contended(attempts))
       def healthCheck: IO[Either[String, Unit]] = IO.pure(Right(()))
 
+  "TokenQuotaService admitted-token metrics" - {
+
+    def withProm(
+        f: TokenQuotaService[IO] => IO[Unit],
+    ): IO[observability.PrometheusMetrics[IO]] =
+      for
+        prom <- observability.PrometheusMetrics[IO]
+        store <- TokenQuotaStore.inMemory[IO]
+        metrics = observability.PrometheusMetrics
+          .dual(MetricsPublisher.noop[IO], prom)
+        _ <- f(TokenQuotaService[IO](store, defaultConfig, metrics, summon))
+      yield prom
+
+    def admitted(prom: observability.PrometheusMetrics[IO], level: String) =
+      prom.registry.getSampleValue(
+        "gate_quota_tokens_admitted_total",
+        Array("level"),
+        Array(level),
+      ).doubleValue
+
+    "an admitted check counts its estimate at every level it reserved" in
+      withProm(
+        _.checkQuota(QuotaIdentifier("u", Some("a"), Some("o")), 1000, 500).void,
+      ).asserting(prom =>
+        List("user", "agent", "org").map(admitted(prom, _)) shouldBe
+          List(1500.0, 1500.0, 1500.0),
+      )
+
+    "a refused check counts nothing" in
+      withProm(_.checkQuota(QuotaIdentifier("u"), 50_000, 0).void)
+        .asserting(prom => admitted(prom, "user") shouldBe 0.0)
+  }
+
   "TokenQuotaService.checkQuota" - {
 
     "allows a request under the limit and reports remaining tokens per level" in {

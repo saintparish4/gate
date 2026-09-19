@@ -300,7 +300,7 @@ start: ...` rather than running on defaults. The ones that matter most:
 | `DASHBOARD_ENABLED` | `false` | Compose sets `true`; Terraform pins `false` |
 | `AUTH_ENABLED` / `AUTH_RATE_LIMIT_PER_MINUTE` | `true` / `1000` | Compose and the demo raise the throttle to 10,000,000 for load runs |
 | `SECRETS_MANAGER_ENABLED` | `false` | Off means the built-in development keys |
-| `METRICS_ENABLED` / `METRICS_NAMESPACE` | `true` / `RateLimiter` | CloudWatch publishing is off whenever `USE_LOCALSTACK=true` |
+| `METRICS_ENABLED` / `METRICS_NAMESPACE` / `METRICS_ENVIRONMENT` | `true` / `RateLimiter` / `dev` | CloudWatch publishing is off whenever `USE_LOCALSTACK=true` |
 | `PROMETHEUS_ENABLED` | `true` | `/metrics` answers 404 to an admin key when off |
 | `TRACING_ENABLED` | `true` | The OpenTelemetry SDK reads `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_SERVICE_NAME` itself |
 | `STORAGE_BACKEND` | `dynamodb` | `in-memory` for single-process tests; not correct across instances |
@@ -353,30 +353,36 @@ make obs        # the stack plus Prometheus, Grafana and Jaeger
 The dashboard source is
 [`observability/grafana/dashboards/gate.json`](observability/grafana/dashboards/gate.json).
 
-**Prometheus metrics that are live today**
+**Prometheus metrics** (`GET /metrics` with an `AdminMetrics` key)
 
 | Metric | Type | Labels |
 |---|---|---|
-| `gate_requests_total` | counter | `result` (`allowed` / `rejected`); the `key` label is always `unknown` today |
+| `gate_requests_total` | counter | `tier`, `result` (`allowed` / `rejected`); rate-limit checks answered by the API |
 | `gate_rate_limit_check_seconds`, `gate_idempotency_check_seconds`, `gate_token_quota_check_seconds` | histogram | end-to-end latency per endpoint |
+| `gate_dynamodb_latency_seconds` | histogram | `operation` (`checkAndConsume`, `getStatus`, `idempotency_check`, `quota_reserve`); store-call latency, including conditional-write retries |
 | `gate_circuit_breaker_state` | gauge | `name`; 0 closed, 0.5 half-open, 1 open |
 | `gate_degraded_total` | counter | `reason` (`circuit_breaker`, `bulkhead`, `error`) |
+| `gate_idempotency_total` | counter | `result` (`new`, `in_progress`, `duplicate`, `conflict`, `error`) |
+| `gate_token_quota_total` | counter | `level`, `result` (`exceeded`, `contended`, `reconcile_failed`) |
+| `gate_quota_tokens_admitted_total` | counter | `level`; tokens reserved by admitted quota checks, i.e. the pre-request estimate |
+| `gate_events_published_total` | counter | `event_type`; counted once a Kinesis put succeeds |
 | `gate_events_dropped_total` | counter | Kinesis events dropped after the retry |
-| `gate_token_quota_total` | counter | `level`, `result` |
-| `gate_tokens_consumed` | gauge | set on successful reconcile |
-| `gate_idempotency_cache_hit_ratio` | gauge | |
 
-`gate_idempotency_total`, `gate_events_published_total`, and
-`gate_dynamodb_latency_seconds` are registered but not yet fed, so their
-panels stay empty.
+The bounded label combinations exist at zero from startup, so a quiet series
+reads 0 rather than "No data".
 
 **CloudWatch** (namespace `RateLimiter`, off under LocalStack): `RateLimitAllowed`,
 `RateLimitRejected`, `RateLimitOCCAttempts`, `RateLimitCheckLatency`,
 `RateLimitDegraded`, `CircuitBreakerState`, `DroppedKinesisEvent`,
 `CorruptStateRead`, `TokenQuotaExceeded`, `TokenQuotaContended`,
-`TokenQuotaOCCRetry`. Data points are buffered and flushed every 60 s, at
-1,000 buffered entries, and on shutdown; the buffer caps at 50,000 and drops
-the oldest.
+`TokenQuotaOCCRetry`, `QuotaTokensAdmitted`, `IdempotencyCheck`,
+`IdempotencyStoreLatency`, `TokenQuotaStoreLatency`, `KinesisEventPublished`.
+Every datum carries an `Environment` dimension from `METRICS_ENVIRONMENT`
+(Terraform sets it to the deployment's environment). Data points are buffered
+and flushed every `metrics.flush-interval` (60 s), at 1,000 buffered entries,
+and on shutdown; the buffer caps at 50,000 and drops the oldest. The Terraform
+CloudWatch dashboard and circuit-breaker alarm do not yet match the names and
+dimensions the app emits.
 
 **Tracing** uses otel4s over the OpenTelemetry Java SDK. Spans wrap every
 route and each rate-limit, idempotency, and quota operation; the trace ID is

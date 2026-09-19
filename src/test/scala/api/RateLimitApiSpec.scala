@@ -169,8 +169,14 @@ class RateLimitApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
       // Free-tier client: config.profiles("free") = capacity 20
       // An AdminTier client falls back to defaults (capacity 50).
       // Drain the free-tier bucket to 0, then verify next call is rejected.
+      // A near-zero refill: at 2/s, a loaded host took long enough over the 20
+      // checks to refill one and the 21st was allowed.
       val freeClient = testClient.copy(tier = ClientTier.Free)
-      makeApi().flatMap(api =>
+      val slowRefill = configWithProfiles.copy(profiles =
+        configWithProfiles.profiles
+          .updated("free", RateLimitProfileConfig(20, 0.001, 3600)),
+      )
+      makeApi(config = slowRefill).flatMap(api =>
         for
           _ <- (1 to 20).toList.traverse_(_ =>
             api.check(postCheckRequest("tier-key", 1), freeClient),
