@@ -51,49 +51,74 @@ class RateLimitApi[F[_]: Async: Tracer](
 
       // Validate cost before hitting the store; zero/negative cost is a client error
       response <-
-        if checkReq.cost <= 0 then
-          BadRequest(io.circe.Json.obj(
-            "error" -> io.circe.Json.fromString("validation_error"),
-            "message" -> io.circe.Json.fromString("cost must be positive"),
-          ))
+        if checkReq.cost <= 0 then validationError("cost must be positive")
         else
-          for
-            // Get profile for this client tier
-            profile <- Async[F].pure(getProfile(client.tier, checkReq.profile))
-
-            // Perform rate limit check
-            _ <- logger.debug(s"Rate limit check: key=${checkReq
-                .key}, cost=${checkReq.cost}, tier=${client.tier}")
-            decision <- TracingMiddleware.traced("checkAndConsume")(
-              store.checkAndConsume(checkReq.key, checkReq.cost, profile),
-            )
-
-            // Record metrics
-            latency <- Clock[F].realTime.map(_.toMillis - startTime)
-            _ <- metricsPublisher
-              .recordLatency("rate_limit_check", latency.toDouble)
-            _ <- decision match
-              case RateLimitDecision.Allowed(_, _) => metricsPublisher
-                  .recordRateLimitDecision(allowed = true, client.apiKeyId)
-              case RateLimitDecision.Rejected(_, _) => metricsPublisher
-                  .recordRateLimitDecision(allowed = false, client.apiKeyId)
-
-            // Publish event (fire and forget)
-            now <- Clock[F].realTime.map(d => Instant.ofEpochMilli(d.toMillis))
-            traceId <- currentTraceId
-            _ <- publishEvent(decision, checkReq, client, now, traceId).start
-
-            // Build response
-            resp <- buildCheckResponse(decision, profile)
-          yield resp
+          RateLimitApi
+            .selectProfile(config, client.tier, checkReq.profile) match
+            case Left(refusal) => refuseProfile(refusal, client)
+            case Right(profile) => consume(checkReq, profile, client, startTime)
     yield response
+
+  private def consume(
+      checkReq: RateLimitCheckRequest,
+      profile: RateLimitProfile,
+      client: AuthenticatedClient,
+      startTime: Long,
+  ): F[Response[F]] =
+    for
+      _ <- logger.debug(s"Rate limit check: key=${checkReq.key}, cost=${checkReq
+          .cost}, tier=${client.tier}")
+      decision <- TracingMiddleware.traced("checkAndConsume")(
+        store.checkAndConsume(checkReq.key, checkReq.cost, profile),
+      )
+
+      // Record metrics
+      latency <- Clock[F].realTime.map(_.toMillis - startTime)
+      _ <- metricsPublisher.recordLatency("rate_limit_check", latency.toDouble)
+      _ <- decision match
+        case RateLimitDecision.Allowed(_, _) => metricsPublisher
+            .recordRateLimitDecision(allowed = true, client.apiKeyId)
+        case RateLimitDecision.Rejected(_, _) => metricsPublisher
+            .recordRateLimitDecision(allowed = false, client.apiKeyId)
+
+      // Publish event (fire and forget)
+      now <- Clock[F].realTime.map(d => Instant.ofEpochMilli(d.toMillis))
+      traceId <- currentTraceId
+      _ <- publishEvent(decision, checkReq, client, now, traceId).start
+
+      resp <- buildCheckResponse(decision, profile)
+    yield resp
+
+  private def validationError(message: String): F[Response[F]] = BadRequest(
+    io.circe.Json.obj(
+      "error" -> io.circe.Json.fromString("validation_error"),
+      "message" -> io.circe.Json.fromString(message),
+    ),
+  )
+
+  private def refuseProfile(
+      refusal: ProfileRefusal,
+      client: AuthenticatedClient,
+  ): F[Response[F]] = refusal match
+    case ProfileRefusal.Unknown(name) =>
+      validationError(s"unknown profile '$name'")
+    case ProfileRefusal.AboveTier(name, tier) =>
+      val tierName = tier.toString.toLowerCase
+      logger.warn(s"AUDIT decision=profile_refused client=${client
+          .clientId} profile=$name tier=$tierName") *>
+        Forbidden(io.circe.Json.obj(
+          "error" -> io.circe.Json.fromString("profile_not_permitted"),
+          "message" ->
+            io.circe.Json
+              .fromString(s"profile '$name' exceeds the $tierName tier's limits"),
+        ))
 
   /** GET /v1/ratelimit/status/:key
     *
     * Get current rate limit status for a key.
     */
   def status(key: String, client: AuthenticatedClient): F[Response[F]] =
-    val profile = getProfile(client.tier, None)
+    val profile = RateLimitApi.tierProfile(config, client.tier)
     for
       maybeStatus <- store.getStatus(key, profile)
       nowMs <- Clock[F].realTime.map(_.toMillis)
@@ -123,22 +148,6 @@ class RateLimitApi[F[_]: Async: Tracer](
             ).asJson,
           )
     yield response
-
-  // Explicit profile name wins, then tier-named profile from config, then
-  // config defaults. No hardcoded values that can drift from application.conf
-  private def getProfile(
-      tier: ClientTier,
-      profileName: Option[String],
-  ): RateLimitProfile =
-    val fromExplicitName = profileName.flatMap(config.profiles.get)
-    val fromTierName = config.profiles.get(tier.toString.toLowerCase)
-    fromExplicitName.orElse(fromTierName)
-      .map(p => RateLimitProfile(p.capacity, p.refillRatePerSecond, p.ttlSeconds))
-      .getOrElse(RateLimitProfile(
-        config.defaultCapacity,
-        config.defaultRefillRatePerSecond,
-        config.defaultTtlSeconds,
-      ))
 
   private def buildCheckResponse(
       decision: RateLimitDecision,
@@ -269,7 +278,54 @@ case class RateLimitStatusResponse(
     resetAt: String,
 )
 
+/** Why a `profile` named on a check request was not used. */
+enum ProfileRefusal:
+  case Unknown(name: String)
+  case AboveTier(name: String, tier: ClientTier)
+
 object RateLimitApi:
+
+  /** The client's tier picks its profile; a `profile` named in the request may
+    * only narrow it, never widen it. It used to win outright, so a free key
+    * sending `"profile":"enterprise"` got 10,000 tokens at 1,000/s. An unknown
+    * name is refused rather than quietly falling back to the tier, so a typo
+    * surfaces instead of looking like a limit the caller never asked for.
+    */
+  def selectProfile(
+      config: RateLimitConfig,
+      tier: ClientTier,
+      requested: Option[String],
+  ): Either[ProfileRefusal, RateLimitProfile] =
+    val own = tierProfile(config, tier)
+    requested match
+      case None => Right(own)
+      case Some(name) => config.profiles.get(name) match
+          case None => Left(ProfileRefusal.Unknown(name))
+          case Some(p) =>
+            val asked =
+              RateLimitProfile(p.capacity, p.refillRatePerSecond, p.ttlSeconds)
+            if withinTier(asked, own) then Right(asked)
+            else Left(ProfileRefusal.AboveTier(name, tier))
+
+  // Tier-named profile from config, then config defaults. No hardcoded values
+  // that can drift from application.conf.
+  def tierProfile(config: RateLimitConfig, tier: ClientTier): RateLimitProfile =
+    config.profiles.get(tier.toString.toLowerCase)
+      .map(p => RateLimitProfile(p.capacity, p.refillRatePerSecond, p.ttlSeconds))
+      .getOrElse(RateLimitProfile(
+        config.defaultCapacity,
+        config.defaultRefillRatePerSecond,
+        config.defaultTtlSeconds,
+      ))
+
+  // Both dimensions: a larger burst at a slower refill still beats the tier
+  // over a short window, and a faster refill beats it over a long one.
+  private def withinTier(
+      asked: RateLimitProfile,
+      own: RateLimitProfile,
+  ): Boolean = asked.capacity <= own.capacity &&
+    asked.refillRatePerSecond <= own.refillRatePerSecond
+
   def apply[F[_]: Async: Tracer](
       store: RateLimitStore[F],
       eventPublisher: EventPublisher[F],

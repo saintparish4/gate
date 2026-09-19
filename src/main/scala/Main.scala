@@ -51,8 +51,11 @@ object Main extends IOApp:
         case false => Resource
             .pure[IO, EventPublisher[IO]](EventPublisher.noop[IO])
 
-      eventPublisher =
-        BroadcastingEventPublisher(underlyingEvents, obs.dashboardQueue)
+      // The dashboard queue only exists to feed the dashboard; with it off,
+      // nothing drains it.
+      dashboardQueue = Option.when(config.dashboard.enabled)(obs.dashboardQueue)
+      eventPublisher = dashboardQueue
+        .fold(underlyingEvents)(BroadcastingEventPublisher(underlyingEvents, _))
 
       stores <- StoreModule
         .resource[IO](config, obs.metricsPublisher, eventPublisher)
@@ -123,7 +126,7 @@ object Main extends IOApp:
         config.rateLimit,
         config.idempotency,
         summon[Logger[IO]],
-        Some(obs.dashboardQueue),
+        dashboardQueue,
         tokenQuotaApi,
         obs.promMetrics,
         healthCheck,

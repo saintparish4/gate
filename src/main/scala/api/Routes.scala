@@ -33,6 +33,7 @@ import config.{IdempotencyConfig, RateLimitConfig, TokenQuotaConfig}
   *   - Idempotency checks
   *   - Health and readiness probes
   *   - Metrics (admin only)
+  *   - The demo dashboard, only when `dashboardEventQueue` is given
   */
 class Routes[F[_]: Async: Tracer](
     rateLimitStore: RateLimitStore[F],
@@ -43,7 +44,7 @@ class Routes[F[_]: Async: Tracer](
     rateLimitConfig: RateLimitConfig,
     idempotencyConfig: IdempotencyConfig,
     logger: Logger[F],
-    dashboardApi: DashboardApi[F],
+    dashboardApi: Option[DashboardApi[F]],
     tokenQuotaApi: Option[TokenQuotaApi[F]],
     prometheusMetrics: Option[PrometheusMetrics[F]],
     healthCheck: F[AggregateHealth],
@@ -73,26 +74,6 @@ class Routes[F[_]: Async: Tracer](
     // Liveness probe - always returns 200 if service is running
     case GET -> Root / "health" =>
       Ok(HealthResponse("healthy", BuildInfo.version).asJson)
-
-    // Prometheus metrics scrape endpoint.
-    //
-    // We build the response by writing raw UTF-8 bytes to the body stream
-    // instead of `withEntity(body)` / `Ok(body)`. The wildcard
-    // `org.http4s.circe.CirceEntityEncoder.*` import in this file otherwise
-    // resolves an `EntityEncoder[F, String]` that JSON-encodes the payload
-    // (wrapping it in quotes and escaping newlines), which Prometheus
-    // rejects with: expected a valid start token, got "\"".
-    case GET -> Root / "metrics" => prometheusMetrics match
-        case Some(prom) => prom.scrape.map { body =>
-            val bytes = body.getBytes(StandardCharsets.UTF_8)
-            Response[F](status = Status.Ok)
-              .withBodyStream(Stream.emits(bytes).covary[F]).withContentType(
-                `Content-Type`(org.http4s.MediaType.text.plain, Charset.`UTF-8`),
-              ).putHeaders(org.http4s.headers.`Content-Length`.unsafeFromLong(
-                bytes.length.toLong,
-              ))
-          }
-        case None => NotFound()
 
     // Readiness probe - aggregated dependency health
     case GET -> Root / "ready" => healthCheck.flatMap { health =>
@@ -131,11 +112,35 @@ class Routes[F[_]: Async: Tracer](
         tokenQuotaApi match
           case Some(api) => api.reconcile(req.req, client)
           case None => Response[F](status = Status.NotFound).pure[F]
+
+      // Prometheus scrape. It sat on the public routes while AdminMetrics went
+      // unchecked, so anyone who could reach the listener could read it.
+      case GET -> Root / "metrics" as client => ApiKeyAuth
+          .requirePermission(client, Permission.AdminMetrics)(scrapeMetrics)
     }
 
-  // Combined routes — public (health, metrics, ready) first so scrapers never hit auth
+  // We build the response by writing raw UTF-8 bytes to the body stream
+  // instead of `withEntity(body)` / `Ok(body)`. The wildcard
+  // `org.http4s.circe.CirceEntityEncoder.*` import in this file otherwise
+  // resolves an `EntityEncoder[F, String]` that JSON-encodes the payload
+  // (wrapping it in quotes and escaping newlines), which Prometheus
+  // rejects with: expected a valid start token, got "\"".
+  private def scrapeMetrics: F[Response[F]] = prometheusMetrics match
+    case Some(prom) => prom.scrape.map { body =>
+        val bytes = body.getBytes(StandardCharsets.UTF_8)
+        Response[F](status = Status.Ok)
+          .withBodyStream(Stream.emits(bytes).covary[F]).withContentType(
+            `Content-Type`(org.http4s.MediaType.text.plain, Charset.`UTF-8`),
+          ).putHeaders(org.http4s.headers.`Content-Length`.unsafeFromLong(
+            bytes.length.toLong,
+          ))
+      }
+    case None => NotFound()
+
+  // Combined routes — public probes first so health checks never hit auth
   val routes: HttpRoutes[F] = TracingMiddleware[F](
-    publicRoutes <+> dashboardApi.routes <+> authMiddleware(authedRoutes),
+    publicRoutes <+> dashboardApi.fold(HttpRoutes.empty[F])(_.routes) <+>
+      authMiddleware(authedRoutes),
   )
 
   def httpApp: HttpApp[F] = org.http4s.server.middleware.ErrorHandling
@@ -169,12 +174,14 @@ object Routes:
       getRequestId: () => F[String],
   ): F[Routes[F]] =
     for
-      dashboardApi <- DashboardApi.apply[F](
-        rateLimitStore,
-        rateLimitConfig,
-        logger,
-        dashboardEventQueue,
-        eventPublisher,
+      dashboardApi <- dashboardEventQueue.traverse(queue =>
+        DashboardApi.apply[F](
+          rateLimitStore,
+          rateLimitConfig,
+          logger,
+          Some(queue),
+          eventPublisher,
+        ),
       )
       routes = new Routes[F](
         rateLimitStore,

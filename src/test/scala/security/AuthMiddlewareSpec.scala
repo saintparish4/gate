@@ -151,6 +151,33 @@ class AuthMiddlewareSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
     }.asserting(_ => succeed)
   }
 
+  "ApiKeyAuth.requirePermission" - {
+
+    val admin = ApiKeyStore.testKeys("admin-api-key")
+    val standard = ApiKeyStore.testKeys("test-api-key")
+
+    def guarded(client: AuthenticatedClient): IO[Response[IO]] = ApiKeyAuth
+      .requirePermission(client, Permission.AdminMetrics)(Ok("scraped"))
+
+    "runs the route for a client holding the permission" in guarded(admin)
+      .flatMap(r => r.as[String].map(body => (r.status, body)))
+      .asserting(_ shouldBe (Status.Ok, "scraped"))
+
+    "answers 403 naming the permission for a client without it" in
+      guarded(standard).flatMap(r => r.as[String].map(body => (r.status, body)))
+        .asserting { case (status, body) =>
+          status shouldBe Status.Forbidden
+          body should include("AdminMetrics")
+        }
+
+    "never evaluates the route when refusing" in {
+      var ran = false
+      ApiKeyAuth.requirePermission(standard, Permission.AdminMetrics)(IO {
+        ran = true
+      } *> Ok()).asserting(_ => ran shouldBe false)
+    }
+  }
+
   "ApiKeyAuth middleware — auth-layer throttle" - {
     // The throttle is the one failure that is not an auth failure: a valid key
     // sending too fast. It must read as 429 with Retry-After, and it must not

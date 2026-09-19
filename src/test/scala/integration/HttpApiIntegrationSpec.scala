@@ -13,12 +13,14 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
 import org.typelevel.otel4s.trace.Tracer.Implicits.noop
 
 import api.{
-  DashboardApi, RateLimitCheckResponse, RateLimitStatusResponse, Routes,
-  TokenQuotaApi, TokenQuotaCheckRequest, TokenQuotaReconcileRequest,
+  RateLimitCheckResponse, RateLimitStatusResponse, Routes, TokenQuotaApi,
+  TokenQuotaCheckRequest, TokenQuotaReconcileRequest,
 }
-import config.{IdempotencyConfig, RateLimitConfig, TokenQuotaConfig}
-import events.EventPublisher
-import observability.MetricsPublisher
+import config.{
+  IdempotencyConfig, RateLimitConfig, RateLimitProfileConfig, TokenQuotaConfig,
+}
+import events.{EventPublisher, RateLimitEvent}
+import observability.{MetricsPublisher, PrometheusMetrics}
 import resilience.AggregateHealth
 import security.{
   ApiKeyAuth, ApiKeyStore, AuthenticatedClient, ClientTier, Permission,
@@ -27,6 +29,7 @@ import storage.{
   DynamoDBIdempotencyStore, DynamoDBRateLimitStore, DynamoDBTokenQuotaStore,
 }
 import cats.effect.IO
+import cats.effect.std.Queue
 import cats.effect.testing.scalatest.AsyncIOSpec
 import cats.effect.unsafe.implicits.global
 import cats.syntax.all.*
@@ -50,11 +53,16 @@ class HttpApiIntegrationSpec
 
   implicit val logger: Logger[IO] = Slf4jLogger.getLogger[IO]
 
-  // Test configuration
+  // Test configuration. `free` matches the defaults the older tests were
+  // written against; `enterprise` is the profile a free key must not reach.
   lazy val testRateLimitConfig: RateLimitConfig = RateLimitConfig(
     defaultCapacity = 10,
     defaultRefillRatePerSecond = 0.1,
     defaultTtlSeconds = 3600,
+    profiles = Map(
+      "free" -> RateLimitProfileConfig(10, 0.1, 3600),
+      "enterprise" -> RateLimitProfileConfig(10000, 1000.0, 3600),
+    ),
   )
 
   // Create stores
@@ -78,22 +86,29 @@ class HttpApiIntegrationSpec
   lazy val metricsPublisher: MetricsPublisher[IO] = MetricsPublisher.noop[IO]
 
   // Test API key store
-  lazy val testApiKeyStore: ApiKeyStore[IO] = ApiKeyStore.inMemory[IO](Map(
-    "test-key" -> AuthenticatedClient(
-      apiKeyId = "test-client-1",
-      clientId = "test-client-1",
-      clientName = "Test Client",
-      tier = ClientTier.Free, // Use Free tier (capacity 10) to match test expectations
-      permissions = Permission.standard,
-    ),
-  ))
+  lazy val testApiKeyStore: ApiKeyStore[IO] = ApiKeyStore.inMemory[IO] {
+    Map(
+      "test-key" -> AuthenticatedClient(
+        apiKeyId = "test-client-1",
+        clientId = "test-client-1",
+        clientName = "Test Client",
+        tier = ClientTier.Free, // Use Free tier (capacity 10) to match test expectations
+        permissions = Permission.standard,
+      ),
+      "admin-key" -> AuthenticatedClient(
+        apiKeyId = "admin-client-1",
+        clientId = "admin-client-1",
+        clientName = "Admin Client",
+        tier = ClientTier.Enterprise,
+        permissions = Permission.admin,
+      ),
+    )
+  }
 
   // Auth middleware
   lazy val authMiddleware = ApiKeyAuth.middleware[IO](testApiKeyStore, None)
 
-  // Dashboard API (no SSE queue for integration tests)
-  lazy val dashboardApi: DashboardApi[IO] = DashboardApi
-    .apply[IO](rateLimitStore, testRateLimitConfig, logger, None, eventPublisher)
+  lazy val prometheusMetrics: PrometheusMetrics[IO] = PrometheusMetrics[IO]
     .unsafeRunSync()
 
   val tokenQuotaTableName = "test-token-quotas"
@@ -145,9 +160,9 @@ class HttpApiIntegrationSpec
     testRateLimitConfig,
     testIdempotencyConfig,
     logger,
-    dashboardApi,
+    dashboardApi = None,
     tokenQuotaApi = Some(tokenQuotaApi),
-    prometheusMetrics = None,
+    prometheusMetrics = Some(prometheusMetrics),
     healthCheck = IO.pure(AggregateHealth("ok", Nil)),
     getRequestId = () => IO.pure("test-request-id"),
   )
@@ -496,5 +511,100 @@ class HttpApiIntegrationSpec
     "a body missing a required field is a 422, not a 500" in
       httpApp.run(post(uri"/v1/ratelimit/check", """{"cost": 1}"""))
         .asserting(_.status shouldBe Status.UnprocessableEntity)
+  }
+
+  "Authorization" - {
+
+    def withKey(request: Request[IO], key: String): Request[IO] = request
+      .putHeaders(headers.Authorization(Credentials.Token(ci"Bearer", key)))
+
+    def checkNaming(profile: String, key: String): Request[IO] = withKey(
+      Request[IO](Method.POST, uri"/v1/ratelimit/check").withEntity(
+        s"""{"key": "profile-bypass", "cost": 1, "profile": "$profile"}""",
+      ).putHeaders(headers.`Content-Type`(MediaType.application.json)),
+      key,
+    )
+
+    def metrics(key: Option[String]): IO[Response[IO]] =
+      val request = Request[IO](Method.GET, uri"/metrics")
+      httpApp.run(key.fold(request)(withKey(request, _)))
+
+    // Routes.apply is the wiring Main uses: the dashboard exists only when it
+    // is handed the decision queue.
+    def appWithDashboardQueue(
+        queue: Option[Queue[IO, RateLimitEvent]],
+    ): IO[HttpApp[IO]] = Routes[IO](
+      rateLimitStore,
+      idempotencyStore,
+      eventPublisher,
+      metricsPublisher,
+      authMiddleware,
+      testRateLimitConfig,
+      testIdempotencyConfig,
+      logger,
+      dashboardEventQueue = queue,
+      healthCheck = IO.pure(AggregateHealth("ok", Nil)),
+      getRequestId = () => IO.pure("test-request-id"),
+    ).map(_.httpApp)
+
+    "a free key naming the enterprise profile is 403 and consumes nothing" in {
+      val status = withKey(
+        Request[IO](Method.GET, uri"/v1/ratelimit/status/profile-bypass"),
+        "test-key",
+      )
+      for {
+        refused <- httpApp.run(checkNaming("enterprise", "test-key"))
+        body <- refused.as[String]
+        after <- httpApp.run(status).flatMap(_.as[String])
+        json <- IO.fromEither(parse(after))
+      } yield {
+        refused.status shouldBe Status.Forbidden
+        body should include("profile_not_permitted")
+        json.hcursor.get[Int]("tokensRemaining").toOption shouldBe Some(10)
+      }
+    }
+
+    "an enterprise key may name the enterprise profile" in
+      httpApp.run(checkNaming("enterprise", "admin-key"))
+        .asserting(_.status shouldBe Status.Ok)
+
+    "an unknown profile is 400" in httpApp.run(checkNaming("gold", "test-key"))
+      .asserting(_.status shouldBe Status.BadRequest)
+
+    "GET /metrics without a key is 401" in metrics(None)
+      .asserting(_.status shouldBe Status.Unauthorized)
+
+    "GET /metrics with a key lacking AdminMetrics is 403" in
+      metrics(Some("test-key")).asserting(_.status shouldBe Status.Forbidden)
+
+    "GET /metrics with an admin key is the Prometheus exposition" in
+      metrics(Some("admin-key")).flatMap(r => r.as[String].map((r.status, _)))
+        .asserting { case (status, body) =>
+          status shouldBe Status.Ok
+          body should include("gate_requests_total")
+        }
+
+    "without the dashboard queue, dashboard routes are not served" in {
+      val config = Request[IO](Method.POST, uri"/dashboard/api/config")
+        .withEntity(
+          """{"capacity": 1, "refillRatePerSecond": 1, "ttlSeconds": 1}""",
+        )
+      for {
+        app <- appWithDashboardQueue(None)
+        anonymous <- app.run(config)
+        authed <- app.run(withKey(config, "test-key"))
+      } yield {
+        anonymous.status shouldBe Status.Unauthorized
+        authed.status shouldBe Status.NotFound
+      }
+    }
+
+    "with the dashboard queue, dashboard routes are served" in {
+      for {
+        queue <- Queue.bounded[IO, RateLimitEvent](8)
+        app <- appWithDashboardQueue(Some(queue))
+        response <- app.run(Request[IO](Method.GET, uri"/dashboard/api/config"))
+      } yield response.status shouldBe Status.Ok
+    }
   }
 }

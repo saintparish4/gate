@@ -143,7 +143,8 @@ is unreachable. The ALB target group and the deploy script wait on `/ready`.
 
 Three API keys are built in for development: `test-api-key` (premium tier,
 1,000 tokens), `free-api-key` (free tier, 20 tokens), and `admin-api-key`
-(enterprise tier). They are active whenever Secrets Manager is off.
+(enterprise tier, the only one allowed to read `/metrics`). They are active
+whenever Secrets Manager is off.
 
 ```bash
 curl -s -X POST http://localhost:8080/v1/ratelimit/check \
@@ -238,7 +239,7 @@ corrects the counters.
 **6. Metrics**
 
 ```bash
-curl -s http://localhost:8080/metrics | grep '^gate_'
+curl -s -H "Authorization: Bearer admin-api-key" http://localhost:8080/metrics | grep '^gate_'
 ```
 
 ## API
@@ -253,9 +254,9 @@ curl -s http://localhost:8080/metrics | grep '^gate_'
 | `POST` | `/v1/quota/reconcile` | yes | Post-response reconciliation of estimated versus actual tokens |
 | `GET` | `/health` | no | Liveness |
 | `GET` | `/ready` | no | Readiness: DynamoDB tables and Kinesis stream |
-| `GET` | `/metrics` | no | Prometheus text exposition |
-| `GET` | `/v1/ratelimit/dashboard/stats` | no | Server-sent events stream of rate-limit decisions |
-| `GET` | `/dashboard` | no | Demo dashboard page, backed by `/dashboard/api/*` |
+| `GET` | `/metrics` | admin | Prometheus text exposition; 403 for a key without the `AdminMetrics` permission |
+| `GET` | `/v1/ratelimit/dashboard/stats` | no | Server-sent events stream of rate-limit decisions; only with `DASHBOARD_ENABLED=true` |
+| `GET` | `/dashboard` | no | Demo dashboard page, backed by `/dashboard/api/*`; only with `DASHBOARD_ENABLED=true` |
 
 Authentication accepts `Authorization: Bearer <key>`, `Authorization: ApiKey
 <key>`, or an `X-Api-Key` header. A missing or unknown key answers 401 with an
@@ -264,9 +265,11 @@ authentications (default 1,000); past that the answer is **429** with
 `Retry-After`, distinct from a bucket rejection. Malformed JSON answers 400 and
 JSON that does not match the schema answers 422.
 
-The dashboard routes are unauthenticated and `POST /dashboard/api/config`
-rewrites the demo bucket's profile live. They exist for demos; do not expose
-them on a public listener.
+The dashboard routes are unauthenticated: `POST /dashboard/api/config`
+rewrites the demo bucket's profile live, and the decision stream carries every
+client's key ID. They are off unless `DASHBOARD_ENABLED=true`, which only
+docker-compose sets; Terraform pins it to `false`. With the flag off the routes
+are not served at all.
 
 Full request and response schemas: [API.md](docs/API.md).
 
@@ -291,17 +294,20 @@ each setting has an environment-variable override. The ones that matter most:
 | `BULKHEAD_MAX_CONCURRENT` | `100` | |
 | `TIMEOUT_RATE_LIMIT_CHECK` / `TIMEOUT_IDEMPOTENCY_CHECK` | `2s` / `2s` | Compose raises both to 10 s for LocalStack |
 | `DEGRADATION_MODE` | `reject-all` | Or `allow-all`. `use-cached` is accepted but has no cache wired in and behaves as `allow-all` |
+| `DASHBOARD_ENABLED` | `false` | Compose sets `true`; Terraform pins `false` |
 | `AUTH_ENABLED` / `AUTH_RATE_LIMIT_PER_MINUTE` | `true` / `1000` | Compose and the demo raise the throttle to 10,000,000 for load runs |
 | `SECRETS_MANAGER_ENABLED` | `false` | Off means the built-in development keys |
 | `METRICS_ENABLED` / `METRICS_NAMESPACE` | `true` / `RateLimiter` | CloudWatch publishing is off whenever `USE_LOCALSTACK=true` |
-| `PROMETHEUS_ENABLED` | `true` | `/metrics` answers 404 when off |
+| `PROMETHEUS_ENABLED` | `true` | `/metrics` answers 404 to an admin key when off |
 | `TRACING_ENABLED` | `true` | The OpenTelemetry SDK reads `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_SERVICE_NAME` itself |
 | `STORAGE_BACKEND` | `dynamodb` | `in-memory` for single-process tests; not correct across instances |
 
 ### Rate-limit profiles
 
-A client's tier selects its profile; a `profile` field on the check request
-overrides it. Invalid profiles fail startup.
+A client's tier selects its profile. A `profile` field on the check request
+can only narrow it: naming a profile with a higher capacity or refill than the
+tier's own answers **403** `profile_not_permitted` and consumes nothing, and an
+unknown name answers 400. Invalid profiles fail startup.
 
 | Profile | Capacity (burst) | Refill | TTL |
 |---|---|---|---|
@@ -338,7 +344,7 @@ make obs        # the stack plus Prometheus, Grafana and Jaeger
 | Tool | URL | Notes |
 |---|---|---|
 | Grafana | <http://localhost:3000> | `admin` / `admin`, anonymous viewer enabled; dashboard "Gate — Rate Limiting & Quotas" |
-| Prometheus | <http://localhost:9090> | Scrapes the app every 5 s |
+| Prometheus | <http://localhost:9090> | Scrapes the app every 5 s with the development `admin-api-key` |
 | Jaeger | <http://localhost:16686> | Service `gate`; compose points the OTLP exporter at it |
 
 The dashboard source is
@@ -404,7 +410,10 @@ Each invariant prints `PASS` or `FAIL` with a detail prefix (`OVER-ISSUE`,
 `UNDER-ISSUE`, `DEGRADED`, `VACUOUS`, `VIOLATION`, `OVER-ADMISSION`), then
 `Overall: PASS` or `Overall: FAIL` and a matching exit code. `make correctness`
 runs it locally; `make APP_URL=http://<host> correctness` runs it against any
-deployment. Source: [`LoadSim.scala`](loadSim/src/main/scala/LoadSim.scala).
+deployment. A counts degraded decisions from `gate_degraded_total`, so it reads
+`/metrics` with `ADMIN_API_KEY` (default `admin-api-key`); if `/metrics` cannot
+be read, A fails with `METRICS UNREADABLE` rather than assuming zero. Source:
+[`LoadSim.scala`](loadSim/src/main/scala/LoadSim.scala).
 
 ### On AWS
 

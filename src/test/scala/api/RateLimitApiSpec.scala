@@ -39,6 +39,7 @@ class RateLimitApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
     algorithm = "token-bucket",
     profiles = Map(
       "free" -> RateLimitProfileConfig(20, 2.0, 3600),
+      "tiny" -> RateLimitProfileConfig(5, 0.5, 3600),
       "custom" -> RateLimitProfileConfig(500, 50.0, 7200),
     ),
   )
@@ -68,6 +69,62 @@ class RateLimitApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
       RateLimitCheckRequest(key = key, cost = cost, profile = profile).asJson,
     )
 
+  "RateLimitApi.selectProfile" - {
+
+    // The ladder from application.conf, plus two profiles that each beat
+    // `basic` on one dimension only.
+    val ladder = RateLimitConfig(
+      defaultCapacity = 100,
+      defaultRefillRatePerSecond = 10.0,
+      defaultTtlSeconds = 3600,
+      profiles = Map(
+        "free" -> RateLimitProfileConfig(20, 2.0, 3600),
+        "basic" -> RateLimitProfileConfig(100, 10.0, 3600),
+        "premium" -> RateLimitProfileConfig(1000, 100.0, 3600),
+        "enterprise" -> RateLimitProfileConfig(10000, 1000.0, 3600),
+        "burst" -> RateLimitProfileConfig(200, 1.0, 3600),
+        "fast" -> RateLimitProfileConfig(10, 50.0, 3600),
+      ),
+    )
+    val tiers = List(
+      ClientTier.Free,
+      ClientTier.Basic,
+      ClientTier.Premium,
+      ClientTier.Enterprise,
+    )
+    def capacityOf(name: String): Int = ladder.profiles(name).capacity
+
+    "every tier may name its own profile or one below it, never one above" in IO {
+      for
+        (tier, tierRank) <- tiers.zipWithIndex
+        (asked, askedRank) <- tiers.zipWithIndex
+      do
+        val name = asked.toString.toLowerCase
+        val result = RateLimitApi.selectProfile(ladder, tier, Some(name))
+        if askedRank <= tierRank then
+          result.map(_.capacity) shouldBe Right(capacityOf(name))
+        else result shouldBe Left(ProfileRefusal.AboveTier(name, tier))
+    }.asserting(_ => succeed)
+
+    "no named profile means the tier's own" in IO(tiers.foreach(tier =>
+      RateLimitApi.selectProfile(ladder, tier, None).map(_.capacity) shouldBe
+        Right(capacityOf(tier.toString.toLowerCase)),
+    )).asserting(_ => succeed)
+
+    "beating the tier on either dimension alone is above it" in IO {
+      RateLimitApi
+        .selectProfile(ladder, ClientTier.Basic, Some("burst")) shouldBe
+        Left(ProfileRefusal.AboveTier("burst", ClientTier.Basic))
+      RateLimitApi
+        .selectProfile(ladder, ClientTier.Basic, Some("fast")) shouldBe
+        Left(ProfileRefusal.AboveTier("fast", ClientTier.Basic))
+    }.asserting(_ => succeed)
+
+    "an unknown name is refused as unknown" in
+      IO(RateLimitApi.selectProfile(ladder, ClientTier.Enterprise, Some("gold")))
+        .asserting(_ shouldBe Left(ProfileRefusal.Unknown("gold")))
+  }
+
   "RateLimitApi" - {
 
     "rejects cost=0 with 400 BadRequest" in makeApi()
@@ -78,21 +135,35 @@ class RateLimitApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
       .flatMap(api => api.check(postCheckRequest("k1", -5), testClient))
       .asserting((r: Response[IO]) => r.status.shouldBe(Status.BadRequest))
 
-    "resolves profile by explicit name in request body" in
-      // "custom" profile has capacity=500; default is 50.
-      // A cost of 100 should succeed with the custom profile but fail with default.
+    "a named profile narrower than the tier is used" in makeApi().flatMap(api =>
+      api.check(
+        postCheckRequest("k2-tiny", 1, profile = Some("tiny")),
+        testClient,
+      ).flatMap(r => r.as[RateLimitCheckResponse].map(b => (r.status, b.limit))),
+    ).asserting(_ shouldBe (Status.Ok, 5))
+
+    "a named profile above the tier is 403 and consumes nothing" in {
+      // The bypass: a free key naming a bigger profile used to get it.
+      val freeClient = testClient.copy(tier = ClientTier.Free)
       makeApi().flatMap(api =>
         for
-          // drain default-profile bucket (capacity=50)
-          _ <- (1 to 50).toList
-            .traverse_(_ => api.check(postCheckRequest("k2", 1), testClient))
-          // explicit custom profile — separate logical bucket, 500 capacity
           r <- api.check(
-            postCheckRequest("k2-custom", 100, profile = Some("custom")),
-            testClient,
+            postCheckRequest("k2-custom", 1, profile = Some("custom")),
+            freeClient,
           )
-        yield r,
-      ).asserting((r: Response[IO]) => r.status.shouldBe(Status.Ok))
+          body <- r.as[io.circe.Json]
+          status <- api.status("k2-custom", freeClient)
+          remaining <- status.as[RateLimitStatusResponse].map(_.tokensRemaining)
+        yield (r.status, body.hcursor.get[String]("error").toOption, remaining),
+      ).asserting(
+        _ shouldBe (Status.Forbidden, Some("profile_not_permitted"), 20),
+      )
+    }
+
+    "an unknown profile name is 400, not a silent fallback to the tier" in
+      makeApi().flatMap(api =>
+        api.check(postCheckRequest("k2", 1, profile = Some("nope")), testClient),
+      ).asserting((r: Response[IO]) => r.status.shouldBe(Status.BadRequest))
 
     "resolves profile by tier name from config when no explicit profile given" in {
       // Free-tier client: config.profiles("free") = capacity 20
