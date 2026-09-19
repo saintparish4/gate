@@ -29,7 +29,9 @@ object Main extends IOApp:
       given Logger[IO] <- Resource.eval(Slf4jLogger.create[IO])
       _ <- Resource.eval(summon[Logger[IO]].info("Starting Gate..."))
 
-      config <- Resource.eval(AppConfig.loadOrDefault[IO])
+      config <- Resource.eval(AppConfig.load[IO].onError(e =>
+        summon[Logger[IO]].error(s"Refusing to start: ${e.getMessage}"),
+      ))
       _ <- Resource
         .eval(summon[Logger[IO]].info(s"Configuration loaded: ${config.server
             .host}:${config.server.port}"))

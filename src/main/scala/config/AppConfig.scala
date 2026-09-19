@@ -199,8 +199,6 @@ case class ResilienceConfig(
   import resilience.GracefulDegradation.DegradationMode
   def parsedDegradationMode: DegradationMode = degradationMode match
     case "allow-all" => DegradationMode.AllowAll
-    case "reject-all" => DegradationMode.RejectAll
-    case "use-cached" => DegradationMode.UseCached
     case _ => DegradationMode.RejectAll
 
 case class StorageConfig(
@@ -219,10 +217,11 @@ case class CacheConfig(
   * NOTE: PureConfig's Scala 3 derivation uses a fixed camelCase→kebab-case
   * field mapping and converts `s3Prefix` into `s-3-prefix` (digits start a new
   * "word"), which doesn't match the `s3-prefix` key in application.conf.
-  * Without the explicit reader below, `ConfigSource.default.loadOrThrow` fails
-  * and the service silently falls back to `loadOrDefault`, discarding every
-  * `${?ENV}` override in the HOCON file — a very expensive silent failure (it
-  * made `AUTH_RATE_LIMIT_PER_MINUTE` look broken during load tests).
+  * Without the explicit reader below, `ConfigSource.default.loadOrThrow` fails.
+  * That failure used to fall back silently to a hard-coded config, discarding
+  * every `${?ENV}` override in the HOCON file — a very expensive silent failure
+  * (it made `AUTH_RATE_LIMIT_PER_MINUTE` look broken during load tests). It now
+  * stops startup.
   */
 case class AuditConfig(
     enabled: Boolean = true,
@@ -274,82 +273,62 @@ case class AppConfig(
 
 object AppConfig:
 
-  val validDegradationModes: Set[String] =
-    Set("allow-all", "reject-all", "use-cached")
+  val validDegradationModes: Set[String] = Set("allow-all", "reject-all")
 
   /** An unrecognised degradation-mode used to fall through to reject-all in
     * ResilienceConfig.parsedDegradationMode, so a typo in DEGRADATION_MODE
     * silently armed a full outage for the first time the circuit breaker
     * opened. Rejected at startup instead.
     *
+    * `use-cached` gets its own message because it used to be accepted. No cache
+    * was ever wired in, so it served every degraded decision as allow-all: an
+    * option that read as enforcement and failed open.
+    *
     * @return
     *   Some(message) when the value is not usable.
     */
   def validateDegradationMode(mode: String): Option[String] =
     if validDegradationModes.contains(mode) then None
+    else if mode == "use-cached" then
+      Some("resilience.degradation-mode 'use-cached' is no longer accepted: no cache is wired in, so it failed open. Choose allow-all to fail open deliberately, or reject-all")
     else
       Some(
         s"resilience.degradation-mode '$mode' is not one of ${validDegradationModes
             .toList.sorted.mkString(", ")}",
       )
 
-  def load[F[_]: Sync]: F[AppConfig] = Sync[F]
-    .delay(ConfigSource.default.loadOrThrow[AppConfig]).flatMap { config =>
-      val profileErrors = config.rateLimit.profiles.toList
-        .flatMap { case (name, p) => p.validate(name).left.toOption }
-      val agentCap = (config.tokenQuota.userLimit * 0.8).toLong
-      val quotaErrors =
-        if config.tokenQuota.enabled && config.tokenQuota.agentLimit > agentCap
-        then
-          List(s"agentLimit (${config.tokenQuota
-              .agentLimit}) exceeds 80% of userLimit ($agentCap)")
-        else Nil
-      val degradationErrors =
-        validateDegradationMode(config.resilience.degradationMode).toList
-      val allErrors = profileErrors ++ quotaErrors ++ degradationErrors
-      if allErrors.nonEmpty then
+  /** Every rule `load` enforces beyond what the types already do. */
+  def validate(config: AppConfig): List[String] =
+    val profileErrors = config.rateLimit.profiles.toList
+      .flatMap { case (name, p) => p.validate(name).left.toOption }
+    val agentCap = (config.tokenQuota.userLimit * 0.8).toLong
+    val quotaErrors =
+      if config.tokenQuota.enabled && config.tokenQuota.agentLimit > agentCap
+      then
+        List(s"agentLimit (${config.tokenQuota
+            .agentLimit}) exceeds 80% of userLimit ($agentCap)")
+      else Nil
+    val degradationErrors =
+      validateDegradationMode(config.resilience.degradationMode).toList
+    profileErrors ++ quotaErrors ++ degradationErrors
+
+  /** Load and validate, failing on any error.
+    *
+    * There used to be a `loadOrDefault` that caught every failure here,
+    * validation included, and started on a hard-coded fallback: no tier
+    * profiles, token quota off, Kinesis off. So an unknown degradation mode or
+    * an invalid profile, both documented as failing startup, instead started a
+    * service that enforced defaults nobody configured. A config Gate cannot
+    * honour now stops it.
+    */
+  def load[F[_]: Sync]: F[AppConfig] = loadFrom(ConfigSource.default)
+
+  def loadFrom[F[_]: Sync](source: ConfigSource): F[AppConfig] = Sync[F]
+    .delay(source.loadOrThrow[AppConfig]).flatMap { config =>
+      val errors = validate(config)
+      if errors.nonEmpty then
         Sync[F]
-          .raiseError(new IllegalArgumentException(s"Invalid config: ${allErrors
+          .raiseError(new IllegalArgumentException(s"Invalid config: ${errors
               .mkString("; ")}"))
       else Sync[F].pure(config)
     }
-
-  def loadOrDefault[F[_]: Sync]: F[AppConfig] = load[F].handleErrorWith { err =>
-    Sync[F].delay {
-      System.err
-        .println(s"[WARN] AppConfig.load failed, using env-var fallback: ${err
-            .getMessage}")
-      val useLocalstack = Option(System.getenv("USE_LOCALSTACK"))
-        .exists(v => v.equalsIgnoreCase("true") || v == "1")
-      val dynamoEndpoint = Option(System.getenv("DYNAMODB_ENDPOINT"))
-      val kinesisEndpoint = Option(System.getenv("KINESIS_ENDPOINT"))
-      val awsEndpoint = Option(System.getenv("AWS_ENDPOINT")).getOrElse("")
-      val degradationMode = Option(System.getenv("DEGRADATION_MODE"))
-        .getOrElse("reject-all")
-      val algorithm = Option(System.getenv("RATE_LIMIT_ALGORITHM"))
-        .getOrElse("token-bucket")
-      val timeout =
-        if useLocalstack then
-          TimeoutSettings(
-            rateLimitCheck = scala.concurrent.duration.Duration(5, "seconds"),
-            healthCheck = scala.concurrent.duration.Duration(5, "seconds"),
-          )
-        else TimeoutSettings()
-      AppConfig(
-        server = ServerConfig("0.0.0.0", 8080),
-        aws = AwsConfig(
-          region = Option(System.getenv("AWS_REGION")).getOrElse("us-east-1"),
-          localstack = useLocalstack,
-          endpoint = awsEndpoint,
-          dynamodbEndpoint = dynamoEndpoint,
-          kinesisEndpoint = kinesisEndpoint,
-        ),
-        dynamodb = DynamoDBConfig("rate-limits", "idempotency"),
-        kinesis = KinesisConfig("rate-limit-events", false),
-        rateLimit = RateLimitConfig(100, 10.0, 3600, algorithm),
-        idempotency = IdempotencyConfig(),
-        resilience =
-          ResilienceConfig(timeout = timeout, degradationMode = degradationMode),
-      )
-    }
-  }

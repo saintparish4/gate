@@ -164,13 +164,13 @@ variable "enable_secrets_manager" {
 # ---------------------------------------------------------------------------
 
 variable "degradation_mode" {
-  description = "Behaviour when the circuit breaker opens or the bulkhead sheds a request. reject-all fails closed (429 for every caller, no runaway downstream spend); allow-all fails open (admits everything while the breaker is open); use-cached has no cache wired yet and currently behaves as allow-all."
+  description = "Behaviour when the circuit breaker opens or the bulkhead sheds a request. reject-all fails closed (429 for every caller, no runaway downstream spend); allow-all fails open (admits everything while the breaker is open). The application refuses any other value at startup."
   type        = string
   default     = "reject-all"
 
   validation {
-    condition     = contains(["reject-all", "allow-all", "use-cached"], var.degradation_mode)
-    error_message = "degradation_mode must be one of: reject-all, allow-all, use-cached."
+    condition     = contains(["reject-all", "allow-all"], var.degradation_mode)
+    error_message = "degradation_mode must be one of: reject-all, allow-all."
   }
 }
 

@@ -3,6 +3,9 @@ package config
 import org.scalatest.freespec.AnyFreeSpec
 import org.scalatest.matchers.should.Matchers
 
+import cats.effect.IO
+import cats.effect.unsafe.implicits.global
+import pureconfig.ConfigSource
 import resilience.GracefulDegradation.DegradationMode
 
 /** degradation-mode decides what every caller sees when the shared circuit
@@ -34,6 +37,42 @@ class DegradationModeSpec extends AnyFreeSpec with Matchers:
       message should include("nonsense")
       message should include("reject-all")
     }
+
+    "refuses use-cached, which had no cache and failed open" in {
+      val message = AppConfig.validateDegradationMode("use-cached")
+        .getOrElse(fail("use-cached must be refused"))
+      message should include("failed open")
+      message should include("allow-all")
+    }
+  }
+
+  "AppConfig.loadFrom, over the shipped application.conf" - {
+
+    // The real file with one override on top, the way an env var lands.
+    def loadWith(overrides: String): Either[Throwable, AppConfig] = AppConfig
+      .loadFrom[IO](
+        ConfigSource.string(overrides).withFallback(ConfigSource.default),
+      ).attempt.unsafeRunSync()
+
+    "loads as shipped" in {
+      val config = loadWith("").fold(e => fail(e.getMessage), identity)
+      config.resilience.degradationMode shouldBe "reject-all"
+      config.rateLimit.profiles.keySet should contain("free")
+    }
+
+    "stops on use-cached instead of starting fail-open" in {
+      val error = loadWith("resilience.degradation-mode = use-cached").left
+        .getOrElse(fail("use-cached loaded"))
+      error.getMessage should include("use-cached")
+    }
+
+    "stops on an unknown mode instead of starting on a fallback config" in {
+      loadWith("resilience.degradation-mode = nonsense").isLeft shouldBe true
+    }
+
+    "stops on an invalid profile" in {
+      loadWith("rate-limit.profiles.free.capacity = 0").isLeft shouldBe true
+    }
   }
 
   "parsedDegradationMode" - {
@@ -44,7 +83,6 @@ class DegradationModeSpec extends AnyFreeSpec with Matchers:
 
       parse("allow-all") shouldBe DegradationMode.AllowAll
       parse("reject-all") shouldBe DegradationMode.RejectAll
-      parse("use-cached") shouldBe DegradationMode.UseCached
     }
 
     "defaults to failing closed" in {
