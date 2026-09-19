@@ -22,8 +22,11 @@ class PrometheusMetrics[F[_]: Sync](val registry: CollectorRegistry):
 
   // -- Counters --
 
+  // `tier`, not the rate-limit key: keys are unbounded, tiers are four. It was
+  // labelled `key` and fed from the store, which never knew either, so every
+  // sample read "unknown".
   val requestsTotal: Counter = Counter.build().name("gate_requests_total")
-    .help("Total rate limit requests").labelNames("key", "result")
+    .help("Rate limit checks answered by the API").labelNames("tier", "result")
     .register(registry)
 
   val idempotencyTotal: Counter = Counter.build().name("gate_idempotency_total")
@@ -46,9 +49,12 @@ class PrometheusMetrics[F[_]: Sync](val registry: CollectorRegistry):
 
   // -- Gauges --
 
-  val tokensConsumed: Gauge = Gauge.build().name("gate_tokens_consumed")
-    .help("Token quota consumed gauge").labelNames("user", "agent", "org")
-    .register(registry)
+  // Replaces a per-user gauge: one series per user in Prometheus and one
+  // custom metric per user in CloudWatch, and it only moved on reconcile.
+  val quotaTokensAdmitted: Counter = Counter.build()
+    .name("gate_quota_tokens_admitted_total")
+    .help("Tokens reserved by admitted quota checks (the pre-request estimate)")
+    .labelNames("level").register(registry)
 
   val circuitBreakerState: Gauge = Gauge.build()
     .name("gate_circuit_breaker_state")
@@ -58,7 +64,8 @@ class PrometheusMetrics[F[_]: Sync](val registry: CollectorRegistry):
   // -- Histograms --
 
   val dynamoLatency: Histogram = Histogram.build()
-    .name("gate_dynamodb_latency_seconds").help("DynamoDB operation latency")
+    .name("gate_dynamodb_latency_seconds")
+    .help("Store call latency, including any conditional-write retries")
     .labelNames("operation")
     .buckets(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0)
     .register(registry)
@@ -75,11 +82,17 @@ class PrometheusMetrics[F[_]: Sync](val registry: CollectorRegistry):
     .name("gate_token_quota_check_seconds").help("Token quota check latency")
     .buckets(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5).register(registry)
 
-  // -- Cache --
-
-  val idempotencyCacheHitRatio: Gauge = Gauge.build()
-    .name("gate_idempotency_cache_hit_ratio")
-    .help("Idempotency cache hit ratio (0.0 - 1.0)").register(registry)
+  // A labelled series does not exist until its first sample, so a quiet one
+  // reads as "No data" rather than zero. I create the bounded ones up front.
+  List("free", "basic", "premium", "enterprise").foreach(tier =>
+    List("allowed", "rejected").foreach(requestsTotal.labels(tier, _)),
+  )
+  List("new", "in_progress", "duplicate", "conflict", "error")
+    .foreach(idempotencyTotal.labels(_))
+  List("circuit_breaker", "bulkhead", "error").foreach(degradedTotal.labels(_))
+  List("user", "agent", "org").foreach(quotaTokensAdmitted.labels(_))
+  List("checkAndConsume", "getStatus", "idempotency_check", "quota_reserve")
+    .foreach(dynamoLatency.labels(_))
 
   /** Serialize all registered metrics to Prometheus text exposition format. */
   def scrape: F[String] = Sync[F].delay {
@@ -89,6 +102,16 @@ class PrometheusMetrics[F[_]: Sync](val registry: CollectorRegistry):
   }
 
 object PrometheusMetrics:
+
+  // Timings taken around a store call rather than a whole request. These are
+  // the names the stores and APIs already give CloudWatch.
+  private val storeLatencyNames = Set(
+    "RateLimitCheckLatency",
+    "RateLimitStatusLatency",
+    "IdempotencyStoreLatency",
+    "TokenQuotaStoreLatency",
+  )
+
   def apply[F[_]: Sync]: F[PrometheusMetrics[F]] = Sync[F].delay {
     val registry = new CollectorRegistry(true)
     new PrometheusMetrics[F](registry)
@@ -109,12 +132,10 @@ object PrometheusMetrics:
         dimensions: Map[String, String],
     ): F[Unit] = primary.increment(name, dimensions) *> Sync[F].delay {
       name match
-        case "RateLimitAllowed" => prom.requestsTotal
-            .labels(dimensions.getOrElse("ClientTier", "unknown"), "allowed")
-            .inc()
-        case "RateLimitRejected" => prom.requestsTotal
-            .labels(dimensions.getOrElse("ClientTier", "unknown"), "rejected")
-            .inc()
+        case "IdempotencyCheck" => prom.idempotencyTotal
+            .labels(dimensions.getOrElse("result", "unknown")).inc()
+        case "KinesisEventPublished" => prom.eventsPublished
+            .labels(dimensions.getOrElse("event_type", "unknown")).inc()
         case "TokenQuotaExceeded" => prom.tokenQuotaTotal
             .labels(dimensions.getOrElse("level", "unknown"), "exceeded").inc()
         case "RateLimitDegraded" => prom.degradedTotal
@@ -127,24 +148,27 @@ object PrometheusMetrics:
         case _ => ()
     }
 
+    override def count(
+        name: String,
+        amount: Double,
+        dimensions: Map[String, String],
+    ): F[Unit] = primary.count(name, amount, dimensions) *> Sync[F].delay(
+      name match
+        case "QuotaTokensAdmitted" => prom.quotaTokensAdmitted
+            .labels(dimensions.getOrElse("level", "unknown")).inc(amount)
+        case _ => (),
+    )
+
     override def gauge(
         name: String,
         value: Double,
         dimensions: Map[String, String],
-    ): F[Unit] = primary.gauge(name, value, dimensions) *> Sync[F].delay {
+    ): F[Unit] = primary.gauge(name, value, dimensions) *> Sync[F].delay(
       name match
-        case "gate_tokens_consumed" => prom.tokensConsumed.labels(
-            dimensions.getOrElse("user", ""),
-            dimensions.getOrElse("agent", ""),
-            dimensions.getOrElse("org", ""),
-          ).set(value)
         case "CircuitBreakerState" => prom.circuitBreakerState
             .labels(dimensions.getOrElse("CircuitBreaker", "unknown")).set(value)
-        case "CacheHitRate"
-            if dimensions.get("CacheName").contains("idempotency") =>
-          prom.idempotencyCacheHitRatio.set(value / 100.0)
-        case _ => ()
-    }
+        case _ => (),
+    )
 
     override def recordLatency(
         name: String,
@@ -159,7 +183,7 @@ object PrometheusMetrics:
               .observe(seconds)
           case "token_quota_check" => prom.tokenQuotaCheckLatency
               .observe(seconds)
-          case n if n.startsWith("dynamodb") =>
+          case n if storeLatencyNames.contains(n) =>
             prom.dynamoLatency.labels(dimensions.getOrElse("operation", name))
               .observe(seconds)
           case _ => ()
@@ -180,7 +204,11 @@ object PrometheusMetrics:
         allowed: Boolean,
         clientId: String,
         tier: String,
-    ): F[Unit] = primary.recordRateLimitDecision(allowed, clientId, tier)
+    ): F[Unit] = primary.recordRateLimitDecision(allowed, clientId, tier) *>
+      Sync[F].delay(
+        prom.requestsTotal
+          .labels(tier, if allowed then "allowed" else "rejected").inc(),
+      )
 
     override def recordCircuitBreakerState(
         name: String,

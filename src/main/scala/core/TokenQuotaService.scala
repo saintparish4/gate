@@ -216,14 +216,30 @@ object TokenQuotaService:
       val levels = levelsFor(identifier)
       for
         nowMs <- Clock[F].realTime.map(_.toMillis)
-        outcome <- store.reserve(
-          levels.map(_.target),
-          estimatedInputTokens,
-          estimatedOutputTokens,
-          nowMs,
-        )
+        outcome <- metrics
+          .timed("TokenQuotaStoreLatency", Map("operation" -> "quota_reserve"))(
+            store.reserve(
+              levels.map(_.target),
+              estimatedInputTokens,
+              estimatedOutputTokens,
+              nowMs,
+            ),
+          )
+        _ <- outcome match
+          case ReserveOutcome.Reserved(_) =>
+            recordAdmitted(levels, estimatedInputTokens + estimatedOutputTokens)
+          case _ => Async[F].unit
         decision <- toDecision(levels, outcome, nowMs)
       yield decision
+
+    private def recordAdmitted(levels: List[Level], tokens: Long): F[Unit] =
+      levels.traverse_(l =>
+        metrics.count(
+          "QuotaTokensAdmitted",
+          tokens.toDouble,
+          Map("level" -> l.level.prefix),
+        ),
+      )
 
     override def reconcile(
         identifier: QuotaIdentifier,
@@ -243,13 +259,8 @@ object TokenQuotaService:
         for
           nowMs <- Clock[F].realTime.map(_.toMillis)
           outcome <- store.reserve(unlimited, inputDelta, outputDelta, nowMs)
-          result <- toReconcileResult(
-            identifier,
-            levels,
-            outcome,
-            inputDelta,
-            outputDelta,
-          )
+          result <-
+            toReconcileResult(identifier, outcome, inputDelta, outputDelta)
         yield result
 
     private def toDecision(
@@ -280,18 +291,12 @@ object TokenQuotaService:
 
     private def toReconcileResult(
         identifier: QuotaIdentifier,
-        levels: List[Level],
         outcome: ReserveOutcome,
         inputDelta: Long,
         outputDelta: Long,
     ): F[ReconcileResult] = outcome match
-      case ReserveOutcome.Reserved(states) => levels.traverse_(l =>
-          metrics.gauge(
-            "gate_tokens_consumed",
-            states(l.target.pk).totalTokens.toDouble,
-            Map("level" -> l.level.prefix) ++ identifierDims(identifier, l.level),
-          ),
-        ).as(ReconcileResult.Reconciled(inputDelta, outputDelta))
+      case ReserveOutcome.Reserved(_) => Async[F]
+          .pure(ReconcileResult.Reconciled(inputDelta, outputDelta))
 
       case ReserveOutcome.Contended(attempts) => metrics
           .increment("TokenQuotaReconcileFailed") *>
@@ -345,11 +350,3 @@ object TokenQuotaService:
     ): Int =
       val remainingMs = windowStart + windowSeconds * 1000 - nowMs
       math.max(1L, (remainingMs + 999) / 1000).toInt
-
-    private def identifierDims(
-        id: QuotaIdentifier,
-        level: QuotaLevel,
-    ): Map[String, String] = level match
-      case QuotaLevel.User => Map("user" -> id.userId)
-      case QuotaLevel.Agent => Map("agent" -> id.agentId.getOrElse("unknown"))
-      case QuotaLevel.Org => Map("org" -> id.orgId.getOrElse("unknown"))

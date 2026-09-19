@@ -63,6 +63,7 @@ case class KinesisConfig(
 case class MetricsConfig(
     enabled: Boolean = true,
     namespace: String = "RateLimiter",
+    environment: String = "dev",
     flushInterval: FiniteDuration = scala.concurrent.duration
       .Duration(60, "seconds"),
     highResolution: Boolean = false,

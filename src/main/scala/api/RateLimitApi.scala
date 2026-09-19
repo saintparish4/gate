@@ -75,11 +75,11 @@ class RateLimitApi[F[_]: Async: Tracer](
       // Record metrics
       latency <- Clock[F].realTime.map(_.toMillis - startTime)
       _ <- metricsPublisher.recordLatency("rate_limit_check", latency.toDouble)
-      _ <- decision match
-        case RateLimitDecision.Allowed(_, _) => metricsPublisher
-            .recordRateLimitDecision(allowed = true, client.apiKeyId)
-        case RateLimitDecision.Rejected(_, _) => metricsPublisher
-            .recordRateLimitDecision(allowed = false, client.apiKeyId)
+      _ <- metricsPublisher.recordRateLimitDecision(
+        allowed = decision.isInstanceOf[RateLimitDecision.Allowed],
+        client.apiKeyId,
+        client.tier.toString.toLowerCase,
+      )
 
       // Publish event (fire and forget)
       now <- Clock[F].realTime.map(d => Instant.ofEpochMilli(d.toMillis))

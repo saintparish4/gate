@@ -22,14 +22,10 @@ object ObservabilityModule:
     for
       basePublisher <- (config.metrics.enabled && !config.aws.localstack) match
         case true =>
-          val metricsConfig = MetricsConfig(
-            namespace = config.metrics.namespace,
-            maxBufferSize = config.metrics.maxBufferSize,
-            flushThreshold = config.metrics.flushThreshold,
-          )
           val logger = summon[Logger[F]]
           Resource.make(
-            MetricsPublisher.cloudWatch[F](config.aws.region, metricsConfig)
+            MetricsPublisher
+              .cloudWatch[F](config.aws.region, cloudWatchConfig(config.metrics))
               .allocated,
           ) { case (publisher, releaseInner) =>
             logger.info("Flushing metrics buffer before shutdown...") *>
@@ -49,3 +45,17 @@ object ObservabilityModule:
 
       dashboardQueue <- Resource.eval(Queue.bounded[F, RateLimitEvent](512))
     yield ObservabilityModule(metricsPublisher, promMetrics, dashboardQueue)
+
+  /** Only namespace and the buffer sizes used to be passed on, so the flush
+    * interval and resolution were fixed at their defaults and every datum said
+    * `Environment=dev`, in every environment.
+    */
+  def cloudWatchConfig(metrics: config.MetricsConfig): MetricsConfig =
+    MetricsConfig(
+      namespace = metrics.namespace,
+      environment = metrics.environment,
+      flushInterval = metrics.flushInterval,
+      highResolution = metrics.highResolution,
+      maxBufferSize = metrics.maxBufferSize,
+      flushThreshold = metrics.flushThreshold,
+    )

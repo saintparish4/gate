@@ -65,6 +65,13 @@ trait MetricsPublisher[F[_]: Clock: FlatMap]:
       dimensions: Map[String, String] = Map.empty,
   ): F[Unit]
 
+  /** Add `amount` to a count, for quantities larger than one per event. */
+  def count(
+      name: String,
+      amount: Double,
+      dimensions: Map[String, String] = Map.empty,
+  ): F[Unit]
+
   def gauge(
       name: String,
       value: Double,
@@ -166,6 +173,11 @@ object MetricsPublisher:
   def noop[F[_]: Async]: MetricsPublisher[F] = new MetricsPublisher[F]:
     override def increment(
         name: String,
+        dimensions: Map[String, String],
+    ): F[Unit] = Async[F].unit
+    override def count(
+        name: String,
+        amount: Double,
         dimensions: Map[String, String],
     ): F[Unit] = Async[F].unit
     override def gauge(
@@ -284,6 +296,13 @@ private class CloudWatchMetricsPublisher[F[_]: Async: Logger](
   ): F[Unit] =
     addMetric(MetricDataPoint(name, 1.0, StandardUnit.COUNT, dimensions))
 
+  override def count(
+      name: String,
+      amount: Double,
+      dimensions: Map[String, String],
+  ): F[Unit] =
+    addMetric(MetricDataPoint(name, amount, StandardUnit.COUNT, dimensions))
+
   override def gauge(
       name: String,
       value: Double,
@@ -365,6 +384,13 @@ object LoggingMetrics:
             name: String,
             dimensions: Map[String, String],
         ): F[Unit] = logger.info(s"METRIC: $name +1 ${formatDims(dimensions)}")
+
+        override def count(
+            name: String,
+            amount: Double,
+            dimensions: Map[String, String],
+        ): F[Unit] = logger
+          .info(s"METRIC: $name +$amount ${formatDims(dimensions)}")
 
         override def gauge(
             name: String,

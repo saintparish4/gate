@@ -73,16 +73,23 @@ class KinesisPublisher[F[_]: Async: Logger: Temporal](
     10.seconds,
   ).handleError(_ => ())
 
-  private def publishWithRetry(event: RateLimitEvent): F[Unit] = publishDirect(
-    event,
-  ).handleErrorWith(e1 =>
-    logger.warn(e1)(s"Kinesis publish failed (attempt 1), retrying: ${event
-        .eventType}") *> publishDirect(event).handleErrorWith(e2 =>
-      logger
-        .error(e2)(s"Kinesis publish failed after retry, dropping event: ${event
-            .eventType}") *> metrics.increment("DroppedKinesisEvent"),
-    ),
-  )
+  // Counted only once a put succeeds, so a published count that trails the
+  // decision rate means events are being lost, not merely queued.
+  private def publishWithRetry(event: RateLimitEvent): F[Unit] =
+    val published = metrics
+      .increment("KinesisEventPublished", Map("event_type" -> event.eventType))
+    publishDirect(event).attempt.flatMap {
+      case Right(_) => published
+      case Left(e1) => logger
+          .warn(e1)(s"Kinesis publish failed (attempt 1), retrying: ${event
+              .eventType}") *> publishDirect(event).attempt.flatMap {
+          case Right(_) => published
+          case Left(e2) => logger.error(e2)(
+              s"Kinesis publish failed after retry, dropping event: ${event
+                  .eventType}",
+            ) *> metrics.increment("DroppedKinesisEvent")
+        }
+    }
 
   private def publishDirect(event: RateLimitEvent): F[Unit] =
     val json = event.asJson.noSpaces

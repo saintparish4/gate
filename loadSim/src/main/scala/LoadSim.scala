@@ -896,9 +896,9 @@ object Http:
     * scrape would have 401'd and quietly passed every run.
     *
     * Matching on the "{" excludes the gate_degraded_total_created line the
-    * Prometheus client also emits, whose value is a unix timestamp. No
-    * matching line is a genuine zero: the labelled counter has no samples
-    * until its first increment.
+    * Prometheus client also emits, whose value is a unix timestamp. The server
+    * creates one zero-valued series per reason at startup; with no matching
+    * line at all (an older server), the sum is a genuine zero too.
     */
   def readDegradedTotal(
     client:   Client[IO],

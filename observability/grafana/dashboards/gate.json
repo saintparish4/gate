@@ -12,7 +12,7 @@
       }
     ]
   },
-  "description": "Gate operational dashboard: request flow, DynamoDB latency, OCC retries, circuit breaker state, token quota consumption, Kinesis publish/drop.",
+  "description": "Gate operational dashboard: request flow, store latency, circuit breaker state, degraded decisions, idempotency outcomes, quota tokens admitted, Kinesis publish/drop.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -170,7 +170,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(gate_circuit_breaker_state >= 0.9)",
+          "expr": "sum(gate_circuit_breaker_state >= bool 0.9)",
           "legendFormat": "open",
           "datasource": { "type": "prometheus", "uid": "prometheus" }
         }
@@ -324,19 +324,79 @@
       ]
     },
     {
+      "type": "timeseries",
+      "id": 22,
+      "title": "Degraded decisions by reason",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 23 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (reason) (rate(gate_degraded_total[1m]))",
+          "legendFormat": "{{reason}}",
+          "datasource": { "type": "prometheus", "uid": "prometheus" }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 23,
+      "title": "Idempotency checks by result",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 23 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (result) (rate(gate_idempotency_total[1m]))",
+          "legendFormat": "{{result}}",
+          "datasource": { "type": "prometheus", "uid": "prometheus" }
+        }
+      ]
+    },
+    {
       "type": "row",
       "id": 300,
       "title": "Quotas & event pipeline",
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 23 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 31 },
       "panels": []
     },
     {
       "type": "timeseries",
       "id": 30,
-      "title": "Token consumption by level",
+      "title": "Quota tokens admitted by level (per second)",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -350,8 +410,8 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (user) (gate_tokens_consumed)",
-          "legendFormat": "user={{user}}",
+          "expr": "sum by (level) (rate(gate_quota_tokens_admitted_total[1m]))",
+          "legendFormat": "{{level}}",
           "datasource": { "type": "prometheus", "uid": "prometheus" }
         }
       ]
@@ -362,7 +422,7 @@
       "title": "Kinesis publish vs drop",
       "description": "Drops indicate back-pressure: the drain fiber is falling behind Kinesis writes. Sustained drops are a signal to scale the stream or lower publish rate.",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
       "fieldConfig": {
         "defaults": {
           "unit": "reqps",

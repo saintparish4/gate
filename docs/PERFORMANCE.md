@@ -101,7 +101,7 @@ The token-bucket path performs **exactly two DynamoDB operations per
 2. Conditional `PutItem` (`version = current`) → 1 WCU
 
 Under hot-key contention the conditional `PutItem` can fail and retry up to 10
-times, consuming additional WCUs; the `RateLimitOCCRetry` CloudWatch metric and
+times, consuming additional WCUs; the `RateLimitOCCAttempts` CloudWatch metric and
 `gate_requests_total{result="rejected"}` Prometheus counter expose that cost.
 
 ### Estimated spend at AWS on-demand pricing (us-east-1)
