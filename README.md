@@ -276,7 +276,10 @@ Full request and response schemas: [API.md](docs/API.md).
 ## Configuration
 
 Everything is in [`application.conf`](src/main/resources/application.conf);
-each setting has an environment-variable override. The ones that matter most:
+each setting has an environment-variable override. A value Gate cannot honour
+(an unknown degradation mode, an invalid profile, an agent quota above 80% of
+the user quota, a value of the wrong type) stops startup with `Refusing to
+start: ...` rather than running on defaults. The ones that matter most:
 
 | Env var | Default | Notes |
 |---|---|---|
@@ -293,7 +296,7 @@ each setting has an environment-variable override. The ones that matter most:
 | `CIRCUIT_BREAKER_MAX_FAILURES` / `CIRCUIT_BREAKER_RESET_TIMEOUT` | `20` / `30 seconds` | One breaker for the whole rate-limit store |
 | `BULKHEAD_MAX_CONCURRENT` | `100` | |
 | `TIMEOUT_RATE_LIMIT_CHECK` / `TIMEOUT_IDEMPOTENCY_CHECK` | `2s` / `2s` | Compose raises both to 10 s for LocalStack |
-| `DEGRADATION_MODE` | `reject-all` | Or `allow-all`. `use-cached` is accepted but has no cache wired in and behaves as `allow-all` |
+| `DEGRADATION_MODE` | `reject-all` | Or `allow-all`. Anything else, including the former `use-cached`, stops startup |
 | `DASHBOARD_ENABLED` | `false` | Compose sets `true`; Terraform pins `false` |
 | `AUTH_ENABLED` / `AUTH_RATE_LIMIT_PER_MINUTE` | `true` / `1000` | Compose and the demo raise the throttle to 10,000,000 for load runs |
 | `SECRETS_MANAGER_ENABLED` | `false` | Off means the built-in development keys |
