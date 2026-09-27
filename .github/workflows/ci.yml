@@ -95,10 +95,27 @@ jobs:
     name: Smoke and correctness invariants
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      # Pinned so the app image tag below is the name compose looks for.
+      # Otherwise compose names the project after the checkout directory.
+      COMPOSE_PROJECT_NAME: gate
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
+
+    # The LocalStack image is a pull plus two COPYs, so caching it would cost
+    # more than it saves. Instead its ~30 s pull runs in the background, where
+    # it overlaps the app image build rather than adding to it. Output goes to
+    # a file so the step does not wait on the background process.
+    - name: Build LocalStack image (background)
+      run: |
+        (
+          set +e
+          docker compose build localstack
+          echo $? > "$RUNNER_TEMP/localstack-build.rc.tmp"
+          mv "$RUNNER_TEMP/localstack-build.rc.tmp" "$RUNNER_TEMP/localstack-build.rc"
+        ) > "$RUNNER_TEMP/localstack-build.log" 2>&1 < /dev/null &
 
     - name: Set up JDK 17
       uses: actions/setup-java@v4
@@ -110,8 +127,39 @@ jobs:
     - name: Set up SBT
       uses: sbt/setup-sbt@v1
 
+    # use: false keeps compose on Docker's default builder, so the LocalStack
+    # image lands straight in Docker whatever order these steps finish in.
+    - name: Set up Docker Buildx
+      id: buildx
+      uses: docker/setup-buildx-action@v4
+      with:
+        use: false
+
+    # The app image rebuilt apt-get and `sbt update` (about 40 s) on every run,
+    # even when no build file had changed. The GitHub Actions cache keeps those
+    # layers. mode=max is needed because they live in the builder stage.
+    - name: Build app image (layers cached between runs)
+      uses: docker/build-push-action@v7
+      with:
+        builder: ${{ steps.buildx.outputs.name }}
+        context: .
+        tags: ${{ env.COMPOSE_PROJECT_NAME }}-rate-limiter
+        load: true
+        cache-from: type=gha,scope=rate-limiter
+        cache-to: type=gha,mode=max,scope=rate-limiter
+      env:
+        DOCKER_BUILD_RECORD_UPLOAD: false
+
+    - name: Wait for LocalStack image
+      run: |
+        while [ ! -f "$RUNNER_TEMP/localstack-build.rc" ]; do sleep 1; done
+        cat "$RUNNER_TEMP/localstack-build.log"
+        exit "$(cat "$RUNNER_TEMP/localstack-build.rc")"
+
+    # --no-build: if the tag above stops matching the name compose expects,
+    # this fails loudly instead of quietly rebuilding without the cache.
     - name: Start full stack
-      run: docker compose up -d
+      run: docker compose up -d --no-build
       env:
         AWS_ACCESS_KEY_ID: "test"
         AWS_SECRET_ACCESS_KEY: "test"
