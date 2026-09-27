@@ -142,9 +142,12 @@ resource "aws_lb_target_group" "app" {
 
   # /ready, not /health. /health is a liveness probe that returns 200 as soon as
   # the process is accepting connections -- it stays "healthy" even when
-  # DynamoDB and Kinesis are unreachable, so routing on it puts tasks into
-  # service that cannot serve a single rate-limit check. /ready aggregates
-  # dependency health and answers 503 until they are actually reachable.
+  # DynamoDB is unreachable, so routing on it puts tasks into service that
+  # cannot serve a single rate-limit check. /ready answers 503 only while a
+  # table the service needs is unreachable. It used to fail on Kinesis too, so
+  # one Kinesis fault took every task out of service, although events are
+  # fire-and-forget and no request waits on them. A Kinesis fault now reads
+  # "degraded" with a 200.
   health_check {
     path                = "/ready"
     healthy_threshold   = 2

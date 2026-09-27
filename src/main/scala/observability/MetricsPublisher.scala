@@ -335,7 +335,10 @@ private class CloudWatchMetricsPublisher[F[_]: Async: Logger](
       state: String,
       failureCount: Int,
   ): F[Unit] =
-    val dims = Map("CircuitBreaker" -> name, "State" -> state)
+    // No State dimension: the value already is the state. With one, every
+    // state was a separate CloudWatch series, so no single alarm could watch
+    // the breaker.
+    val dims = Map("CircuitBreaker" -> name)
     gauge("CircuitBreakerState", stateToValue(state), dims) *>
       gauge("CircuitBreakerFailures", failureCount.toDouble, dims)
 

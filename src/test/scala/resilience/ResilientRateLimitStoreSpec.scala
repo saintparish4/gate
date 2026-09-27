@@ -210,3 +210,35 @@ class ResilientRateLimitStoreSpec
       )
     }
   }
+
+  "the circuit-breaker gauge" - {
+    // Finding A: the state was recorded only after a successful call, and while
+    // the breaker is open every call fails, so gate_circuit_breaker_state and
+    // the CloudWatch alarm kept reading closed through the outage.
+
+    "reads Open while the breaker is open" in {
+      val ex = new RuntimeException("dynamo down")
+      for
+        prom <- observability.PrometheusMetrics[IO]
+        gauge <- ResilientRateLimitStore[IO](
+          underlying = failingStore(ex),
+          config = testConfig,
+          metrics = observability.PrometheusMetrics
+            .dual(MetricsPublisher.noop[IO], prom),
+          eventPublisher = EventPublisher.noop[IO],
+          degradationMode = GracefulDegradation.DegradationMode.RejectAll,
+        ).use(store =>
+          // maxFailures = 3 opens it; the fourth call is refused by the open
+          // breaker without reaching the store.
+          List.fill(4)(store.checkAndConsume("k", 1, testProfile).attempt)
+            .sequence_ *> IO(
+            Option(prom.registry.getSampleValue(
+              "gate_circuit_breaker_state",
+              Array("name"),
+              Array("dynamodb-ratelimit"),
+            )).map(_.doubleValue),
+          ),
+        )
+      yield gauge shouldBe Some(1.0)
+    }
+  }

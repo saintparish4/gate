@@ -24,7 +24,7 @@ NEED_SBT = @command -v sbt >/dev/null 2>&1 || { echo "Error: sbt not found in PA
 
 .DEFAULT_GOAL := help
 .PHONY: help up up-clean down clean logs status run dev stack obs \
-        fmt test test-it test-all smoke health correctness env-drift tf-validate
+        fmt test test-it test-all smoke health correctness env-drift monitoring-check tf-validate
 
 help: ## Show this help
 	@awk 'BEGIN { FS = ":.*##"; printf "Usage: make <target>\n" } \
@@ -140,6 +140,9 @@ smoke: ## Send 100 rate-limit checks and verify the X-RateLimit-* headers
 
 env-drift: ## Compare env vars across application.conf, compose and Terraform
 	./scripts/check-env-drift.sh
+
+monitoring-check: ## Check every app metric the Terraform dashboard and alarms use is emitted
+	./scripts/check-monitoring-metrics.sh
 
 tf-validate: ## Initialise providers and validate the Terraform config
 	@command -v terraform >/dev/null 2>&1 || { echo "Error: terraform not found in PATH."; echo "  Install it: https://www.terraform.io/downloads"; exit 1; }

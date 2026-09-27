@@ -102,6 +102,8 @@ object Main extends IOApp:
       security <- SecurityModule.resource[IO](config)
       _ <- Resource.eval(summon[Logger[IO]].info("Security initialized"))
 
+      // The quota table is required when quotas are on; it was missing, so
+      // /ready said ready while /v1/quota/check could not reach its table.
       healthSources = List(
         HealthAggregator.dynamoDbSource(
           "dynamodb_ratelimit",
@@ -111,8 +113,9 @@ object Main extends IOApp:
           "dynamodb_idempotency",
           stores.idempotencyStore.healthCheck,
         ),
-        HealthAggregator.kinesisSource(eventPublisher.healthCheck),
-      )
+      ) ++ stores.tokenQuotaStore.map(tqs =>
+        HealthAggregator.dynamoDbSource("dynamodb_quota", tqs.healthCheck),
+      ) :+ HealthAggregator.kinesisSource(eventPublisher.healthCheck)
       healthCheck = HealthAggregator.aggregate(healthSources)
 
       getRequestId = () =>

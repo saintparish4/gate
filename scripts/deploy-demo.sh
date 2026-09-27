@@ -94,7 +94,9 @@ while [ $ELAPSED -lt $MAX_WAIT ]; do
   # /ready, not /health: /health returns 200 as soon as the process is up, even
   # with every backend unreachable, so waiting on it would report success on a
   # deployment that cannot serve a single request.
-  if curl -sf --max-time 5 "http://$ALB_DNS/ready" > /dev/null 2>&1; then
+  # "ok", not just 200: /ready answers 200 "degraded" while Kinesis is
+  # unreachable, which serves traffic but is not a finished deploy.
+  if curl -sf --max-time 5 "http://$ALB_DNS/ready" 2>/dev/null | grep -q '"status":"ok"'; then
     echo "Service is ready (dependencies reachable)!"
     break
   fi

@@ -43,6 +43,11 @@ jobs:
     - name: Check compose/Terraform env drift
       run: ./scripts/check-env-drift.sh
 
+    # Same idea for monitoring: the dashboard charted metrics the app never
+    # emitted and the breaker alarm watched a series that never existed.
+    - name: Check Terraform monitoring against emitted metrics
+      run: ./scripts/check-monitoring-metrics.sh
+
     # `cache: sbt` includes ~/.cache/coursier, where sbt keeps downloaded jars.
     # The hand-rolled cache this replaces saved ~/.ivy2/cache, which sbt stopped
     # using in 1.3, so every job fetched every dependency again.
