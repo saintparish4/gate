@@ -198,6 +198,11 @@ object SecretsManagerStore:
             Some(Permission.RateLimitStatus)
           case "idempotency_check" | "idempotencycheck" =>
             Some(Permission.IdempotencyCheck)
+          case "idempotency_complete" | "idempotencycomplete" =>
+            Some(Permission.IdempotencyComplete)
+          case "quota_check" | "quotacheck" => Some(Permission.QuotaCheck)
+          case "quota_reconcile" | "quotareconcile" =>
+            Some(Permission.QuotaReconcile)
           case "admin_metrics" | "adminmetrics" => Some(Permission.AdminMetrics)
           case "admin_config" | "adminconfig" => Some(Permission.AdminConfig)
           case _ => None

@@ -95,6 +95,14 @@ class SecretsManagerSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
       keys("live").permissions shouldBe
         Set(Permission.RateLimitCheck, Permission.AdminMetrics)
     }
+
+    "parses every route permission by its secret name" in apiKeys(secret(
+      """[{"apiKey": "k", "apiKeyId": "key_1", "clientName": "C",
+        |  "tier": "basic", "active": true, "permissions": [
+        |    "ratelimit_check", "ratelimit_status", "idempotency_check",
+        |    "idempotency_complete", "quota_check", "quota_reconcile"]}]"""
+        .stripMargin,
+    )).asserting(_("k").permissions shouldBe Permission.standard)
   }
 
   // Serves getApiKeys from a script of answers; the last one repeats.

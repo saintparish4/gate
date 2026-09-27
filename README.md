@@ -246,26 +246,30 @@ curl -s -H "Authorization: Bearer admin-api-key" http://localhost:8080/metrics |
 
 ## API
 
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| `POST` | `/v1/ratelimit/check` | yes | Consume `cost` tokens (default 1) for `key`; optional `profile` and `endpoint` |
-| `GET` | `/v1/ratelimit/status/:key` | yes | Current bucket state for a key, without consuming |
-| `POST` | `/v1/idempotency/check` | yes | `new` (200), `in_progress` (202), `duplicate` (200) or `conflict` (409) |
-| `POST` | `/v1/idempotency/:key/complete` | yes | Store the response for a key; 409 if it is not pending |
-| `POST` | `/v1/quota/check` | yes | Pre-request user / agent / org quota check; 429 with `Retry-After` when exceeded |
-| `POST` | `/v1/quota/reconcile` | yes | Post-response reconciliation of estimated versus actual tokens |
-| `GET` | `/health` | no | Liveness |
-| `GET` | `/ready` | no | Readiness: DynamoDB tables and Kinesis stream |
-| `GET` | `/metrics` | admin | Prometheus text exposition; 403 for a key without the `AdminMetrics` permission |
-| `GET` | `/v1/ratelimit/dashboard/stats` | no | Server-sent events stream of rate-limit decisions; only with `DASHBOARD_ENABLED=true` |
-| `GET` | `/dashboard` | no | Demo dashboard page, backed by `/dashboard/api/*`; only with `DASHBOARD_ENABLED=true` |
+| Method | Path | Permission | Description |
+|--------|------|------------|-------------|
+| `POST` | `/v1/ratelimit/check` | `RateLimitCheck` | Consume `cost` tokens (default 1) for `key`; optional `profile` and `endpoint` |
+| `GET` | `/v1/ratelimit/status/:key` | `RateLimitStatus` | Current bucket state for a key, without consuming |
+| `POST` | `/v1/idempotency/check` | `IdempotencyCheck` | `new` (200), `in_progress` (202), `duplicate` (200) or `conflict` (409) |
+| `POST` | `/v1/idempotency/:key/complete` | `IdempotencyComplete` | Store the response for a key; 409 if it is not pending |
+| `POST` | `/v1/quota/check` | `QuotaCheck` | Pre-request user / agent / org quota check; 429 with `Retry-After` when exceeded |
+| `POST` | `/v1/quota/reconcile` | `QuotaReconcile` | Post-response reconciliation of estimated versus actual tokens |
+| `GET` | `/health` | none, unauthenticated | Liveness |
+| `GET` | `/ready` | none, unauthenticated | Readiness: DynamoDB tables and Kinesis stream |
+| `GET` | `/metrics` | `AdminMetrics` | Prometheus text exposition |
+| `GET` | `/v1/ratelimit/dashboard/stats` | none, unauthenticated | Server-sent events stream of rate-limit decisions; only with `DASHBOARD_ENABLED=true` |
+| `GET` | `/dashboard` | none, unauthenticated | Demo dashboard page, backed by `/dashboard/api/*`; only with `DASHBOARD_ENABLED=true` |
 
 Authentication accepts `Authorization: Bearer <key>`, `Authorization: ApiKey
 <key>`, or an `X-Api-Key` header. A missing or unknown key answers 401 with an
-empty body. Each key is also throttled to `AUTH_RATE_LIMIT_PER_MINUTE`
-authentications (default 1,000); past that the answer is **429** with
-`Retry-After`, distinct from a bucket rejection. Malformed JSON answers 400 and
-JSON that does not match the schema answers 422.
+empty body. A valid key without the route's permission answers 403 naming the
+permission, before the route touches any state. The built-in `test-api-key`
+and `free-api-key` hold the six standard permissions; `admin-api-key` also
+holds `AdminMetrics` and `AdminConfig`. Each key is also throttled to
+`AUTH_RATE_LIMIT_PER_MINUTE` authentications (default 1,000); past that the
+answer is **429** with `Retry-After`, distinct from a bucket rejection.
+Malformed JSON answers 400 and JSON that does not match the schema answers
+422.
 
 The dashboard routes are unauthenticated: `POST /dashboard/api/config`
 rewrites the demo bucket's profile live, and the decision stream carries every
@@ -573,12 +577,13 @@ terraform apply -var-file=environments/prod.tfvars \
   -var="container_image=..." -target=module.secrets
 aws secretsmanager put-secret-value \
   --secret-id "rate-limiter/prod/api-keys" \
-  --secret-string '[{"apiKey":"...","apiKeyId":"key_001","clientName":"Client","tier":"basic","permissions":["ratelimit_check","ratelimit_status","idempotency_check"],"active":true}]'
+  --secret-string '[{"apiKey":"...","apiKeyId":"key_001","clientName":"Client","tier":"basic","permissions":["ratelimit_check","ratelimit_status","idempotency_check","idempotency_complete","quota_check","quota_reconcile"],"active":true}]'
 ```
 
 Every field is required, `active` included. Permission names are
-`ratelimit_check`, `ratelimit_status`, `idempotency_check`, `admin_metrics`,
-and `admin_config`; tiers are `free`, `basic`, `premium`, and `enterprise`. An
+`ratelimit_check`, `ratelimit_status`, `idempotency_check`,
+`idempotency_complete`, `quota_check`, `quota_reconcile`, `admin_metrics`, and
+`admin_config`; tiers are `free`, `basic`, `premium`, and `enterprise`. An
 entry with an unknown tier is skipped, and an unknown permission name is
 dropped. The app composes the secret name from `SECRETS_PREFIX`,
 `SECRETS_ENVIRONMENT`, and `API_KEYS_SECRET_NAME`, which Terraform sets to

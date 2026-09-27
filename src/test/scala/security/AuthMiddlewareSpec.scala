@@ -94,6 +94,9 @@ class AuthMiddlewareSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
         client.permissions should contain(Permission.RateLimitCheck)
         client.permissions should contain(Permission.RateLimitStatus)
         client.permissions should contain(Permission.IdempotencyCheck)
+        client.permissions should contain(Permission.IdempotencyComplete)
+        client.permissions should contain(Permission.QuotaCheck)
+        client.permissions should contain(Permission.QuotaReconcile)
         client.permissions shouldNot contain(Permission.AdminMetrics)
         client.permissions shouldNot contain(Permission.AdminConfig)
       }

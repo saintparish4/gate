@@ -82,42 +82,56 @@ class Routes[F[_]: Async: Tracer](
       }
   }
 
-  // Authenticated routes
+  // Authenticated routes. Each one names the permission it needs; only
+  // /metrics used to check, so a key's permissions decided nothing anywhere
+  // else. The check runs before the route, so a refused request touches no
+  // state.
   private val authedRoutes: AuthedRoutes[AuthenticatedClient, F] = AuthedRoutes
     .of {
-      // Rate limit check
       case req @ POST -> Root / "v1" / "ratelimit" / "check" as client =>
-        rateLimitApi.check(req.req, client)
+        guard(client, Permission.RateLimitCheck)(
+          rateLimitApi.check(req.req, client),
+        )
 
-      // Rate limit status
       case GET -> Root / "v1" / "ratelimit" / "status" / key as client =>
-        rateLimitApi.status(key, client)
+        guard(client, Permission.RateLimitStatus)(
+          rateLimitApi.status(key, client),
+        )
 
-      // Idempotency check
       case req @ POST -> Root / "v1" / "idempotency" / "check" as client =>
-        idempotencyApi.check(req.req, client)
+        guard(client, Permission.IdempotencyCheck)(
+          idempotencyApi.check(req.req, client),
+        )
 
       // Store idempotency response
       case req @ POST -> Root / "v1" / "idempotency" / key / "complete" as
-          client => idempotencyApi.complete(key, req.req, client)
+          client => guard(client, Permission.IdempotencyComplete)(
+          idempotencyApi.complete(key, req.req, client),
+        )
 
-      // Token quota check
       case req @ POST -> Root / "v1" / "quota" / "check" as client =>
-        tokenQuotaApi match
-          case Some(api) => api.check(req.req, client)
-          case None => Response[F](status = Status.NotFound).pure[F]
+        guard(client, Permission.QuotaCheck)(
+          tokenQuotaApi match
+            case Some(api) => api.check(req.req, client)
+            case None => Response[F](status = Status.NotFound).pure[F],
+        )
 
-      // Token quota reconcile
       case req @ POST -> Root / "v1" / "quota" / "reconcile" as client =>
-        tokenQuotaApi match
-          case Some(api) => api.reconcile(req.req, client)
-          case None => Response[F](status = Status.NotFound).pure[F]
+        guard(client, Permission.QuotaReconcile)(
+          tokenQuotaApi match
+            case Some(api) => api.reconcile(req.req, client)
+            case None => Response[F](status = Status.NotFound).pure[F],
+        )
 
       // Prometheus scrape. It sat on the public routes while AdminMetrics went
       // unchecked, so anyone who could reach the listener could read it.
-      case GET -> Root / "metrics" as client => ApiKeyAuth
-          .requirePermission(client, Permission.AdminMetrics)(scrapeMetrics)
+      case GET -> Root / "metrics" as client =>
+        guard(client, Permission.AdminMetrics)(scrapeMetrics)
     }
+
+  private def guard(client: AuthenticatedClient, permission: Permission)(
+      route: => F[Response[F]],
+  ): F[Response[F]] = ApiKeyAuth.requirePermission(client, permission)(route)
 
   // We build the response by writing raw UTF-8 bytes to the body stream
   // instead of `withEntity(body)` / `Ok(body)`. The wildcard

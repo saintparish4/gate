@@ -65,18 +65,30 @@ object ClientTier:
     case "enterprise" => Some(Enterprise)
     case _ => None
 
-/** Permissions for API key holders.
+/** Permissions for API key holders. Every authenticated route requires one.
+  * Only `/metrics` used to check, so the others were labels: a key without
+  * `IdempotencyCheck` could still check, and quota and complete had no
+  * permission at all.
   */
 sealed trait Permission
 object Permission:
   case object RateLimitCheck extends Permission
   case object RateLimitStatus extends Permission
   case object IdempotencyCheck extends Permission
+  case object IdempotencyComplete extends Permission
+  case object QuotaCheck extends Permission
+  case object QuotaReconcile extends Permission
   case object AdminMetrics extends Permission
   case object AdminConfig extends Permission
 
-  val standard: Set[Permission] =
-    Set(RateLimitCheck, RateLimitStatus, IdempotencyCheck)
+  val standard: Set[Permission] = Set(
+    RateLimitCheck,
+    RateLimitStatus,
+    IdempotencyCheck,
+    IdempotencyComplete,
+    QuotaCheck,
+    QuotaReconcile,
+  )
 
   val admin: Set[Permission] = standard ++ Set(AdminMetrics, AdminConfig)
 

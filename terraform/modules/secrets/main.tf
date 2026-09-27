@@ -42,7 +42,10 @@ resource "aws_secretsmanager_secret_version" "api_keys_initial" {
       apiKeyId    = "key_001"
       clientName  = "Default Client"
       tier        = "basic"
-      permissions = ["ratelimit_check", "ratelimit_status", "idempotency_check"]
+      permissions = [
+        "ratelimit_check", "ratelimit_status", "idempotency_check",
+        "idempotency_complete", "quota_check", "quota_reconcile",
+      ]
       active      = false
     }
   ])
