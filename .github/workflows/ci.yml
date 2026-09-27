@@ -17,10 +17,22 @@ on:
       - 'CHANGELOG*'
   workflow_dispatch:
 
+# A new push to a pull request makes the run for its old head worthless, so I
+# cancel it. Pushes to master always run to the end, so every merge commit
+# gets a verdict.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# The three jobs run side by side. They used to be chained with `needs:`, but
+# none of them uses another's output, so the chain only summed their times:
+# about 10.5 minutes, against about 4.5 for the slowest job alone.
 jobs:
-  test:
+  unit:
+    name: Unit tests
     runs-on: ubuntu-latest
-    
+    timeout-minutes: 15
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -31,26 +43,19 @@ jobs:
     - name: Check compose/Terraform env drift
       run: ./scripts/check-env-drift.sh
 
+    # `cache: sbt` includes ~/.cache/coursier, where sbt keeps downloaded jars.
+    # The hand-rolled cache this replaces saved ~/.ivy2/cache, which sbt stopped
+    # using in 1.3, so every job fetched every dependency again.
     - name: Set up JDK 17
       uses: actions/setup-java@v4
       with:
         java-version: '17'
         distribution: 'temurin'
+        cache: 'sbt'
 
     - name: Set up SBT
       uses: sbt/setup-sbt@v1
 
-    - name: Cache SBT dependencies
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.sbt
-          ~/.ivy2/cache
-          project/target
-        key: ${{ runner.os }}-sbt-${{ hashFiles('**/*.sbt', '**/project/build.properties') }}
-        restore-keys: |
-          ${{ runner.os }}-sbt-
-          
     - name: Check formatting
       run: sbt scalafmtCheckAll
 
@@ -59,104 +64,102 @@ jobs:
 
     - name: Run unit tests
       run: sbt unitTest
-      
+
+  # Separate from `unit` so a formatting or unit failure reports in about two
+  # minutes instead of waiting behind TestContainers.
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+        cache: 'sbt'
+
+    - name: Set up SBT
+      uses: sbt/setup-sbt@v1
+
     - name: Run integration tests
       run: sbt "testOnly *IntegrationSpec"
 
-  smoke:
-    name: Smoke test
-    runs-on: ubuntu-latest
-    needs: [test]
-
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Set up JDK 17
-      uses: actions/setup-java@v4
-      with:
-        java-version: '17'
-        distribution: 'temurin'
-
-    - name: Set up SBT
-      uses: sbt/setup-sbt@v1
-
-    - name: Cache SBT dependencies
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.sbt
-          ~/.ivy2/cache
-          project/target
-        key: ${{ runner.os }}-sbt-${{ hashFiles('**/*.sbt', '**/project/build.properties') }}
-        restore-keys: |
-          ${{ runner.os }}-sbt-
-
-    - name: Start full stack
-      run: docker compose up -d
-      env:
-        AWS_ACCESS_KEY_ID: "test"
-        AWS_SECRET_ACCESS_KEY: "test"
-        AWS_REGION: "us-east-1"
-
-    - name: Wait for /health (retry 3)
-      run: |
-        for i in 1 2 3; do
-          echo "Health check attempt $i..."
-          curl -sf http://localhost:8080/health && break
-          [ "$i" -eq 3 ] && echo "Service did not become healthy" && exit 1
-          sleep 10
-        done
-
-    - name: Smoke — POST /v1/ratelimit/check
-      run: |
-        curl -sf -X POST http://localhost:8080/v1/ratelimit/check \
-          -H "Content-Type: application/json" \
-          -H "Authorization: Bearer test-api-key" \
-          -d '{"key": "smoke-test", "cost": 1}' | tee /dev/stderr | grep -q '"allowed"'
-
-    - name: Smoke — POST /v1/idempotency/check
-      run: |
-        curl -sf -X POST http://localhost:8080/v1/idempotency/check \
-          -H "Content-Type: application/json" \
-          -H "Authorization: Bearer test-api-key" \
-          -d '{"idempotencyKey": "smoke-idem-1", "ttl": 3600}' | tee /dev/stderr | grep -q '"status"'
-
-    - name: Cleanup
-      if: always()
-      run: docker compose down -v
-
+  # One stack serves both the smoke calls and the invariants. They were two jobs
+  # that each built the same images from scratch, about 1.5 minutes apiece.
   correctness:
-    name: Correctness invariants
+    name: Smoke and correctness invariants
     runs-on: ubuntu-latest
-    needs: [smoke]
+    timeout-minutes: 15
+    env:
+      # Pinned so the app image tag below is the name compose looks for.
+      # Otherwise compose names the project after the checkout directory.
+      COMPOSE_PROJECT_NAME: gate
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
+
+    # The LocalStack image is a pull plus two COPYs, so caching it would cost
+    # more than it saves. Instead its ~30 s pull runs in the background, where
+    # it overlaps the app image build rather than adding to it. Output goes to
+    # a file so the step does not wait on the background process.
+    - name: Build LocalStack image (background)
+      run: |
+        (
+          set +e
+          docker compose build localstack
+          echo $? > "$RUNNER_TEMP/localstack-build.rc.tmp"
+          mv "$RUNNER_TEMP/localstack-build.rc.tmp" "$RUNNER_TEMP/localstack-build.rc"
+        ) > "$RUNNER_TEMP/localstack-build.log" 2>&1 < /dev/null &
 
     - name: Set up JDK 17
       uses: actions/setup-java@v4
       with:
         java-version: '17'
         distribution: 'temurin'
+        cache: 'sbt'
 
     - name: Set up SBT
       uses: sbt/setup-sbt@v1
 
-    - name: Cache SBT dependencies
-      uses: actions/cache@v4
+    # use: false keeps compose on Docker's default builder, so the LocalStack
+    # image lands straight in Docker whatever order these steps finish in.
+    - name: Set up Docker Buildx
+      id: buildx
+      uses: docker/setup-buildx-action@v4
       with:
-        path: |
-          ~/.sbt
-          ~/.ivy2/cache
-          project/target
-        key: ${{ runner.os }}-sbt-${{ hashFiles('**/*.sbt', '**/project/build.properties') }}
-        restore-keys: |
-          ${{ runner.os }}-sbt-
+        use: false
 
+    # The app image rebuilt apt-get and `sbt update` (about 40 s) on every run,
+    # even when no build file had changed. The GitHub Actions cache keeps those
+    # layers. mode=max is needed because they live in the builder stage.
+    - name: Build app image (layers cached between runs)
+      uses: docker/build-push-action@v7
+      with:
+        builder: ${{ steps.buildx.outputs.name }}
+        context: .
+        tags: ${{ env.COMPOSE_PROJECT_NAME }}-rate-limiter
+        load: true
+        cache-from: type=gha,scope=rate-limiter
+        cache-to: type=gha,mode=max,scope=rate-limiter
+      env:
+        DOCKER_BUILD_RECORD_UPLOAD: false
+
+    - name: Wait for LocalStack image
+      run: |
+        while [ ! -f "$RUNNER_TEMP/localstack-build.rc" ]; do sleep 1; done
+        cat "$RUNNER_TEMP/localstack-build.log"
+        exit "$(cat "$RUNNER_TEMP/localstack-build.rc")"
+
+    # --no-build: if the tag above stops matching the name compose expects,
+    # this fails loudly instead of quietly rebuilding without the cache.
     - name: Start full stack
-      run: docker compose up -d
+      run: docker compose up -d --no-build
       env:
         AWS_ACCESS_KEY_ID: "test"
         AWS_SECRET_ACCESS_KEY: "test"
@@ -177,10 +180,26 @@ jobs:
         docker compose logs --tail 200 rate-limiter || true
         exit 1
 
+    - name: Smoke — GET /health
+      run: curl -sf http://localhost:8080/health
+
+    - name: Smoke — POST /v1/ratelimit/check
+      run: |
+        curl -sf -X POST http://localhost:8080/v1/ratelimit/check \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Bearer test-api-key" \
+          -d '{"key": "smoke-test", "cost": 1}' | tee /dev/stderr | grep -q '"allowed"'
+
+    - name: Smoke — POST /v1/idempotency/check
+      run: |
+        curl -sf -X POST http://localhost:8080/v1/idempotency/check \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Bearer test-api-key" \
+          -d '{"idempotencyKey": "smoke-idem-1", "ttl": 3600}' | tee /dev/stderr | grep -q '"status"'
+
     - name: "Run correctness invariants (A: token-bucket non-over-issue, B: idempotency exactly-one-Created, C: quota non-over-admission)"
       run: sbt "loadSim/run --scenario correctness"
 
     - name: Cleanup
       if: always()
       run: docker compose down -v
-
