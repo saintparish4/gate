@@ -38,6 +38,7 @@ LOCAL_ONLY=(
   AWS_SECRET_ACCESS_KEY       # dummy creds locally; task role on AWS
   TIMEOUT_RATE_LIMIT_CHECK    # widened locally: LocalStack is 10-50x slower
   TIMEOUT_IDEMPOTENCY_CHECK   # widened locally, same reason
+  ALLOW_BUILT_IN_KEYS         # public dev keys; AWS must load keys from Secrets Manager
 )
 
 # ── extraction ───────────────────────────────────────────────────────────────

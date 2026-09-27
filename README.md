@@ -143,8 +143,10 @@ is unreachable. The ALB target group and the deploy script wait on `/ready`.
 
 Three API keys are built in for development: `test-api-key` (premium tier,
 1,000 tokens), `free-api-key` (free tier, 20 tokens), and `admin-api-key`
-(enterprise tier, the only one allowed to read `/metrics`). They are active
-whenever Secrets Manager is off.
+(enterprise tier, the only one allowed to read `/metrics`). They are public, so
+the service serves them only with `ALLOW_BUILT_IN_KEYS=true`, which
+docker-compose and `make run` set. With neither that flag nor Secrets Manager,
+it refuses to start.
 
 ```bash
 curl -s -X POST http://localhost:8080/v1/ratelimit/check \
@@ -278,7 +280,7 @@ Full request and response schemas: [API.md](docs/API.md).
 Everything is in [`application.conf`](src/main/resources/application.conf);
 each setting has an environment-variable override. A value Gate cannot honour
 (an unknown degradation mode, an invalid profile, an agent quota above 80% of
-the user quota, a value of the wrong type) stops startup with `Refusing to
+the user quota, no API key source, a value of the wrong type) stops startup with `Refusing to
 start: ...` rather than running on defaults. The ones that matter most:
 
 | Env var | Default | Notes |
@@ -298,8 +300,9 @@ start: ...` rather than running on defaults. The ones that matter most:
 | `TIMEOUT_RATE_LIMIT_CHECK` / `TIMEOUT_IDEMPOTENCY_CHECK` | `2s` / `2s` | Compose raises both to 10 s for LocalStack |
 | `DEGRADATION_MODE` | `reject-all` | Or `allow-all`. Anything else, including the former `use-cached`, stops startup |
 | `DASHBOARD_ENABLED` | `false` | Compose sets `true`; Terraform pins `false` |
-| `AUTH_ENABLED` / `AUTH_RATE_LIMIT_PER_MINUTE` | `true` / `1000` | Compose and the demo raise the throttle to 10,000,000 for load runs |
-| `SECRETS_MANAGER_ENABLED` | `false` | Off means the built-in development keys |
+| `AUTH_RATE_LIMIT_PER_MINUTE` | `1000` | Compose and the demo raise it to 10,000,000 for load runs |
+| `SECRETS_MANAGER_ENABLED` | `false` | Terraform pins `true`. A missing or unreadable secret, or one with no active keys, stops startup |
+| `ALLOW_BUILT_IN_KEYS` | `false` | Serves the public built-in keys. Compose and `make run` set it; Terraform never does |
 | `METRICS_ENABLED` / `METRICS_NAMESPACE` / `METRICS_ENVIRONMENT` | `true` / `RateLimiter` / `dev` | CloudWatch publishing is off whenever `USE_LOCALSTACK=true` |
 | `PROMETHEUS_ENABLED` | `true` | `/metrics` answers 404 to an admin key when off |
 | `TRACING_ENABLED` | `true` | The OpenTelemetry SDK reads `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_SERVICE_NAME` itself |
@@ -420,7 +423,9 @@ Each invariant prints `PASS` or `FAIL` with a detail prefix (`OVER-ISSUE`,
 runs it locally; `make APP_URL=http://<host> correctness` runs it against any
 deployment. A counts degraded decisions from `gate_degraded_total`, so it reads
 `/metrics` with `ADMIN_API_KEY` (default `admin-api-key`); if `/metrics` cannot
-be read, A fails with `METRICS UNREADABLE` rather than assuming zero. Source:
+be read, A fails with `METRICS UNREADABLE` rather than assuming zero. A drains
+`FREE_API_KEY`'s bucket and B and C use `API_KEY`; against a deployed stack all
+three come from `.demo-keys.env`. Source:
 [`LoadSim.scala`](loadSim/src/main/scala/LoadSim.scala).
 
 ### On AWS
@@ -487,7 +492,7 @@ shared keys), `realistic` (40 VUs, 80/20 rate-limit/idempotency mix),
 | ECS Fargate service + ALB | Target group health check on `/ready`, container health check on `/health`; CPU target-tracking autoscaling when enabled |
 | VPC | Two AZs, private subnets for tasks, two NAT gateways, interface endpoints for ECR, CloudWatch Logs, Secrets Manager and Kinesis, a gateway endpoint for DynamoDB |
 | CloudWatch | Log group `/ecs/<project>-<environment>` (7 days, 30 in `prod`), a dashboard, and four alarms that exist only when `alarm_sns_topic_arn` is set |
-| Secrets Manager | `<project>/<environment>/api-keys`, seeded with an inactive placeholder |
+| Secrets Manager | `<project>/<environment>/api-keys`, seeded with an inactive placeholder; the service refuses to start until it holds an active key |
 
 Local and AWS resource names differ. The app reads them from the environment,
 so compose and Terraform each pass their own:
@@ -513,7 +518,6 @@ the only one without a default:
 | `circuit_breaker_max_failures` / `circuit_breaker_reset_timeout` | `20` / `30 seconds` | |
 | `auth_rate_limit_per_minute` | `1000` | The demo raises it to 10,000,000 |
 | `otel_exporter_otlp_endpoint` | `""` | Empty disables the tracing SDK on the task |
-| `enable_secrets_manager` | `false` | See [API keys on AWS](#api-keys-on-aws) |
 | `alarm_sns_topic_arn` | `""` | Empty means no alarms |
 
 ### Scripted demo
@@ -522,8 +526,9 @@ the only one without a default:
 make env-drift                                 # exit 0, or fix the drift before touching AWS
 make tf-validate
 export ECR_IMAGE=$(./scripts/publish-image.sh)  # builds linux/amd64, creates the ECR repo, pushes, prints the URI
-./scripts/deploy-demo.sh                        # terraform apply with demo.tfvars, waits for /ready
+./scripts/deploy-demo.sh                        # writes demo API keys, applies demo.tfvars, waits for /ready
 ALB=$(cd terraform && terraform output -raw load_balancer_dns)
+source .demo-keys.env                           # the demo's keys; the built-in ones are refused on AWS
 make APP_URL="http://$ALB" correctness
 ./scripts/teardown-demo.sh                      # terraform destroy, then fails if anything is left in state
 ```
@@ -549,22 +554,37 @@ variable, and runs as the first CI step.
 
 ### API keys on AWS
 
-With `enable_secrets_manager` off, the deployed service uses the built-in
-development keys: fine for a demo, not for anything real. Terraform creates
-the secret either way but seeds it with one placeholder entry whose `active`
-flag is `false`, so enabling Secrets Manager before writing real keys leaves
-zero usable keys and every request answers 401. Write keys first:
+Every Terraform deploy loads its keys from Secrets Manager; the built-in keys
+are refused outside docker-compose. Terraform creates the secret with one
+inactive placeholder entry, and the service refuses to start until the secret
+holds at least one active key. It also refuses to start if the secret is
+missing or is not a JSON list of keys.
+
+`deploy-demo.sh` handles this for the demo. It creates the secret first,
+writes three random keys into it (premium, free, and admin, matching the
+built-in set), saves them to `.demo-keys.env` (gitignored, mode 600), and only
+then deploys the service. Re-running it keeps keys that are already active;
+`teardown-demo.sh` deletes the file along with the secret.
+
+For `dev` or `prod`, write keys before the first apply creates the service:
 
 ```bash
+terraform apply -var-file=environments/prod.tfvars \
+  -var="container_image=..." -target=module.secrets
 aws secretsmanager put-secret-value \
-  --secret-id "rate-limiter/demo/api-keys" \
-  --secret-string '[{"apiKey":"...","apiKeyId":"key_001","clientName":"Demo","tier":"basic","permissions":["ratelimit_check","ratelimit_status","idempotency_check"],"active":true}]'
+  --secret-id "rate-limiter/prod/api-keys" \
+  --secret-string '[{"apiKey":"...","apiKeyId":"key_001","clientName":"Client","tier":"basic","permissions":["ratelimit_check","ratelimit_status","idempotency_check"],"active":true}]'
 ```
 
-then apply with `-var="enable_secrets_manager=true"`. The app composes the
-secret name from `SECRETS_PREFIX`, `SECRETS_ENVIRONMENT`, and
-`API_KEYS_SECRET_NAME`, which Terraform sets to match. Keys are re-read every
-5 minutes.
+Every field is required, `active` included. Permission names are
+`ratelimit_check`, `ratelimit_status`, `idempotency_check`, `admin_metrics`,
+and `admin_config`; tiers are `free`, `basic`, `premium`, and `enterprise`. An
+entry with an unknown tier is skipped, and an unknown permission name is
+dropped. The app composes the secret name from `SECRETS_PREFIX`,
+`SECRETS_ENVIRONMENT`, and `API_KEYS_SECRET_NAME`, which Terraform sets to
+match. Keys are re-read every 5 minutes. A refresh that cannot read the secret
+keeps the current keys, while one that finds every key inactive revokes them
+all.
 
 ### Other environments
 

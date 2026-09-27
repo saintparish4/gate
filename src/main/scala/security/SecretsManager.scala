@@ -31,7 +31,9 @@ trait SecretStore[F[_]]:
   /** Get a secret as JSON and parse it */
   def getSecretAs[A: Decoder](secretName: String): F[Option[A]]
 
-  /** Get API keys from secrets */
+  /** Get the active API keys. Fails when the keys secret is missing or is not a
+    * JSON list of keys, so a misnamed secret cannot read as "no keys".
+    */
   def getApiKeys: F[Map[String, AuthenticatedClient]]
 
 /** Configuration for Secrets Manager.
@@ -56,6 +58,10 @@ private case class CachedSecret(
 )
 
 /** API key configuration stored in Secrets Manager.
+  *
+  * Every field is required, `active` included. It used to default to true, but
+  * the derived decoder ignores Scala defaults, so an entry without it failed to
+  * parse and the whole secret silently read as empty.
   */
 case class ApiKeyConfig(
     apiKey: String,
@@ -63,7 +69,7 @@ case class ApiKeyConfig(
     clientName: String,
     tier: String,
     permissions: List[String],
-    active: Boolean = true,
+    active: Boolean,
 )
 
 /** AWS Secrets Manager implementation of SecretStore.
@@ -128,27 +134,38 @@ object SecretsManagerStore:
           case None => Async[F].pure(None)
         }
 
+      // A missing or unparseable secret used to fall back to the built-in keys,
+      // admin included, whenever the environment was "dev", which Terraform's
+      // dev environment is. The warning meant to announce it sat inside a
+      // `.map`, so it was built and never run. Both cases now fail instead.
       override def getApiKeys: F[Map[String, AuthenticatedClient]] =
-        getSecretAs[List[ApiKeyConfig]](config.apiKeysSecretName).map {
-          case Some(configs) => configs.filter(_.active).flatMap(cfg =>
-              ClientTier.fromString(cfg.tier).map(tier =>
-                cfg.apiKey -> AuthenticatedClient(
-                  apiKeyId = cfg.apiKeyId,
-                  clientId = cfg.apiKeyId,
-                  clientName = cfg.clientName,
-                  tier = tier,
-                  permissions = cfg.permissions.flatMap(parsePermission).toSet,
-                ),
-              ),
-            ).toMap
-          case None =>
-            // Fall back to test keys in development
-            if config.environment == "dev" then
-              logger
-                .warn("No API keys found in Secrets Manager, using test keys")
-              ApiKeyStore.testKeys
-            else Map.empty
+        val fullName = config.fullSecretName(config.apiKeysSecretName)
+        getSecret(config.apiKeysSecretName).flatMap {
+          case None => Async[F].raiseError(new IllegalStateException(
+              s"API keys secret $fullName not found. Write the keys into it before starting the service.",
+            ))
+          case Some(json) => decode[List[ApiKeyConfig]](json) match
+              case Left(error) => Async[F].raiseError(new IllegalStateException(
+                  s"API keys secret $fullName is not a JSON list of keys: ${error
+                      .getMessage}",
+                ))
+              case Right(configs) => Async[F].pure(toClients(configs))
         }
+
+      private def toClients(
+          configs: List[ApiKeyConfig],
+      ): Map[String, AuthenticatedClient] = configs.filter(_.active).flatMap(
+        cfg =>
+          ClientTier.fromString(cfg.tier).map(tier =>
+            cfg.apiKey -> AuthenticatedClient(
+              apiKeyId = cfg.apiKeyId,
+              clientId = cfg.apiKeyId,
+              clientName = cfg.clientName,
+              tier = tier,
+              permissions = cfg.permissions.flatMap(parsePermission).toSet,
+            ),
+          ),
+      ).toMap
 
       private def fetchAndCache(fullName: String): F[Option[String]] =
         val request = GetSecretValueRequest.builder().secretId(fullName).build()
@@ -190,14 +207,28 @@ object SecretsManagerStore:
 object SecretsManagerApiKeyStore:
 
   /** Create an API key store that loads keys from Secrets Manager.
+    *
+    * The first load happens here and must yield at least one active key, so a
+    * missing, malformed, or still-placeholder secret stops startup. It used to
+    * load lazily on the first request, so a deploy with no usable keys passed
+    * every health check and then answered 401 to everyone. Later refreshes keep
+    * the current keys when the secret cannot be read, but a readable secret
+    * with every key inactive does take effect, so revoking all keys works.
     */
   def apply[F[_]: Async: Logger](
       secretStore: SecretStore[F],
       refreshInterval: FiniteDuration = 5.minutes,
   ): F[ApiKeyStore[F]] =
     for
-      keysRef <- Ref.of[F, Map[String, AuthenticatedClient]](Map.empty)
-      lastRefreshRef <- Ref.of[F, Long](0L)
+      initial <- secretStore.getApiKeys
+      _ <- Async[F].raiseWhen(initial.isEmpty)(new IllegalStateException(
+        "The API keys secret has no active keys. Write at least one key with \"active\": true before starting the service.",
+      ))
+      _ <- Logger[F]
+        .info(s"Loaded ${initial.size} API keys from Secrets Manager")
+      now <- Clock[F].realTime.map(_.toMillis)
+      keysRef <- Ref.of[F, Map[String, AuthenticatedClient]](initial)
+      lastRefreshRef <- Ref.of[F, Long](now)
     yield new ApiKeyStore[F]:
       private val logger = Logger[F]
 
@@ -219,7 +250,10 @@ object SecretsManagerApiKeyStore:
 
       private def refresh: F[Unit] = secretStore.getApiKeys.flatMap(keys =>
         keysRef.set(keys) *>
-          logger.info(s"Refreshed ${keys.size} API keys from Secrets Manager"),
+          (if keys.isEmpty then
+             logger.warn("The API keys secret has no active keys; every request will answer 401")
+           else
+             logger.info(s"Refreshed ${keys.size} API keys from Secrets Manager")),
       ).handleErrorWith(error =>
         logger.error(error)("Failed to refresh API keys, keeping existing") *>
           Async[F].unit,

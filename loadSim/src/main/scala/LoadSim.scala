@@ -48,11 +48,21 @@ import org.HdrHistogram.ConcurrentHistogram
  *                                 that cannot serve the load measures nothing.
  *   --admin-key KEY               key holding AdminMetrics, used to read /metrics
  *                                 for invariant A (default admin-api-key)
+ *   --api-key KEY                 key for the warm-up and invariants B and C
+ *                                 (default test-api-key)
+ *   --free-key KEY                Free-tier key whose 20-token bucket invariant A
+ *                                 drains (default free-api-key)
+ *
+ * The defaults are the built-in development keys, which only docker-compose
+ * serves. A deployed stack loads its keys from Secrets Manager, so pass its
+ * keys with the three --*-key flags (`make correctness` does, from API_KEY,
+ * FREE_API_KEY and ADMIN_API_KEY).
  */
 object LoadSim extends IOApp:
 
   val defaultBaseUrl = "http://localhost:8080"
   val defaultApiKey  = "test-api-key"
+  val defaultFreeKey  = "free-api-key"
   val defaultAdminKey = "admin-api-key"
 
   override def run(args: List[String]): IO[ExitCode] =
@@ -65,6 +75,8 @@ object LoadSim extends IOApp:
     // the invariant then measures degradation instead of the token bucket.
     val concurrency = Args.intOpt(args, "--concurrency")
     val adminKey    = Args.string(args, "--admin-key", defaultAdminKey)
+    val apiKey      = Args.string(args, "--api-key", defaultApiKey)
+    val freeKey     = Args.string(args, "--free-key", defaultFreeKey)
 
     // Larger connection pool so workers don't queue waiting for a connection
     // at high RPS, and an explicit per-request timeout so a hung server fails
@@ -99,7 +111,7 @@ object LoadSim extends IOApp:
         case "idempotency"    => withPreflight(Scenarios.idempotency(client, baseUrl).as(ExitCode.Success))
         case "realistic"      => withPreflight(Scenarios.realistic(client, baseUrl).as(ExitCode.Success))
         case "highContention" => withPreflight(Scenarios.highContention(client, baseUrl).as(ExitCode.Success))
-        case "correctness"    => withPreflight(Scenarios.correctness(client, baseUrl, concurrency, adminKey))
+        case "correctness"    => withPreflight(Scenarios.correctness(client, baseUrl, concurrency, adminKey, apiKey, freeKey))
         case "latency"        => withPreflight(Scenarios.latency(client, baseUrl, rps.getOrElse(1000), duration.getOrElse(60)))
         case unknown =>
           Console[IO].errorln(
@@ -378,16 +390,18 @@ object Scenarios:
     baseUrl:     String,
     concurrency: Option[Int] = None,
     adminKey:    String = LoadSim.defaultAdminKey,
+    apiKey:      String = LoadSim.defaultApiKey,
+    freeKey:     String = LoadSim.defaultFreeKey,
   ): IO[ExitCode] =
     val runId = System.currentTimeMillis.toString
     // One --concurrency scales all three invariants. Absent, each keeps its own
     // default: B and C need more contention than A to prove anything.
     for
       _  <- Console[IO].println(s"=== correctness — run $runId ===")
-      _  <- warmUp(client, baseUrl, runId)
-      a  <- invariantA_tokenBucketNonOverIssue(client, baseUrl, runId, concurrency.getOrElse(20), adminKey)
-      b  <- invariantB_idempotencyExactlyOneCreated(client, baseUrl, runId, concurrency.getOrElse(50))
-      c  <- invariantC_quotaNonOverAdmission(client, baseUrl, runId, concurrency.getOrElse(50))
+      _  <- warmUp(client, baseUrl, runId, apiKey)
+      a  <- invariantA_tokenBucketNonOverIssue(client, baseUrl, runId, concurrency.getOrElse(20), adminKey, freeKey)
+      b  <- invariantB_idempotencyExactlyOneCreated(client, baseUrl, runId, concurrency.getOrElse(50), apiKey)
+      c  <- invariantC_quotaNonOverAdmission(client, baseUrl, runId, concurrency.getOrElse(50), apiKey)
       ok  = a.passed && b.passed && c.passed
       _  <- Console[IO].println(
               s"""
@@ -413,7 +427,7 @@ object Scenarios:
    * invariants are about correctness, not cold-start latency, so I warm the hot
    * path first the way real traffic would.
    */
-  private def warmUp(client: Client[IO], baseUrl: String, runId: String): IO[Unit] =
+  private def warmUp(client: Client[IO], baseUrl: String, runId: String, apiKey: String): IO[Unit] =
     val stages = List((1, 5), (5, 5), (20, 5)) // (workers, seconds)
     Console[IO].println("-- Warm-up — ramping 1 -> 5 -> 20 workers on throwaway keys --") *>
     stages.zipWithIndex.traverse_ { case ((workers, secs), stage) =>
@@ -422,7 +436,7 @@ object Scenarios:
       IO.race(
         IO.sleep(secs.seconds),
         (0 until workers).toList.parTraverse_ { w =>
-          sendRateLimitCheck(client, baseUrl, s"warmup:$runId:$stage:$w").flatMap {
+          sendRateLimitCheck(client, baseUrl, s"warmup:$runId:$stage:$w", apiKey).flatMap {
             case Right(_) => IO(ok.incrementAndGet()).void
             case Left(_)  => IO(bad.incrementAndGet()).void
           }.loop
@@ -436,12 +450,13 @@ object Scenarios:
     runId:       String,
     concurrency: Int,
     adminKey:    String,
+    freeKey:     String,
   ): IO[InvariantResult] =
     val durationSecs  = 30
-    // free-api-key maps to the Free tier (20 tokens, 2 tokens/s in application.conf).
-    // Premium refills faster than this driver can send against LocalStack, so it
-    // would never block and prove nothing.
-    val apiKey        = "free-api-key"
+    // A Free-tier key (20 tokens, 2 tokens/s in application.conf). Premium
+    // refills faster than this driver can send against LocalStack, so it would
+    // never block and prove nothing.
+    val apiKey        = freeKey
     val capacity      = 20
     val refillPerSec  = 2
     // The server refills on its wall clock; this bound uses the client's
@@ -522,7 +537,7 @@ object Scenarios:
     Console[IO].println(
       s"""-- Invariant A — token-bucket non-over-issue --
          |  key           = $key
-         |  apiKey        = $apiKey (Free tier)
+         |  apiKey        = ${if apiKey == LoadSim.defaultFreeKey then apiKey else "from --free-key (not printed)"} (Free tier)
          |  concurrency   = $concurrency
          |  duration      = ${durationSecs}s
          |  capacity      = $capacity
@@ -541,6 +556,7 @@ object Scenarios:
     baseUrl:     String,
     runId:       String,
     concurrency: Int,
+    apiKey:      String,
   ): IO[InvariantResult] =
     val K             = 10
     val durationSecs  = 30
@@ -566,7 +582,7 @@ object Scenarios:
         // Each worker cycles through all K keys so every key is hit multiple times.
         def step(i: Int): IO[Unit] =
           val key = keys((vuid + i) % K)
-          sendIdempotencyCheck(client, baseUrl, key).flatMap {
+          sendIdempotencyCheck(client, baseUrl, key, apiKey).flatMap {
             case Right("new")         => IO { total.incrementAndGet(); created.incrementAndGet() }
             case Right("in_progress") => IO { total.incrementAndGet(); duplicate.incrementAndGet() }
             case Right("duplicate")   => IO { total.incrementAndGet(); duplicate.incrementAndGet() }
@@ -594,6 +610,7 @@ object Scenarios:
     baseUrl:     String,
     runId:       String,
     concurrency: Int,
+    apiKey:      String,
   ): IO[InvariantResult] =
     val durationSecs = 20
     val userLimit    = 1_000_000L   // TOKEN_QUOTA_USER_LIMIT default
@@ -621,7 +638,7 @@ object Scenarios:
     IO.race(
       progressTicker("invariantC", durationSecs, total, admitted, rejected, errors, okLabel = "admitted", nokLabel = "rejected"),
       (0 until concurrency).toList.parTraverse_ { _ =>
-        sendQuotaCheck(client, baseUrl, userId, perRequest).flatMap {
+        sendQuotaCheck(client, baseUrl, userId, perRequest, apiKey).flatMap {
           case Right("allowed")   => IO { total.incrementAndGet(); admitted.incrementAndGet() }
           case Right("exceeded")  => IO { total.incrementAndGet(); rejected.incrementAndGet() }
           case Right("contended") => IO { total.incrementAndGet(); contended.incrementAndGet() }
@@ -948,14 +965,14 @@ object Http:
       }
     }.handleError(e => Left(e.getMessage))
 
-  def sendIdempotencyCheck(client: Client[IO], baseUrl: String, key: String): IO[Either[String, String]] =
+  def sendIdempotencyCheck(client: Client[IO], baseUrl: String, key: String, apiKey: String = LoadSim.defaultApiKey): IO[Either[String, String]] =
     val body = Json.obj("idempotencyKey" := key, "ttl" := 3600)
     val req  = Request[IO](
       method  = Method.POST,
       uri     = Uri.unsafeFromString(s"$baseUrl/v1/idempotency/check"),
       headers = Headers(
         "Content-Type"  -> "application/json",
-        "Authorization" -> s"Bearer ${LoadSim.defaultApiKey}",
+        "Authorization" -> s"Bearer $apiKey",
       ),
     ).withEntity(body.noSpaces)
 
@@ -974,14 +991,14 @@ object Http:
     }.handleError(e => Left(e.getMessage))
 
   /** Right("allowed" | "exceeded" | "contended") for the three decision outcomes; Left for anything else. */
-  def sendQuotaCheck(client: Client[IO], baseUrl: String, userId: String, estimatedInputTokens: Long): IO[Either[String, String]] =
+  def sendQuotaCheck(client: Client[IO], baseUrl: String, userId: String, estimatedInputTokens: Long, apiKey: String = LoadSim.defaultApiKey): IO[Either[String, String]] =
     val body = Json.obj("userId" := userId, "estimatedInputTokens" := estimatedInputTokens)
     val req  = Request[IO](
       method  = Method.POST,
       uri     = Uri.unsafeFromString(s"$baseUrl/v1/quota/check"),
       headers = Headers(
         "Content-Type"  -> "application/json",
-        "Authorization" -> s"Bearer ${LoadSim.defaultApiKey}",
+        "Authorization" -> s"Bearer $apiKey",
       ),
     ).withEntity(body.noSpaces)
 

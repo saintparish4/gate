@@ -101,7 +101,9 @@ object ApiKeyStore:
     override def isKeyValid(apiKey: String): F[Boolean] = Sync[F]
       .pure(keys.contains(apiKey))
 
-  /** Default test keys for local development.
+  /** The built-in development keys. They are public, so the service serves them
+    * only with `ALLOW_BUILT_IN_KEYS=true`, which only docker-compose and
+    * `make run` set. Tests use them directly.
     */
   val testKeys: Map[String, AuthenticatedClient] = Map(
     "test-api-key" -> AuthenticatedClient(

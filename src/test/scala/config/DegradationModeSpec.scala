@@ -48,10 +48,14 @@ class DegradationModeSpec extends AnyFreeSpec with Matchers:
 
   "AppConfig.loadFrom, over the shipped application.conf" - {
 
-    // The real file with one override on top, the way an env var lands.
+    // The real file with one override on top, the way an env var lands. The
+    // shipped file has no key source of its own (see KeySourceSpec), so each
+    // load also sets the flag compose sets.
     def loadWith(overrides: String): Either[Throwable, AppConfig] = AppConfig
       .loadFrom[IO](
-        ConfigSource.string(overrides).withFallback(ConfigSource.default),
+        ConfigSource.string(overrides).withFallback(ConfigSource.string(
+          "security.allow-built-in-keys = true",
+        )).withFallback(ConfigSource.default),
       ).attempt.unsafeRunSync()
 
     "loads as shipped" in {

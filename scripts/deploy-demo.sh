@@ -29,14 +29,58 @@ cd "$PROJECT_ROOT/terraform"
 echo "Initializing Terraform..."
 terraform init
 
-echo "Applying Terraform configuration..."
-# shellcheck disable=SC1009,SC1073,SC1072,SC2086
-terraform apply -auto-approve \
-  -var-file=environments/demo.tfvars \
-  -var="ecs_desired_count=1" \
-  -var="container_image=${ECR_IMAGE}" \
-  -var="enable_autoscaling=false" \
+TF_VARS=(
+  -var-file=environments/demo.tfvars
+  -var="ecs_desired_count=1"
+  -var="container_image=${ECR_IMAGE}"
+  -var="enable_autoscaling=false"
   -var="enable_kinesis_firehose=false"
+)
+
+# The app refuses the built-in keys outside docker compose, and refuses to start
+# until the keys secret holds an active key. So the secret comes first and gets
+# keys before the service exists to read them.
+echo "Creating the API keys secret..."
+terraform apply -auto-approve "${TF_VARS[@]}" -target=module.secrets
+
+SECRET_ID=$(terraform output -raw api_keys_secret_name)
+KEYS_FILE="$PROJECT_ROOT/.demo-keys.env"
+
+# One key entry. The keys are hex, so nothing in them needs JSON escaping.
+key_json() { # apiKey apiKeyId clientName tier permissions
+  printf '{"apiKey":"%s","apiKeyId":"%s","clientName":"%s","tier":"%s","permissions":[%s],"active":true}' \
+    "$1" "$2" "$3" "$4" "$5"
+}
+
+if aws secretsmanager get-secret-value --secret-id "$SECRET_ID" \
+     --query SecretString --output text | grep -Eq '"active" *: *true'; then
+  echo "$SECRET_ID already holds active keys; keeping them."
+  [ -f "$KEYS_FILE" ] || echo "   $KEYS_FILE is missing; read the keys with: aws secretsmanager get-secret-value --secret-id $SECRET_ID"
+else
+  echo "Writing fresh demo keys into $SECRET_ID..."
+  API_KEY="gate_$(openssl rand -hex 24)"
+  FREE_API_KEY="gate_$(openssl rand -hex 24)"
+  ADMIN_API_KEY="gate_$(openssl rand -hex 24)"
+  STANDARD='"ratelimit_check","ratelimit_status","idempotency_check"'
+  ADMIN="$STANDARD,\"admin_metrics\",\"admin_config\""
+  KEYS_JSON="[$(key_json "$API_KEY" key_demo_api "Demo client" premium "$STANDARD"),$(key_json "$FREE_API_KEY" key_demo_free "Demo free client" free "$STANDARD"),$(key_json "$ADMIN_API_KEY" key_demo_admin "Demo admin" enterprise "$ADMIN")]"
+  aws secretsmanager put-secret-value --secret-id "$SECRET_ID" \
+    --secret-string "$KEYS_JSON" > /dev/null
+  (
+    umask 077
+    cat > "$KEYS_FILE" <<KEYS
+# Demo API keys, written by scripts/deploy-demo.sh. Load them with:
+#   source .demo-keys.env
+export API_KEY=$API_KEY
+export FREE_API_KEY=$FREE_API_KEY
+export ADMIN_API_KEY=$ADMIN_API_KEY
+KEYS
+  )
+  echo "Saved the keys to $KEYS_FILE (gitignored, mode 600)."
+fi
+
+echo "Applying Terraform configuration..."
+terraform apply -auto-approve "${TF_VARS[@]}"
 
 # Wait for healthy
 ALB_DNS=$(terraform output -raw load_balancer_dns)
@@ -85,9 +129,13 @@ echo "256/512 (\$0.012), one Kinesis shard (\$0.015). About \$6/day if left up."
 echo ""
 echo "TEAR IT DOWN WHEN DONE:  ./scripts/teardown-demo.sh"
 echo ""
-echo "Quick test:"
+echo "Quick test (the built-in keys are refused here; use the demo's own):"
+echo "   source .demo-keys.env"
 echo "   curl http://$ALB_DNS/ready"
 echo "   curl -X POST http://$ALB_DNS/v1/ratelimit/check \\"
 echo "     -H 'Content-Type: application/json' \\"
-echo "     -H 'Authorization: Bearer test-api-key' \\"
+echo "     -H \"Authorization: Bearer \$API_KEY\" \\"
 echo "     -d '{\"key\":\"demo\",\"cost\":1}'"
+echo ""
+echo "Correctness invariants against the demo:"
+echo "   source .demo-keys.env && make APP_URL=http://$ALB_DNS correctness"
