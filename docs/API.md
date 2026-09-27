@@ -482,7 +482,15 @@ Returns service health status.
 
 ### Readiness Check
 
-Checks if service is ready to accept traffic (validates dependencies). Answers 200 only when every component reports `ok`; otherwise 503 with `"status": "degraded"` and the error in the failing component's `details`.
+Checks if the service can serve decisions. Each component is `required` or not:
+
+| `status` | HTTP | Meaning |
+|----------|------|---------|
+| `ok` | 200 | Every component reachable |
+| `degraded` | 200 | Only optional components failing (Kinesis: events are fire-and-forget and no request waits on them) |
+| `unavailable` | 503 | A required component failing: the rate-limit, idempotency, or (when quotas are on) quota table |
+
+The ALB routes on this endpoint, so only `unavailable` takes a task out of service. The failing component's error is in its `details`.
 
 **Endpoint:** `GET /ready`
 
@@ -491,9 +499,23 @@ Checks if service is ready to accept traffic (validates dependencies). Answers 2
 {
   "status": "ok",
   "components": [
-    { "name": "dynamodb_ratelimit", "status": "ok", "details": null },
-    { "name": "dynamodb_idempotency", "status": "ok", "details": null },
-    { "name": "kinesis", "status": "ok", "details": null }
+    { "name": "dynamodb_ratelimit", "status": "ok", "required": true, "details": null },
+    { "name": "dynamodb_idempotency", "status": "ok", "required": true, "details": null },
+    { "name": "dynamodb_quota", "status": "ok", "required": true, "details": null },
+    { "name": "kinesis", "status": "ok", "required": false, "details": null }
+  ]
+}
+```
+
+**Degraded Response (200):** Kinesis unreachable; decisions are still served.
+```json
+{
+  "status": "degraded",
+  "components": [
+    { "name": "dynamodb_ratelimit", "status": "ok", "required": true, "details": null },
+    { "name": "dynamodb_idempotency", "status": "ok", "required": true, "details": null },
+    { "name": "dynamodb_quota", "status": "ok", "required": true, "details": null },
+    { "name": "kinesis", "status": "error", "required": false, "details": "Received an UnknownHostException when attempting to interact with a service..." }
   ]
 }
 ```
@@ -501,11 +523,12 @@ Checks if service is ready to accept traffic (validates dependencies). Answers 2
 **Not Ready Response (503):**
 ```json
 {
-  "status": "degraded",
+  "status": "unavailable",
   "components": [
-    { "name": "dynamodb_ratelimit", "status": "ok", "details": null },
-    { "name": "dynamodb_idempotency", "status": "ok", "details": null },
-    { "name": "kinesis", "status": "error", "details": "Received an UnknownHostException when attempting to interact with a service..." }
+    { "name": "dynamodb_ratelimit", "status": "error", "required": true, "details": "Requested resource not found" },
+    { "name": "dynamodb_idempotency", "status": "ok", "required": true, "details": null },
+    { "name": "dynamodb_quota", "status": "ok", "required": true, "details": null },
+    { "name": "kinesis", "status": "ok", "required": false, "details": null }
   ]
 }
 ```

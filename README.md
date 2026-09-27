@@ -136,9 +136,13 @@ curl -s http://localhost:8080/ready
 ```
 
 `/health` is liveness only and answers 200 whenever the process is up.
-`/ready` pings the two DynamoDB tables and the Kinesis stream and answers 503
-with `"status":"degraded"` and the failing component's error when any of them
-is unreachable. The ALB target group and the deploy script wait on `/ready`.
+`/ready` pings the DynamoDB tables (rate-limit, idempotency, and the quota
+table when quotas are on) and the Kinesis stream. It answers 503 with
+`"status":"unavailable"` only when a table is unreachable, because that is when
+the service cannot decide anything. Kinesis is optional: events are
+fire-and-forget, and no request waits on them, so a Kinesis fault reads
+`"status":"degraded"` with a 200 and the task stays in service. The ALB target
+group routes on `/ready`, and the deploy script waits for `"status":"ok"`.
 
 **2. A rate-limit check**
 
@@ -266,7 +270,7 @@ curl -s -H "Authorization: Bearer admin-api-key" http://localhost:8080/metrics |
 | `POST` | `/v1/quota/check` | `QuotaCheck` | Pre-request user / agent / org quota check; 429 with `Retry-After` when exceeded |
 | `POST` | `/v1/quota/reconcile` | `QuotaReconcile` | Post-response reconciliation of estimated versus actual tokens |
 | `GET` | `/health` | none, unauthenticated | Liveness |
-| `GET` | `/ready` | none, unauthenticated | Readiness: DynamoDB tables and Kinesis stream |
+| `GET` | `/ready` | none, unauthenticated | Readiness: 503 only when a DynamoDB table is unreachable; a Kinesis fault is a 200 `degraded` |
 | `GET` | `/metrics` | `AdminMetrics` | Prometheus text exposition |
 | `GET` | `/v1/ratelimit/dashboard/stats` | none, unauthenticated | Server-sent events stream of rate-limit decisions; only with `DASHBOARD_ENABLED=true` |
 | `GET` | `/dashboard` | none, unauthenticated | Demo dashboard page, backed by `/dashboard/api/*`; only with `DASHBOARD_ENABLED=true` |
@@ -399,8 +403,10 @@ Every datum carries an `Environment` dimension from `METRICS_ENVIRONMENT`
 (Terraform sets it to the deployment's environment). Data points are buffered
 and flushed every `metrics.flush-interval` (60 s), at 1,000 buffered entries,
 and on shutdown; the buffer caps at 50,000 and drops the oldest. The Terraform
-CloudWatch dashboard and circuit-breaker alarm do not yet match the names and
-dimensions the app emits.
+CloudWatch dashboard and alarms query the names and dimensions the app emits,
+and `make monitoring-check` (run in CI) fails if a referenced metric is not
+emitted or omits `Environment`. The circuit-breaker gauge is recorded after
+every protected call, so it reads open while the breaker is open.
 
 **Tracing** uses otel4s over the OpenTelemetry Java SDK. Spans wrap every
 route and each rate-limit, idempotency, and quota operation; the trace ID is
@@ -499,16 +505,28 @@ shared keys), `realistic` (40 VUs, 80/20 rate-limit/idempotency mix),
 
 ## Deploying to AWS
 
-[`terraform/`](terraform/) provisions, per `<project>-<environment>` prefix
-(`rate-limiter-demo-*` for the demo):
+Two Terraform roots, both keeping state in S3. They need Terraform 1.10 or
+later for S3 state locking; 1.11 is the first release where it is not
+experimental.
+
+- [`terraform/bootstrap/`](terraform/bootstrap/) holds what outlives every
+  environment: the `gate` ECR repository and its lifecycle policy (tags are
+  immutable, scanned on push; untagged images expire after a day, and only the
+  10 most recent are kept). `scripts/bootstrap.sh` applies it once per account.
+  It also creates the state bucket, `gate-tfstate-<account-id>` (versioned,
+  encrypted, public access blocked, TLS only), and adopts an ECR repository
+  made by an older `publish-image.sh` instead of recreating it.
+- [`terraform/`](terraform/) provisions each environment, under the state key
+  `gate/<environment>/terraform.tfstate` and the prefix `<project>-<environment>`
+  (`rate-limiter-demo-*` for the demo):
 
 | Resource | What it does |
 |---|---|
 | DynamoDB `-rate-limits`, `-idempotency`, `-token-quotas` | On-demand tables, hash key `pk`, TTL on `ttl`, encryption at rest; point-in-time recovery in `prod` |
 | Kinesis `-events` | Decision event stream, KMS-encrypted |
-| ECS Fargate service + ALB | Target group health check on `/ready`, container health check on `/health`; CPU target-tracking autoscaling when enabled |
+| ECS Fargate service + ALB | Target group health check on `/ready`, container health check on `/health`; CPU target-tracking autoscaling when enabled. HTTPS (TLS 1.2+) with an HTTP redirect when `certificate_arn` is set; otherwise HTTP only to `alb_ingress_cidrs` (see [TLS](#tls)) |
 | VPC | Two AZs, private subnets for tasks, two NAT gateways, interface endpoints for ECR, CloudWatch Logs, Secrets Manager and Kinesis, a gateway endpoint for DynamoDB |
-| CloudWatch | Log group `/ecs/<project>-<environment>` (7 days, 30 in `prod`), a dashboard, and four alarms that exist only when `alarm_sns_topic_arn` is set |
+| CloudWatch | Log group `/ecs/<project>-<environment>` (7 days, 30 in `prod`), a dashboard, and four alarms (error rate, p99 latency, healthy tasks, circuit breaker open); they notify only when `alarm_sns_topic_arn` is set |
 | Secrets Manager | `<project>/<environment>/api-keys`, seeded with an inactive placeholder; the service refuses to start until it holds an active key |
 
 Local and AWS resource names differ. The app reads them from the environment,
@@ -535,27 +553,31 @@ the only one without a default:
 | `circuit_breaker_max_failures` / `circuit_breaker_reset_timeout` | `20` / `30 seconds` | |
 | `auth_rate_limit_per_minute` | `1000` | The demo raises it to 10,000,000 |
 | `otel_exporter_otlp_endpoint` | `""` | Empty disables the tracing SDK on the task |
-| `alarm_sns_topic_arn` | `""` | Empty means no alarms |
+| `alarm_sns_topic_arn` | `""` | Empty means the alarms exist but notify nobody |
+| `certificate_arn` | `""` | ACM certificate for the HTTPS listener |
+| `alb_ingress_cidrs` | `["0.0.0.0/0"]` | Who may reach the ALB. `deploy-demo.sh` passes your IP |
+| `allow_public_plaintext` | `false` | Required to serve HTTP to `0.0.0.0/0` without a certificate |
 
 ### Scripted demo
 
 ```bash
-make env-drift                                 # exit 0, or fix the drift before touching AWS
-make tf-validate
-export ECR_IMAGE=$(./scripts/publish-image.sh)  # builds linux/amd64, creates the ECR repo, pushes, prints the URI
+make env-drift tf-validate tf-test             # exit 0, or fix it before touching AWS
+./scripts/bootstrap.sh                          # once per account: state bucket, ECR repository
+export ECR_IMAGE=$(./scripts/publish-image.sh)  # builds linux/amd64, pushes, prints the URI
 ./scripts/deploy-demo.sh                        # writes demo API keys, applies demo.tfvars, waits for /ready
-ALB=$(cd terraform && terraform output -raw load_balancer_dns)
+API=$(cd terraform && terraform output -raw api_endpoint)
 source .demo-keys.env                           # the demo's keys; the built-in ones are refused on AWS
-make APP_URL="http://$ALB" correctness
+make APP_URL="$API" correctness
 ./scripts/teardown-demo.sh                      # terraform destroy, then fails if anything is left in state
 ```
 
-`publish-image.sh` tags the image with the short git SHA and applies an ECR
-lifecycle policy that keeps the 10 most recent images. The ECR repository is
-outside Terraform state, so teardown leaves it and its images behind; the
-teardown script prints the NAT gateway, load balancer, and ECS cluster
-commands to confirm nothing else survived. Terraform state is local: tear
-down from the machine you deployed from.
+`publish-image.sh` tags the image with the short git SHA, or the SHA plus
+`-dirty-<timestamp>` when the tree has uncommitted changes, because tags are
+immutable. It reuses a tag that is already pushed. Teardown leaves the ECR
+repository, its images, and the state bucket, which belong to the bootstrap
+root, and prints the NAT gateway, load balancer, and ECS cluster commands to
+confirm nothing else survived. State is in S3, so any machine with
+`terraform/backend.hcl` (written by `bootstrap.sh`) can deploy or tear down.
 
 The demo costs roughly $0.30 per hour in `us-east-1`: two NAT gateways, five
 interface endpoints across two AZs, an ALB, one 1 vCPU / 2 GB task, and one
@@ -586,6 +608,7 @@ then deploys the service. Re-running it keeps keys that are already active;
 For `dev` or `prod`, write keys before the first apply creates the service:
 
 ```bash
+terraform init -backend-config=backend.hcl -backend-config="key=gate/prod/terraform.tfstate"
 terraform apply -var-file=environments/prod.tfvars \
   -var="container_image=..." -target=module.secrets
 aws secretsmanager put-secret-value \
@@ -604,15 +627,34 @@ match. Keys are re-read every 5 minutes. A refresh that cannot read the secret
 keeps the current keys, while one that finds every key inactive revokes them
 all.
 
+### TLS
+
+API keys travel in every request, and the ALB used to serve them over plain
+HTTP to the whole internet.
+- **With `certificate_arn`** (an ACM certificate for your domain; point the
+  domain at the ALB), port 443 serves the API under a TLS 1.2+ policy, and
+  port 80 only redirects to it.
+- **Without one,** Terraform refuses a plan that serves plaintext to
+  `0.0.0.0/0`. Restrict `alb_ingress_cidrs`, or set `allow_public_plaintext =
+  true` to accept the risk on purpose.
+
+The demo takes the restricted path: `deploy-demo.sh` lets in only your current
+public IP, or `ALB_INGRESS_CIDR`. It serves HTTPS if you export
+`CERTIFICATE_ARN`. `make tf-test` plans these rules against a mocked AWS
+provider, and CI runs it.
+
 ### Other environments
 
 `environments/dev.tfvars` and `environments/prod.tfvars` exist alongside
-`demo.tfvars`. Apply one directly:
+`demo.tfvars`. Each environment keeps its own state key. Without a
+`certificate_arn`, they need `alb_ingress_cidrs` too:
 
 ```bash
-cd terraform && terraform init
+cd terraform
+terraform init -backend-config=backend.hcl -backend-config="key=gate/dev/terraform.tfstate"
 terraform apply -var-file=environments/dev.tfvars \
-  -var="container_image=ACCOUNT.dkr.ecr.REGION.amazonaws.com/gate:<tag>"
+  -var="container_image=ACCOUNT.dkr.ecr.REGION.amazonaws.com/gate:<tag>" \
+  -var="certificate_arn=arn:aws:acm:REGION:ACCOUNT:certificate/..."
 terraform output api_endpoint
 ```
 

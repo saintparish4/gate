@@ -8,14 +8,11 @@ terraform {
     }
   }
 
-  # Remote state configuration - uncomment and configure for production
-  # backend "s3" {
-  #   bucket         = "your-terraform-state-bucket"
-  #   key            = "rate-limiter/terraform.tfstate"
-  #   region         = "us-east-1"
-  #   dynamodb_table = "terraform-locks"
-  #   encrypt        = true
-  # }
+  # State lives in S3 (row 12: it was a local file, so it was lost with the
+  # machine and dev, demo, and prod shared one file). Partial configuration:
+  # scripts/bootstrap.sh creates the bucket and writes backend.hcl, and the
+  # deploy scripts add key = "gate/<environment>/terraform.tfstate".
+  backend "s3" {}
 }
 
 locals {
@@ -118,6 +115,10 @@ module "ecs" {
 
   container_image = var.container_image
   container_port  = var.container_port
+
+  certificate_arn        = var.certificate_arn
+  alb_ingress_cidrs      = var.alb_ingress_cidrs
+  allow_public_plaintext = var.allow_public_plaintext
   desired_count   = var.ecs_desired_count
   cpu             = var.ecs_cpu
   memory          = var.ecs_memory
@@ -215,9 +216,11 @@ module "monitoring" {
   project_name = var.project_name
   environment  = var.environment
 
-  ecs_cluster_name = module.ecs.cluster_name
-  ecs_service_name = module.ecs.service_name
-  alb_arn_suffix   = module.ecs.alb_arn_suffix
+  ecs_cluster_name        = module.ecs.cluster_name
+  ecs_service_name        = module.ecs.service_name
+  alb_arn_suffix          = module.ecs.alb_arn_suffix
+  target_group_arn_suffix = module.ecs.target_group_arn_suffix
+  min_healthy_tasks       = var.enable_autoscaling ? var.ecs_min_capacity : var.ecs_desired_count
 
   alarm_sns_topic_arn = var.alarm_sns_topic_arn
 }

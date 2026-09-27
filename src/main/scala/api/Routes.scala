@@ -75,10 +75,12 @@ class Routes[F[_]: Async: Tracer](
     case GET -> Root / "health" =>
       Ok(HealthResponse("healthy", BuildInfo.version).asJson)
 
-    // Readiness probe - aggregated dependency health
+    // Readiness probe: 503 only when a component needed to serve decisions is
+    // down. A failing optional one (Kinesis) reads "degraded" with a 200, so
+    // the ALB keeps the task in service.
     case GET -> Root / "ready" => healthCheck.flatMap { health =>
         val json = health.asJson
-        if health.isHealthy then Ok(json) else ServiceUnavailable(json)
+        if health.isServing then Ok(json) else ServiceUnavailable(json)
       }
   }
 

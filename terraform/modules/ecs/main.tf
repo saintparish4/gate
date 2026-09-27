@@ -114,7 +114,9 @@ resource "aws_ecs_service" "app" {
     rollback = true
   }
 
-  depends_on = [aws_lb_listener.app]
+  # With a certificate the target group hangs off the HTTPS listener, and ECS
+  # refuses a target group that no listener uses.
+  depends_on = [aws_lb_listener.app, aws_lb_listener.https]
 
   tags = {
     Name = "${var.project_name}-${var.environment}-service"
@@ -142,9 +144,12 @@ resource "aws_lb_target_group" "app" {
 
   # /ready, not /health. /health is a liveness probe that returns 200 as soon as
   # the process is accepting connections -- it stays "healthy" even when
-  # DynamoDB and Kinesis are unreachable, so routing on it puts tasks into
-  # service that cannot serve a single rate-limit check. /ready aggregates
-  # dependency health and answers 503 until they are actually reachable.
+  # DynamoDB is unreachable, so routing on it puts tasks into service that
+  # cannot serve a single rate-limit check. /ready answers 503 only while a
+  # table the service needs is unreachable. It used to fail on Kinesis too, so
+  # one Kinesis fault took every task out of service, although events are
+  # fire-and-forget and no request waits on them. A Kinesis fault now reads
+  # "degraded" with a 200.
   health_check {
     path                = "/ready"
     healthy_threshold   = 2
@@ -159,10 +164,54 @@ resource "aws_lb_target_group" "app" {
   }
 }
 
+# TLS. API keys travel in every request, and this ALB used to serve them over
+# plain HTTP to the whole internet. With a certificate, port 443 serves the API
+# and port 80 only redirects to it. Without one, the ALB may still serve HTTP,
+# but only to alb_ingress_cidrs: deploy-demo.sh sets that to the deployer's IP,
+# and a plan that would open plaintext to 0.0.0.0/0 is refused unless
+# allow_public_plaintext is set on purpose.
+locals {
+  https = var.certificate_arn != ""
+  public_plaintext = !local.https && anytrue([
+    for cidr in var.alb_ingress_cidrs : cidr == "0.0.0.0/0"
+  ])
+}
+
 resource "aws_lb_listener" "app" {
   load_balancer_arn = aws_lb.app.arn
   port              = "80"
   protocol          = "HTTP"
+
+  default_action {
+    type             = local.https ? "redirect" : "forward"
+    target_group_arn = local.https ? null : aws_lb_target_group.app.arn
+
+    dynamic "redirect" {
+      for_each = local.https ? [1] : []
+      content {
+        port        = "443"
+        protocol    = "HTTPS"
+        status_code = "HTTP_301"
+      }
+    }
+  }
+
+  lifecycle {
+    precondition {
+      condition     = !local.public_plaintext || var.allow_public_plaintext
+      error_message = "The ALB would serve API keys over plain HTTP to the whole internet: certificate_arn is empty and alb_ingress_cidrs includes 0.0.0.0/0. Set certificate_arn, restrict alb_ingress_cidrs to known addresses (deploy-demo.sh uses your current IP), or set allow_public_plaintext = true to accept that."
+    }
+  }
+}
+
+resource "aws_lb_listener" "https" {
+  count = local.https ? 1 : 0
+
+  load_balancer_arn = aws_lb.app.arn
+  port              = "443"
+  protocol          = "HTTPS"
+  ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+  certificate_arn   = var.certificate_arn
 
   default_action {
     type             = "forward"
@@ -183,14 +232,14 @@ resource "aws_security_group" "alb" {
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    cidr_blocks = var.alb_ingress_cidrs
   }
 
   ingress {
     from_port   = 443
     to_port     = 443
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    cidr_blocks = var.alb_ingress_cidrs
   }
 
   egress {

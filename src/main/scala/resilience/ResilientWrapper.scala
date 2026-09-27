@@ -164,15 +164,21 @@ object ResilientRateLimitStore:
 
         val withRetry = Retry.withPolicy(retryPolicy, name)(withTimeout)
 
+        // The state is recorded after every call, whatever its outcome. It
+        // used to follow successful calls only, and while the breaker is open
+        // every call fails, so the gauge and the CloudWatch alarm read closed
+        // for the whole outage. A failure to record never replaces the call's
+        // own result.
         val withCB = circuitBreaker.fold(withRetry)(cb =>
-          cb.protect(withRetry).flatTap(_ =>
+          Temporal[F].guarantee(
+            cb.protect(withRetry),
             cb.metrics.flatMap(m =>
               metrics.recordCircuitBreakerState(
                 "dynamodb-ratelimit",
                 m.state.toString,
                 m.failureCount,
               ),
-            ),
+            ).handleError(_ => ()),
           ),
         )
 
