@@ -423,7 +423,7 @@ and pull request:
    smoke-tests `/health`, one rate-limit call, and one idempotency call, then
    runs `sbt "loadSim/run --scenario correctness"`. A violation fails the build.
 
-The correctness scenario warms the server for about 15 s, then asserts three
+The correctness scenario warms the server for about 15 s, then asserts four
 invariants:
 
 | Invariant | Load | Assertion |
@@ -431,6 +431,7 @@ invariants:
 | **A** — token bucket never over-issues | 20 workers on one `free-api-key` bucket for 30 s | `allowed <= capacity + refill x (measured elapsed + 5 s)`, `errors = 0`, no degraded decisions. Reports `server-excess`, the refill the server saw beyond the client's window; the 5 s allowance exists because a wall-clock correction on the server can mint that much once. |
 | **B** — idempotency creates exactly once | 50 workers over 10 shared keys for 30 s | exactly 10 `new` responses, 0 conflicts, 0 errors |
 | **C** — token quota never over-admits | 50 workers spending 25,000 tokens each against a 1,000,000 limit for 20 s | `admitted x 25,000 <= 1,000,000`, some rejections, 0 errors |
+| **D** — tenants never share state | Two clients (`API_KEY` and `FREE_API_KEY`) racing for 20 s on the same 10 idempotency keys and the same quota user, while the second reconciles every reservation the first is granted | each client creates its own 10 records; each is held to 40 quota admissions and together they pass 40; every stolen reconcile answers 404; 0 conflicts, 0 errors |
 
 Each invariant prints `PASS` or `FAIL` with a detail prefix (`OVER-ISSUE`,
 `UNDER-ISSUE`, `DEGRADED`, `VACUOUS`, `VIOLATION`, `OVER-ADMISSION`), then
@@ -439,8 +440,9 @@ runs it locally; `make APP_URL=http://<host> correctness` runs it against any
 deployment. A counts degraded decisions from `gate_degraded_total`, so it reads
 `/metrics` with `ADMIN_API_KEY` (default `admin-api-key`); if `/metrics` cannot
 be read, A fails with `METRICS UNREADABLE` rather than assuming zero. A drains
-`FREE_API_KEY`'s bucket and B and C use `API_KEY`; against a deployed stack all
-three come from `.demo-keys.env`. Source:
+`FREE_API_KEY`'s bucket, B and C use `API_KEY`, and D needs both, as two
+different clients. Against a deployed stack all three come from
+`.demo-keys.env`. Source:
 [`LoadSim.scala`](loadSim/src/main/scala/LoadSim.scala).
 
 ### On AWS

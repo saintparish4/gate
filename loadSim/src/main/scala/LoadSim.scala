@@ -28,6 +28,9 @@ import org.HdrHistogram.ConcurrentHistogram
  *   correctness    — CI-gated invariants:
  *                      A) token-bucket non-over-issue under 50-way parallel load
  *                      B) idempotency exactly-one-Created under K=10 shared keys
+ *                      C) token-quota non-over-admission
+ *                      D) cross-tenant isolation: two clients racing on the
+ *                         same idempotency keys, quota user, and reservations
  *                    exits non-zero on any invariant violation
  *   latency        — fixed-RPS latency measurement with HdrHistogram; emits a
  *                    markdown table row of rps, p50, p95, p99, error_rate
@@ -384,6 +387,17 @@ object Scenarios:
    *   limit is 1,000,000 (the default), so at most 40 checks may be admitted.
    *   Requires TOKEN_QUOTA_ENABLED=true on the server.
    *   Assert: admitted * 25,000 <= 1,000,000, at least one 429, no HTTP errors.
+   *
+   * Invariant D — cross-tenant isolation (ADR-005):
+   *   Two clients, --api-key (A) and --free-key (B), race for 20 s on the same
+   *   visible identifiers. Each is its own tenant.
+   *     D1: both drive the same K=10 idempotency keys; each must create exactly
+   *         K records of its own. Shared keys would give K between them.
+   *     D2: both fill the same quota user; each is held to 40 admissions, and
+   *         together they must pass 40, which one shared counter cannot.
+   *     D3: while D2 runs, B reconciles every reservation A is granted, with
+   *         zero usage. Every attempt must answer 404.
+   *   Assert all three, no conflicts, no HTTP errors.
    */
   def correctness(
     client:      Client[IO],
@@ -402,7 +416,8 @@ object Scenarios:
       a  <- invariantA_tokenBucketNonOverIssue(client, baseUrl, runId, concurrency.getOrElse(20), adminKey, freeKey)
       b  <- invariantB_idempotencyExactlyOneCreated(client, baseUrl, runId, concurrency.getOrElse(50), apiKey)
       c  <- invariantC_quotaNonOverAdmission(client, baseUrl, runId, concurrency.getOrElse(50), apiKey)
-      ok  = a.passed && b.passed && c.passed
+      d  <- invariantD_crossTenantIsolation(client, baseUrl, runId, concurrency.getOrElse(10), apiKey, freeKey)
+      ok  = a.passed && b.passed && c.passed && d.passed
       _  <- Console[IO].println(
               s"""
                  |=== Correctness Results ===
@@ -412,6 +427,8 @@ object Scenarios:
                  |     ${b.details}
                  |  C) Token quota non-over-admission  : ${if c.passed then "PASS" else "FAIL"}
                  |     ${c.details}
+                 |  D) Cross-tenant isolation          : ${if d.passed then "PASS" else "FAIL"}
+                 |     ${d.details}
                  |
                  |Overall: ${if ok then "PASS" else "FAIL"}
                  |""".stripMargin
@@ -660,6 +677,132 @@ object Scenarios:
         else s"OVER-ADMISSION: admitted=$adm ($tokens tokens) > userLimit=$userLimit (rejected=$rej, contended=$con)"
       IO.pure(InvariantResult(pass, why))
     }
+
+  private def invariantD_crossTenantIsolation(
+    client:      Client[IO],
+    baseUrl:     String,
+    runId:       String,
+    concurrency: Int,
+    keyA:        String,
+    keyB:        String,
+  ): IO[InvariantResult] =
+    val durationSecs = 20
+    val K            = 10
+    val idemKeys     = (0 until K).map(i => s"correctness:D:$runId:key-$i").toVector
+    val userId       = s"correctness:D:$runId"
+    val userLimit    = 1_000_000L   // TOKEN_QUOTA_USER_LIMIT default
+    val perRequest   = 25_000L
+    val maxAdmitted  = userLimit / perRequest
+
+    final class Tenant(val key: String):
+      val created   = new AtomicLong(0)
+      val conflicts = new AtomicLong(0)
+      val admitted  = new AtomicLong(0)
+
+    val a = new Tenant(keyA)
+    val b = new Tenant(keyB)
+    val total         = new AtomicLong(0)
+    val admittedAll   = new AtomicLong(0)
+    val rejectedAll   = new AtomicLong(0)
+    val errors        = new AtomicLong(0)
+    val thefts        = new AtomicLong(0)
+    val theftsLanded  = new AtomicLong(0)
+    // Reservations granted to A, which B then tries to reconcile.
+    val grantedToA    = new java.util.concurrent.CopyOnWriteArrayList[String]()
+    val sampler       = new ErrorSampler(5)
+
+    def fail(msg: String): IO[Unit] =
+      IO { total.incrementAndGet(); errors.incrementAndGet(); sampler.record(msg) }
+
+    def idempotency(t: Tenant, worker: Int): IO[Unit] =
+      def step(i: Int): IO[Unit] =
+        sendIdempotencyCheck(client, baseUrl, idemKeys((worker + i) % K), t.key).flatMap {
+          case Right("new")                       => IO { total.incrementAndGet(); t.created.incrementAndGet() }
+          case Right("in_progress" | "duplicate") => IO(total.incrementAndGet()).void
+          case Right("conflict")                  => IO { total.incrementAndGet(); t.conflicts.incrementAndGet() }
+          case Right(other)                       => fail(s"unexpected idempotency status: $other")
+          case Left(msg)                          => fail(msg)
+        } >> step(i + 1)
+      step(0)
+
+    def quota(t: Tenant): IO[Unit] =
+      sendQuotaCheckReserving(client, baseUrl, userId, perRequest, t.key).flatMap {
+        case Right(("allowed", id)) => IO {
+            total.incrementAndGet(); admittedAll.incrementAndGet(); t.admitted.incrementAndGet()
+            if t eq a then id.foreach(grantedToA.add)
+          }.void
+        case Right(("exceeded", _))  => IO { total.incrementAndGet(); rejectedAll.incrementAndGet() }.void
+        case Right(("contended", _)) => IO(total.incrementAndGet()).void
+        case Right((other, _))       => fail(s"unexpected quota outcome: $other")
+        case Left(msg)               => fail(msg)
+      }.loop
+
+    def steal(id: String): IO[Unit] =
+      sendQuotaReconcile(client, baseUrl, id, 0L, b.key).flatMap {
+        case Right(404)  => IO(thefts.incrementAndGet()).void
+        case Right(code) => IO {
+            thefts.incrementAndGet(); theftsLanded.incrementAndGet()
+            sampler.record(s"B reconciled A's reservation: HTTP $code")
+          }.void
+        case Left(msg) => fail(msg)
+      }
+
+    val thief: IO[Unit] = IO.defer {
+      val n = grantedToA.size
+      if n == 0 then IO.sleep(20.millis)
+      else steal(grantedToA.get(java.util.concurrent.ThreadLocalRandom.current().nextInt(n)))
+    }.loop
+
+    if keyA == keyB then
+      IO.pure(InvariantResult(false, "D needs two different keys: --api-key and --free-key are the same, so there is only one tenant"))
+    else
+      Console[IO].println(
+        s"""-- Invariant D — cross-tenant isolation --
+           |  clients       = A (--api-key) and B (--free-key), same identifiers
+           |  concurrency   = $concurrency per client per race
+           |  duration      = ${durationSecs}s
+           |  K (idem keys) = $K
+           |  userId        = $userId  (limit $userLimit, $perRequest per check, $maxAdmitted each)
+           |""".stripMargin
+      ) *>
+      IO.race(
+        progressTicker("invariantD", durationSecs, total, admittedAll, rejectedAll, errors, okLabel = "admitted", nokLabel = "rejected"),
+        List(
+          (0 until concurrency).toList.parTraverse_(idempotency(a, _)),
+          (0 until concurrency).toList.parTraverse_(idempotency(b, _)),
+          List.fill(concurrency)(a).parTraverse_(quota),
+          List.fill(concurrency)(b).parTraverse_(quota),
+          List.fill(math.max(1, concurrency / 2))(thief).parSequence_,
+        ).parSequence_,
+      ) *>
+      // Every reservation A holds gets one more attempt after the race.
+      IO(grantedToA.toArray(Array.empty[String]).toList).flatMap(_.traverse_(steal)) *>
+      IO.defer {
+        val (ca, cb)   = (a.created.get, b.created.get)
+        val (aa, ab)   = (a.admitted.get, b.admitted.get)
+        val conflicts  = a.conflicts.get + b.conflicts.get
+        val (t, landed) = (thefts.get, theftsLanded.get)
+        val e          = errors.get
+        val idemOk     = ca == K && cb == K
+        val quotaOk    = aa <= maxAdmitted && ab <= maxAdmitted && aa + ab > maxAdmitted
+        val theftOk    = t > 0 && landed == 0
+        val pass       = idemOk && quotaOk && theftOk && conflicts == 0 && e == 0
+        val summary =
+          s"created A=$ca B=$cb (K=$K each), admitted A=$aa B=$ab (max $maxAdmitted each, ${aa + ab} together), stolen reconciles refused=${t - landed}/$t, conflicts=$conflicts, errors=$e"
+        val why =
+          if pass then summary
+          else
+            val cause =
+              if e > 0 then "errors"
+              else if !idemOk then "SHARED IDEMPOTENCY: each client must create its own K records"
+              else if aa > maxAdmitted || ab > maxAdmitted then "OVER-ADMISSION"
+              else if aa + ab <= maxAdmitted then "SHARED QUOTA or VACUOUS: together the clients never passed one limit"
+              else if landed > 0 then "CROSS-TENANT RECONCILE: B changed A's reservation"
+              else if t == 0 then "VACUOUS: A was never granted a reservation to steal"
+              else "conflicts"
+            s"$cause — $summary\n     Sample errors:\n${sampler.render}"
+        IO.pure(InvariantResult(pass, why))
+      }
 
   // ------------------------------------------------------------------
   // Latency scenario: fixed-RPS with HdrHistogram
@@ -1009,6 +1152,55 @@ object Http:
           case 429  => Right("exceeded")
           case 503  => Right("contended")
           case code => Left(s"HTTP $code: $body")
+      }
+    }.handleError(e => Left(e.getMessage))
+
+  /** Right((outcome, reservationId)); the ID is present when allowed. */
+  def sendQuotaCheckReserving(client: Client[IO], baseUrl: String, userId: String, estimatedInputTokens: Long, apiKey: String): IO[Either[String, (String, Option[String])]] =
+    val body = Json.obj("userId" := userId, "estimatedInputTokens" := estimatedInputTokens)
+    val req  = Request[IO](
+      method  = Method.POST,
+      uri     = Uri.unsafeFromString(s"$baseUrl/v1/quota/check"),
+      headers = Headers(
+        "Content-Type"  -> "application/json",
+        "Authorization" -> s"Bearer $apiKey",
+      ),
+    ).withEntity(body.noSpaces)
+
+    client.run(req).use { resp =>
+      resp.as[String].map { body =>
+        resp.status.code match
+          case 200 =>
+            io.circe.parser.parse(body).flatMap(_.hcursor.get[String]("reservationId"))
+              .left.map(e => s"200 without a reservationId: ${e.getMessage}")
+              .map(id => ("allowed", Some(id)))
+          case 429  => Right(("exceeded", None))
+          case 503  => Right(("contended", None))
+          case code => Left(s"HTTP $code: $body")
+      }
+    }.handleError(e => Left(e.getMessage))
+
+  /** Right(status) for the answers reconcile gives; Left for anything else. */
+  def sendQuotaReconcile(client: Client[IO], baseUrl: String, reservationId: String, actualInputTokens: Long, apiKey: String): IO[Either[String, Int]] =
+    val body = Json.obj(
+      "reservationId"      := reservationId,
+      "actualInputTokens"  := actualInputTokens,
+      "actualOutputTokens" := 0L,
+    )
+    val req = Request[IO](
+      method  = Method.POST,
+      uri     = Uri.unsafeFromString(s"$baseUrl/v1/quota/reconcile"),
+      headers = Headers(
+        "Content-Type"  -> "application/json",
+        "Authorization" -> s"Bearer $apiKey",
+      ),
+    ).withEntity(body.noSpaces)
+
+    client.run(req).use { resp =>
+      resp.as[String].map { body =>
+        resp.status.code match
+          case code @ (200 | 404 | 409 | 503) => Right(code)
+          case code                           => Left(s"HTTP $code: $body")
       }
     }.handleError(e => Left(e.getMessage))
 

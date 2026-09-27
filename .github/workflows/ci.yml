@@ -197,7 +197,7 @@ jobs:
           -H "Authorization: Bearer test-api-key" \
           -d '{"idempotencyKey": "smoke-idem-1", "ttl": 3600}' | tee /dev/stderr | grep -q '"status"'
 
-    - name: "Run correctness invariants (A: token-bucket non-over-issue, B: idempotency exactly-one-Created, C: quota non-over-admission)"
+    - name: "Run correctness invariants (A: token-bucket non-over-issue, B: idempotency exactly-one-Created, C: quota non-over-admission, D: cross-tenant isolation)"
       run: sbt "loadSim/run --scenario correctness"
 
     - name: Cleanup
