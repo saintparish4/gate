@@ -395,16 +395,15 @@ demo stack.
 
 ### In CI
 
-[`ci.yml`](.github/workflows/ci.yml) runs three jobs in sequence on every push
+[`ci.yml`](.github/workflows/ci.yml) runs three jobs in parallel on every push
 and pull request:
 
-1. **test** — the compose-versus-Terraform environment drift check first (it
-   needs only bash), then `scalafmtCheckAll`, compile, unit tests, and the
-   integration suite against TestContainers LocalStack.
-2. **smoke** — brings the compose stack up, waits for `/health`, and makes one
-   rate-limit and one idempotency call.
-3. **correctness** — brings the stack up, waits for `/ready`, and runs
-   `sbt "loadSim/run --scenario correctness"`. A violation fails the build.
+1. **unit** — the compose-versus-Terraform environment drift check first (it
+   needs only bash), then `scalafmtCheckAll`, compile, and unit tests.
+2. **integration** — the integration suite against TestContainers LocalStack.
+3. **correctness** — brings the compose stack up and waits for `/ready`. It
+   smoke-tests `/health`, one rate-limit call, and one idempotency call, then
+   runs `sbt "loadSim/run --scenario correctness"`. A violation fails the build.
 
 The correctness scenario warms the server for about 15 s, then asserts three
 invariants:
