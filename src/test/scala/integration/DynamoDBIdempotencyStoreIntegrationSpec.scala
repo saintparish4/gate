@@ -79,7 +79,8 @@ class DynamoDBIdempotencyStoreIntegrationSpec
           .check("response-key", clientId = "client-1", ttlSeconds = 3600)
 
         // Store the response
-        success <- store.storeResponse("response-key", storedResponse)
+        success <- store
+          .storeResponse("response-key", "client-1", storedResponse)
 
         // Second request - should get cached response
         result <- store
@@ -166,7 +167,7 @@ class DynamoDBIdempotencyStoreIntegrationSpec
 
       val test = for {
         _ <- store.check("complex-key", clientId = "client-1", ttlSeconds = 3600)
-        _ <- store.storeResponse("complex-key", complexResponse)
+        _ <- store.storeResponse("complex-key", "client-1", complexResponse)
         result <- store
           .check("complex-key", clientId = "client-1", ttlSeconds = 3600)
       } yield result
@@ -261,6 +262,22 @@ class DynamoDBIdempotencyStoreIntegrationSpec
       test.asserting { case (newCount, conflictCount, inProgressCount) =>
         newCount shouldBe 1
         conflictCount + inProgressCount shouldBe 9
+      }
+    }
+
+    "storeResponse refuses a client other than the one that created the record" in {
+      // The condition behind scoped keys (ADR-005): reaching the row is not
+      // enough to complete it.
+      val forged = StoredResponse(200, "forged", Map.empty, Instant.now())
+      val test = for {
+        _ <- store.check("owned-key", clientId = "owner", ttlSeconds = 3600)
+        stored <- store.storeResponse("owned-key", "intruder", forged)
+        after <- store.check("owned-key", clientId = "owner", ttlSeconds = 3600)
+      } yield (stored, after)
+
+      test.asserting { case (stored, after) =>
+        stored shouldBe false
+        after shouldBe a[IdempotencyResult.InProgress]
       }
     }
   }

@@ -51,6 +51,7 @@ class IdempotencyApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
               )
             override def storeResponse(
                 idempotencyKey: String,
+                clientId: String,
                 response: StoredResponse,
             ): IO[Boolean] = IO.pure(false)
             override def markFailed(idempotencyKey: String): IO[Boolean] = IO
@@ -108,6 +109,7 @@ class IdempotencyApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
             )
             override def storeResponse(
                 idempotencyKey: String,
+                clientId: String,
                 response: StoredResponse,
             ): IO[Boolean] = IO.pure(false)
             override def markFailed(idempotencyKey: String): IO[Boolean] = IO
@@ -156,6 +158,7 @@ class IdempotencyApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
           ): IO[IdempotencyResult] = IO.raiseError(ex)
           override def storeResponse(
               idempotencyKey: String,
+              clientId: String,
               response: StoredResponse,
           ): IO[Boolean] = IO.raiseError(ex)
           override def markFailed(idempotencyKey: String): IO[Boolean] = IO

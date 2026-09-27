@@ -92,7 +92,8 @@ trait IdempotencyStore[F[_]]:
     * @param idempotencyKey
     *   Unique key for this operation
     * @param clientId
-    *   Client making the request (for audit/logging)
+    *   Client making the request. Recorded on the record, and `storeResponse`
+    *   only completes a record whose client matches.
     * @param ttlSeconds
     *   Time-to-live for the record
     * @param requestHash
@@ -112,16 +113,25 @@ trait IdempotencyStore[F[_]]:
   /** Store the response for a completed operation.
     *
     * Should only be called after check() returns New and the operation has
-    * completed successfully.
+    * completed successfully. Stores only when the record is Pending and was
+    * created by `clientId`. Keys are already scoped per client (ADR-005); this
+    * is the second guard, so a key-construction bug still cannot let one client
+    * complete another's record with a forged response.
     *
     * @param idempotencyKey
     *   The key from the original check
+    * @param clientId
+    *   The client completing it; must match the client that created it
     * @param response
     *   The response to store
     * @return
     *   true if stored successfully
     */
-  def storeResponse(idempotencyKey: String, response: StoredResponse): F[Boolean]
+  def storeResponse(
+      idempotencyKey: String,
+      clientId: String,
+      response: StoredResponse,
+  ): F[Boolean]
 
   /** Mark an operation as failed.
     *
@@ -254,6 +264,7 @@ object IdempotencyStore:
 
         override def storeResponse(
             idempotencyKey: String,
+            clientId: String,
             response: StoredResponse,
         ): F[Boolean] =
           for
@@ -261,7 +272,8 @@ object IdempotencyStore:
             result <- stateRef.modify(records =>
               records.get(idempotencyKey) match
                 case Some(existing)
-                    if existing.status == IdempotencyStatus.Pending =>
+                    if existing.status == IdempotencyStatus.Pending &&
+                      existing.clientId == clientId =>
                   val updated = existing.copy(
                     status = IdempotencyStatus.Completed,
                     response = Some(response),

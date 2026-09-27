@@ -25,8 +25,10 @@ import DynamoDBOps.*
   * instance processes a request with a given idempotency key.
   *
   * Table Schema:
-  *   - pk (S): Partition key - "idempotency#<key>"
-  *   - clientId (S): Client making the request
+  *   - pk (S): Partition key - "idempotency#<key>", where the key is already
+  *     scoped to the client by core.TenantKey (ADR-005)
+  *   - clientId (S): Client that created the record; completing it requires the
+  *     same client
   *   - status (S): Pending | Completed | Failed
   *   - response (S): JSON-encoded response (if completed)
   *   - createdAt (N): Creation timestamp
@@ -128,6 +130,7 @@ class DynamoDBIdempotencyStore[F[_]: Async](
 
   override def storeResponse(
       idempotencyKey: String,
+      clientId: String,
       response: StoredResponse,
   ): F[Boolean] =
     for
@@ -137,12 +140,14 @@ class DynamoDBIdempotencyStore[F[_]: Async](
         .key(Map("pk" -> attr(s"idempotency#$idempotencyKey")).asJava)
         .updateExpression(
           "SET #status = :status, #response = :response, #updatedAt = :updatedAt, #version = #version + :one",
-        ).conditionExpression("#status = :pending").expressionAttributeNames(
+        ).conditionExpression("#status = :pending AND #clientId = :clientId")
+        .expressionAttributeNames(
           Map(
             "#status" -> "status",
             "#response" -> "response",
             "#updatedAt" -> "updatedAt",
             "#version" -> "version",
+            "#clientId" -> "clientId",
           ).asJava,
         ).expressionAttributeValues(
           Map(
@@ -151,6 +156,7 @@ class DynamoDBIdempotencyStore[F[_]: Async](
             ":updatedAt" -> attrN(now.toEpochMilli),
             ":pending" -> attr("Pending"),
             ":one" -> attrN(1),
+            ":clientId" -> attr(clientId),
           ).asJava,
         ).build()
 

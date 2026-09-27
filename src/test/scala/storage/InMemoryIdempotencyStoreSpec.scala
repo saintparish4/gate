@@ -64,7 +64,7 @@ class InMemoryIdempotencyStoreSpec
         store <- InMemoryIdempotencyStore.create[IO]
         _ <- store
           .check("response-key", clientId = "client-1", ttlSeconds = 3600)
-        success <- store.storeResponse("response-key", response)
+        success <- store.storeResponse("response-key", "client-1", response)
         result <- store
           .check("response-key", clientId = "client-1", ttlSeconds = 3600)
       } yield (success, result)
@@ -165,7 +165,7 @@ class InMemoryIdempotencyStoreSpec
           ttlSeconds = 3600,
           requestHash = Some("original-hash"),
         )
-        _ <- store.storeResponse("hash-complete-key", response)
+        _ <- store.storeResponse("hash-complete-key", "client-1", response)
         result <- store.check(
           "hash-complete-key",
           clientId = "client-1",
@@ -190,7 +190,7 @@ class InMemoryIdempotencyStoreSpec
           ttlSeconds = 3600,
           requestHash = Some("same-hash"),
         )
-        _ <- store.storeResponse("hash-match-key", response)
+        _ <- store.storeResponse("hash-match-key", "client-1", response)
         result <- store.check(
           "hash-match-key",
           clientId = "client-1",
@@ -234,4 +234,32 @@ class InMemoryIdempotencyStoreSpec
 
       test.asserting(healthy => healthy shouldBe Right(()))
     }
+  }
+
+  "storeResponse checks the client that created the record" - {
+    // The second guard behind scoped keys (ADR-005): a client that somehow
+    // reaches another's record still cannot complete it with a forged response.
+    val response = StoredResponse(200, "forged", Map.empty, Instant.now())
+
+    def refusesAnotherClient(
+        store: core.IdempotencyStore[IO],
+    ): IO[(Boolean, IdempotencyResult)] = for {
+      _ <- store.check("owned", clientId = "owner", ttlSeconds = 3600)
+      stored <- store.storeResponse("owned", "intruder", response)
+      after <- store.check("owned", clientId = "owner", ttlSeconds = 3600)
+    } yield (stored, after)
+
+    "in the test interpreter" in
+      InMemoryIdempotencyStore.create[IO].flatMap(refusesAnotherClient)
+        .asserting { case (stored, after) =>
+          stored shouldBe false
+          after shouldBe a[IdempotencyResult.InProgress]
+        }
+
+    "in core's interpreter" in
+      core.IdempotencyStore.inMemory[IO].flatMap(refusesAnotherClient).asserting {
+        case (stored, after) =>
+          stored shouldBe false
+          after shouldBe a[IdempotencyResult.InProgress]
+      }
   }

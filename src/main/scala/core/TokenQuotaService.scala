@@ -28,8 +28,11 @@ case class QuotaIdentifier(
 
 sealed trait QuotaDecision
 object QuotaDecision:
-  case class Available(remainingByLevel: Map[QuotaLevel, Long])
-      extends QuotaDecision
+  /** Admitted. `reservationId` names what was reserved; reconcile takes it. */
+  case class Available(
+      remainingByLevel: Map[QuotaLevel, Long],
+      reservationId: String,
+  ) extends QuotaDecision
 
   case class Exceeded(
       level: QuotaLevel,
@@ -45,11 +48,24 @@ object QuotaDecision:
 
 sealed trait ReconcileResult
 object ReconcileResult:
+  /** Applied, or already applied with the same actual usage. The deltas are
+    * actual minus the stored estimate.
+    */
   case class Reconciled(inputDelta: Long, outputDelta: Long)
       extends ReconcileResult
 
   /** The adjustment was not recorded; the caller should retry it. */
   case class Contended(attempts: Int) extends ReconcileResult
+
+  /** No such reservation for this client: unknown, expired, or another
+    * client's. The three are indistinguishable on purpose.
+    */
+  case object NotFound extends ReconcileResult
+
+  /** Already reconciled with different actual usage. A reservation reconciles
+    * once; a retry with the same usage gets `Reconciled` again.
+    */
+  case class Conflict(recorded: ReconciledUsage) extends ReconcileResult
 
 case class TokenQuotaState(
     inputTokens: Long,
@@ -101,6 +117,47 @@ object TokenQuotaState:
   */
 case class QuotaTarget(pk: String, windowSeconds: Long, limit: Option[Long])
 
+/** A counter a reservation was charged to, and the window it was charged in.
+  */
+case class ChargedTarget(pk: String, windowSeconds: Long, windowStart: Long)
+
+/** Actual usage a reservation was reconciled with. */
+case class ReconciledUsage(actualInput: Long, actualOutput: Long)
+
+/** What a quota check reserved, kept server-side so reconcile never trusts the
+  * caller's estimate. Reconcile used to take the estimate from the request, so
+  * a call with actual = 0 and a huge estimate zeroed the user, agent, and org
+  * counters. It now applies `actual - estimatedInput/Output` from this record,
+  * once.
+  */
+case class ReservationRecord(
+    pk: String,
+    targets: List[ChargedTarget],
+    estimatedInput: Long,
+    estimatedOutput: Long,
+    expiresAtSeconds: Long,
+    reconciled: Option[ReconciledUsage],
+):
+  def expired(nowMs: Long): Boolean = nowMs >= expiresAtSeconds * 1000
+
+/** Asks `reserve` to record a reservation at `pk` with the counters it writes.
+  */
+case class NewReservation(pk: String, expiresAtSeconds: Long):
+  def record(
+      planned: List[PlannedWrite],
+      estimatedInput: Long,
+      estimatedOutput: Long,
+  ): ReservationRecord = ReservationRecord(
+    pk,
+    planned.map(p =>
+      ChargedTarget(p.target.pk, p.target.windowSeconds, p.after.windowStart),
+    ),
+    estimatedInput,
+    estimatedOutput,
+    expiresAtSeconds,
+    reconciled = None,
+  )
+
 sealed trait ReserveOutcome
 object ReserveOutcome:
   /** Every target was written; states are keyed by target pk. */
@@ -113,6 +170,21 @@ object ReserveOutcome:
 
   /** Conditional writes kept losing; nothing was written. */
   case class Contended(attempts: Int) extends ReserveOutcome
+
+sealed trait ReconcileOutcome
+object ReconcileOutcome:
+  /** The counters were adjusted and `record` marked reconciled, atomically. */
+  case class Applied(record: ReservationRecord) extends ReconcileOutcome
+
+  /** Nothing was written; `record` was reconciled before. */
+  case class AlreadyReconciled(record: ReservationRecord)
+      extends ReconcileOutcome
+
+  /** No live reservation at that key. */
+  case object NotFound extends ReconcileOutcome
+
+  /** Conditional writes kept losing; nothing was written. */
+  case class Contended(attempts: Int) extends ReconcileOutcome
 
 /** One target's read state and the state a reservation would write. */
 case class PlannedWrite(
@@ -146,56 +218,156 @@ object QuotaReservation:
       else Right(PlannedWrite(t, before, after))
     }
 
+/** Pure reconciliation planning shared by every store implementation. */
+object QuotaReconciliation:
+  /** The counter writes that reconcile `record` with actual usage at `nowMs`.
+    *
+    * A counter still in the window the estimate was charged to gets
+    * `actual - estimate`, which may be negative. That can only give back this
+    * reservation's own charge, so the counter never drops below the usage
+    * recorded by everyone else. A counter whose window has rolled over never
+    * held this estimate, so it gets only the overage, never a refund. A refund
+    * there would erase other reservations' usage.
+    *
+    * Counters with nothing to apply are left out; the record is marked
+    * reconciled regardless.
+    */
+  def plan(
+      record: ReservationRecord,
+      current: Map[String, TokenQuotaState],
+      actualInput: Long,
+      actualOutput: Long,
+      nowMs: Long,
+  ): List[PlannedWrite] =
+    val inputDelta = actualInput - record.estimatedInput
+    val outputDelta = actualOutput - record.estimatedOutput
+    record.targets.flatMap { t =>
+      val before = current.get(t.pk)
+      val charged = before.exists(s =>
+        s.windowStart == t.windowStart &&
+          TokenQuotaState.inWindow(s, t.windowSeconds, nowMs),
+      )
+      val (in, out) =
+        if charged then (inputDelta, outputDelta)
+        else (math.max(0L, inputDelta), math.max(0L, outputDelta))
+      Option.when(in != 0 || out != 0)(PlannedWrite(
+        QuotaTarget(t.pk, t.windowSeconds, limit = None),
+        before,
+        TokenQuotaState.next(before, in, out, t.windowSeconds, nowMs),
+      ))
+    }
+
 trait TokenQuotaStore[F[_]]:
   def getQuota(pk: String): F[Option[TokenQuotaState]]
 
-  /** Applies the deltas to every target or to none of them. */
+  /** Applies the deltas to every target or to none of them. With a
+    * `reservation`, `Reserved` also means its record was written; if the record
+    * cannot be written, the counters are released and the outcome is
+    * `Contended`. So an admitted check always leaves something to reconcile.
+    */
   def reserve(
       targets: List[QuotaTarget],
       inputDelta: Long,
       outputDelta: Long,
       nowMs: Long,
+      reservation: Option[NewReservation] = None,
   ): F[ReserveOutcome]
+
+  /** Applies `QuotaReconciliation.plan` to the reservation at `reservationPk`
+    * and marks it reconciled, atomically and at most once.
+    */
+  def reconcile(
+      reservationPk: String,
+      actualInput: Long,
+      actualOutput: Long,
+      nowMs: Long,
+  ): F[ReconcileOutcome]
 
   def healthCheck: F[Either[String, Unit]]
 
 object TokenQuotaStore:
+  private case class Memory(
+      counters: Map[String, TokenQuotaState],
+      reservations: Map[String, ReservationRecord],
+  )
+
   def inMemory[F[_]: Async]: F[TokenQuotaStore[F]] = Ref
-    .of[F, Map[String, TokenQuotaState]](Map.empty).map { ref =>
+    .of[F, Memory](Memory(Map.empty, Map.empty)).map { ref =>
       new TokenQuotaStore[F]:
         override def getQuota(pk: String): F[Option[TokenQuotaState]] = ref.get
-          .map(_.get(pk))
+          .map(_.counters.get(pk))
 
         override def reserve(
             targets: List[QuotaTarget],
             inputDelta: Long,
             outputDelta: Long,
             nowMs: Long,
-        ): F[ReserveOutcome] = ref.modify(m =>
+            reservation: Option[NewReservation],
+        ): F[ReserveOutcome] = ref.modify { m =>
           QuotaReservation
-            .plan(targets, m, inputDelta, outputDelta, nowMs) match
+            .plan(targets, m.counters, inputDelta, outputDelta, nowMs) match
             case Left(exceeded) => (m, exceeded)
+            case Right(_)
+                if reservation.exists(r => m.reservations.contains(r.pk)) =>
+              (m, ReserveOutcome.Contended(1))
             case Right(planned) =>
               val written = planned.map(p => p.target.pk -> p.after).toMap
-              (m ++ written, ReserveOutcome.Reserved(written)),
-        )
+              val records = reservation
+                .map(r => r.pk -> r.record(planned, inputDelta, outputDelta))
+              (
+                Memory(m.counters ++ written, m.reservations ++ records),
+                ReserveOutcome.Reserved(written),
+              )
+        }
+
+        override def reconcile(
+            reservationPk: String,
+            actualInput: Long,
+            actualOutput: Long,
+            nowMs: Long,
+        ): F[ReconcileOutcome] = ref.modify { m =>
+          m.reservations.get(reservationPk).filterNot(_.expired(nowMs)) match
+            case None => (m, ReconcileOutcome.NotFound)
+            case Some(record) if record.reconciled.isDefined =>
+              (m, ReconcileOutcome.AlreadyReconciled(record))
+            case Some(record) =>
+              val planned = QuotaReconciliation
+                .plan(record, m.counters, actualInput, actualOutput, nowMs)
+              val done = record.copy(reconciled =
+                Some(ReconciledUsage(actualInput, actualOutput)),
+              )
+              (
+                Memory(
+                  m.counters ++ planned.map(p => p.target.pk -> p.after),
+                  m.reservations + (reservationPk -> done),
+                ),
+                ReconcileOutcome.Applied(done),
+              )
+        }
 
         override def healthCheck: F[Either[String, Unit]] = Async[F].pure(Right(()))
     }
 
+/** Quota checks and reconciliation. `clientId` scopes every counter (ADR-005):
+  * two clients naming the same user, agent, or org meter separate counters.
+  */
 trait TokenQuotaService[F[_]]:
   def checkQuota(
+      clientId: String,
       identifier: QuotaIdentifier,
       estimatedInputTokens: Long,
       estimatedOutputTokens: Long,
   ): F[QuotaDecision]
 
+  /** Reconciles the reservation `reservationId` made for `clientId` with actual
+    * usage. The estimate comes from the stored reservation, never from the
+    * caller.
+    */
   def reconcile(
-      identifier: QuotaIdentifier,
+      clientId: String,
+      reservationId: String,
       actualInputTokens: Long,
       actualOutputTokens: Long,
-      estimatedInputTokens: Long,
-      estimatedOutputTokens: Long,
   ): F[ReconcileResult]
 
 object TokenQuotaService:
@@ -209,13 +381,19 @@ object TokenQuotaService:
   ): TokenQuotaService[F] = new TokenQuotaService[F]:
 
     override def checkQuota(
+        clientId: String,
         identifier: QuotaIdentifier,
         estimatedInputTokens: Long,
         estimatedOutputTokens: Long,
     ): F[QuotaDecision] =
-      val levels = levelsFor(identifier)
+      val levels = levelsFor(clientId, identifier)
       for
         nowMs <- Clock[F].realTime.map(_.toMillis)
+        reservationId <- Async[F].delay(java.util.UUID.randomUUID().toString)
+        reservation = NewReservation(
+          reservationPk(clientId, reservationId),
+          nowMs / 1000 + config.reservationTtlSeconds,
+        )
         outcome <- metrics
           .timed("TokenQuotaStoreLatency", Map("operation" -> "quota_reserve"))(
             store.reserve(
@@ -223,13 +401,14 @@ object TokenQuotaService:
               estimatedInputTokens,
               estimatedOutputTokens,
               nowMs,
+              Some(reservation),
             ),
           )
         _ <- outcome match
           case ReserveOutcome.Reserved(_) =>
             recordAdmitted(levels, estimatedInputTokens + estimatedOutputTokens)
           case _ => Async[F].unit
-        decision <- toDecision(levels, outcome, nowMs)
+        decision <- toDecision(levels, outcome, nowMs, reservationId)
       yield decision
 
     private def recordAdmitted(levels: List[Level], tokens: Long): F[Unit] =
@@ -241,37 +420,56 @@ object TokenQuotaService:
         ),
       )
 
+    // Actual usage already happened, so the store records it even past the
+    // limit.
     override def reconcile(
-        identifier: QuotaIdentifier,
+        clientId: String,
+        reservationId: String,
         actualInputTokens: Long,
         actualOutputTokens: Long,
-        estimatedInputTokens: Long,
-        estimatedOutputTokens: Long,
     ): F[ReconcileResult] =
-      val inputDelta = actualInputTokens - estimatedInputTokens
-      val outputDelta = actualOutputTokens - estimatedOutputTokens
-      if inputDelta == 0 && outputDelta == 0 then
-        Async[F].pure(ReconcileResult.Reconciled(0, 0))
-      else
-        val levels = levelsFor(identifier)
-        // Actual usage already happened, so I record it even past the limit.
-        val unlimited = levels.map(_.target.copy(limit = None))
-        for
-          nowMs <- Clock[F].realTime.map(_.toMillis)
-          outcome <- store.reserve(unlimited, inputDelta, outputDelta, nowMs)
-          result <-
-            toReconcileResult(identifier, outcome, inputDelta, outputDelta)
-        yield result
+      val usage = ReconciledUsage(actualInputTokens, actualOutputTokens)
+      def deltas(record: ReservationRecord) = ReconcileResult.Reconciled(
+        actualInputTokens - record.estimatedInput,
+        actualOutputTokens - record.estimatedOutput,
+      )
+      for
+        nowMs <- Clock[F].realTime.map(_.toMillis)
+        outcome <- store.reconcile(
+          reservationPk(clientId, reservationId),
+          actualInputTokens,
+          actualOutputTokens,
+          nowMs,
+        )
+        result <- outcome match
+          case ReconcileOutcome.Applied(record) => Async[F].pure(deltas(record))
+          // A retry after a lost response: same usage, same answer, nothing
+          // applied twice.
+          case ReconcileOutcome.AlreadyReconciled(record)
+              if record.reconciled.contains(usage) =>
+            Async[F].pure(deltas(record))
+          case ReconcileOutcome.AlreadyReconciled(record) => metrics
+              .increment("TokenQuotaReconcileConflict") *> Async[F].pure(
+              ReconcileResult.Conflict(record.reconciled.getOrElse(usage)),
+            )
+          case ReconcileOutcome.NotFound => Async[F]
+              .pure(ReconcileResult.NotFound)
+          case ReconcileOutcome.Contended(attempts) => metrics
+              .increment("TokenQuotaReconcileFailed") *>
+              logger.warn(s"Quota reconciliation of $reservationId lost $attempts conditional writes; usage not recorded")
+                .as(ReconcileResult.Contended(attempts))
+      yield result
 
     private def toDecision(
         levels: List[Level],
         outcome: ReserveOutcome,
         nowMs: Long,
+        reservationId: String,
     ): F[QuotaDecision] = outcome match
       case ReserveOutcome.Reserved(states) =>
         val remaining = levels
           .map(l => l.level -> (l.limit - states(l.target.pk).totalTokens))
-        Async[F].pure(QuotaDecision.Available(remaining.toMap))
+        Async[F].pure(QuotaDecision.Available(remaining.toMap, reservationId))
 
       case ReserveOutcome.LimitExceeded(pk, used, windowStart) =>
         levelFor(levels, pk).flatMap { l =>
@@ -289,26 +487,6 @@ object TokenQuotaService:
           logger.warn(s"Quota reservation lost $attempts conditional writes; nothing reserved")
             .as(QuotaDecision.Contended(attempts))
 
-    private def toReconcileResult(
-        identifier: QuotaIdentifier,
-        outcome: ReserveOutcome,
-        inputDelta: Long,
-        outputDelta: Long,
-    ): F[ReconcileResult] = outcome match
-      case ReserveOutcome.Reserved(_) => Async[F]
-          .pure(ReconcileResult.Reconciled(inputDelta, outputDelta))
-
-      case ReserveOutcome.Contended(attempts) => metrics
-          .increment("TokenQuotaReconcileFailed") *>
-          logger.warn(s"Quota reconciliation for ${identifier
-              .userId} lost $attempts conditional writes; usage not recorded")
-            .as(ReconcileResult.Contended(attempts))
-
-      case ReserveOutcome.LimitExceeded(pk, _, _) => Async[F]
-          .raiseError(new IllegalStateException(
-            s"Unlimited reservation on $pk reported a limit",
-          ))
-
     private def levelFor(levels: List[Level], pk: String): F[Level] =
       levels.find(_.target.pk == pk) match
         case Some(l) => Async[F].pure(l)
@@ -316,8 +494,14 @@ object TokenQuotaService:
             s"Store reported unknown quota target $pk",
           ))
 
-    private def levelsFor(id: QuotaIdentifier): List[Level] =
+    // Scoped like every other key (ADR-005): another client's reservation ID
+    // finds nothing.
+    private def reservationPk(clientId: String, reservationId: String): String =
+      s"reservation:${TenantKey(clientId, reservationId)}"
+
+    private def levelsFor(clientId: String, id: QuotaIdentifier): List[Level] =
       val user = mkLevel(
+        clientId,
         QuotaLevel.User,
         id.userId,
         config.userLimit,
@@ -325,14 +509,27 @@ object TokenQuotaService:
       )
       val agent = id.agentId.map { aid =>
         val limit = math.min(config.agentLimit, (config.userLimit * 0.8).toLong)
-        mkLevel(QuotaLevel.Agent, aid, limit, config.agentWindowSeconds)
+        mkLevel(
+          clientId,
+          QuotaLevel.Agent,
+          aid,
+          limit,
+          config.agentWindowSeconds,
+        )
       }
       val org = id.orgId.map(oid =>
-        mkLevel(QuotaLevel.Org, oid, config.orgLimit, config.orgWindowSeconds),
+        mkLevel(
+          clientId,
+          QuotaLevel.Org,
+          oid,
+          config.orgLimit,
+          config.orgWindowSeconds,
+        ),
       )
       user :: agent.toList ::: org.toList
 
     private def mkLevel(
+        clientId: String,
         l: QuotaLevel,
         id: String,
         limit: Long,
@@ -340,7 +537,11 @@ object TokenQuotaService:
     ): Level = Level(
       l,
       limit,
-      QuotaTarget(s"${l.prefix}:$id:${windowSec}s", windowSec, Some(limit)),
+      QuotaTarget(
+        s"${l.prefix}:${TenantKey(clientId, id)}:${windowSec}s",
+        windowSec,
+        Some(limit),
+      ),
     )
 
     private def secondsUntilReset(

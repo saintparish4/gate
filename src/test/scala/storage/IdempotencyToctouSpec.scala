@@ -54,8 +54,9 @@ class IdempotencyToctouSpec
               )
             override def storeResponse(
                 key: String,
+                clientId: String,
                 response: StoredResponse,
-            ): IO[Boolean] = delegateStore.storeResponse(key, response)
+            ): IO[Boolean] = delegateStore.storeResponse(key, clientId, response)
             override def markFailed(key: String): IO[Boolean] = delegateStore
               .markFailed(key)
             override def get(key: String): IO[Option[IdempotencyRecord]] =

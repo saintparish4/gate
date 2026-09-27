@@ -48,8 +48,10 @@ class TokenQuotaApi[F[_]: Async: Tracer](
 
   /** POST /v1/quota/reconcile
     *
-    * Post-LLM-call: replace the estimate with actual usage. Actual usage is
-    * recorded even when it lands past the limit.
+    * Post-LLM-call: replace the reservation's estimate with actual usage.
+    * Actual usage is recorded even when it lands past the limit. The estimate
+    * comes from the reservation the check stored, never from the request: a
+    * request carrying its own estimate could zero every counter.
     */
   def reconcile(
       request: Request[F],
@@ -58,12 +60,9 @@ class TokenQuotaApi[F[_]: Async: Tracer](
     for
       startTime <- Clock[F].realTime.map(_.toMillis)
       req <- request.as[TokenQuotaReconcileRequest]
-      response <- nonNegative(
-        req.actualInputTokens,
-        req.actualOutputTokens,
-        req.estimatedInputTokens,
-        req.estimatedOutputTokens,
-      )("token counts must be non-negative")(runReconcile(req, startTime))
+      response <- nonNegative(req.actualInputTokens, req.actualOutputTokens)(
+        "token counts must be non-negative",
+      )(runReconcile(req, client, startTime))
     yield response
 
   private def runCheck(
@@ -74,6 +73,7 @@ class TokenQuotaApi[F[_]: Async: Tracer](
     val identifier = QuotaIdentifier(req.userId, req.agentId, req.orgId)
     for
       decision <- TracingMiddleware.traced("checkQuota")(quotaService.checkQuota(
+        client.clientId,
         identifier,
         req.estimatedInputTokens,
         req.estimatedOutputTokens,
@@ -88,21 +88,20 @@ class TokenQuotaApi[F[_]: Async: Tracer](
 
   private def runReconcile(
       req: TokenQuotaReconcileRequest,
+      client: AuthenticatedClient,
       startTime: Long,
   ): F[Response[F]] =
-    val identifier = QuotaIdentifier(req.userId, req.agentId, req.orgId)
     for
       result <- quotaService.reconcile(
-        identifier,
+        client.clientId,
+        req.reservationId,
         req.actualInputTokens,
         req.actualOutputTokens,
-        req.estimatedInputTokens,
-        req.estimatedOutputTokens,
       )
       latency <- Clock[F].realTime.map(_.toMillis - startTime)
       _ <- metricsPublisher
         .recordLatency("token_quota_reconcile", latency.toDouble)
-      resp <- buildReconcileResponse(result, req)
+      resp <- buildReconcileResponse(result)
     yield resp
 
   private def nonNegative(
@@ -117,13 +116,14 @@ class TokenQuotaApi[F[_]: Async: Tracer](
 
   private def buildCheckResponse(decision: QuotaDecision): F[Response[F]] =
     decision match
-      case QuotaDecision.Available(remaining) => Ok(
+      case QuotaDecision.Available(remaining, reservationId) => Ok(
           TokenQuotaCheckResponse(
             allowed = true,
             remainingTokens = remaining
               .map { case (level, rem) => level.prefix -> rem },
             exceededLevel = None,
             retryAfter = None,
+            reservationId = Some(reservationId),
           ).asJson,
         )
       case QuotaDecision.Exceeded(level, limit, used, retryAfter) =>
@@ -148,21 +148,31 @@ class TokenQuotaApi[F[_]: Async: Tracer](
           ).asJson,
         ).map(withRetryAfter(ContendedRetryAfterSeconds))
 
-  private def buildReconcileResponse(
-      result: ReconcileResult,
-      req: TokenQuotaReconcileRequest,
-  ): F[Response[F]] = result match
-    case ReconcileResult.Reconciled(inputDelta, outputDelta) => Ok(
-        TokenQuotaReconcileResponse("reconciled", inputDelta, outputDelta)
-          .asJson,
-      )
-    case ReconcileResult.Contended(_) => ServiceUnavailable(
-        TokenQuotaReconcileResponse(
-          status = "contended",
-          inputDelta = req.actualInputTokens - req.estimatedInputTokens,
-          outputDelta = req.actualOutputTokens - req.estimatedOutputTokens,
-        ).asJson,
-      ).map(withRetryAfter(ContendedRetryAfterSeconds))
+  private def buildReconcileResponse(result: ReconcileResult): F[Response[F]] =
+    result match
+      case ReconcileResult.Reconciled(inputDelta, outputDelta) => Ok(
+          TokenQuotaReconcileResponse("reconciled", inputDelta, outputDelta)
+            .asJson,
+        )
+      case ReconcileResult.NotFound => NotFound(io.circe.Json.obj(
+          "error" -> io.circe.Json.fromString("reservation_not_found"),
+          "message" ->
+            io.circe.Json.fromString("No live reservation with this ID for this key: unknown, expired, or another client's"),
+        ))
+      case ReconcileResult.Conflict(recorded) => Conflict(io.circe.Json.obj(
+          "error" -> io.circe.Json.fromString("already_reconciled"),
+          "message" ->
+            io.circe.Json
+              .fromString(s"Reservation already reconciled with ${recorded
+                  .actualInput} input and ${recorded
+                  .actualOutput} output tokens"),
+        ))
+      case ReconcileResult.Contended(attempts) =>
+        ServiceUnavailable(io.circe.Json.obj(
+          "error" -> io.circe.Json.fromString("contended"),
+          "message" ->
+            io.circe.Json.fromString(s"reconciliation contended after $attempts attempts; nothing was recorded, retry shortly"),
+        )).map(withRetryAfter(ContendedRetryAfterSeconds))
 
   private def withRetryAfter(seconds: Int)(resp: Response[F]): Response[F] =
     resp.putHeaders(Header.Raw(ci"Retry-After", seconds.toString))
@@ -251,16 +261,16 @@ case class TokenQuotaCheckResponse(
     exceededLevel: Option[String] = None,
     retryAfter: Option[Int] = None,
     message: Option[String] = None,
+    // Present when allowed; reconcile takes it.
+    reservationId: Option[String] = None,
 )
 
+// The estimate is not part of the request: reconcile reads it from the
+// reservation. The fields that used to carry it are ignored if sent.
 case class TokenQuotaReconcileRequest(
-    userId: String,
-    agentId: Option[String] = None,
-    orgId: Option[String] = None,
+    reservationId: String,
     actualInputTokens: Long,
     actualOutputTokens: Long,
-    estimatedInputTokens: Long,
-    estimatedOutputTokens: Long,
 )
 
 case class TokenQuotaReconcileResponse(

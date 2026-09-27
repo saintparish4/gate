@@ -297,6 +297,8 @@ curl -X POST http://localhost:8080/v1/idempotency/payment:abc-123/complete \
 
 Token quotas cap LLM token consumption per user, per agent, and per org. A check reserves the estimated tokens at every level named in the request in **one atomic write**; if any level would overflow, nothing is reserved anywhere. Both endpoints exist only when `TOKEN_QUOTA_ENABLED=true`; otherwise they return `404`.
 
+Counters are scoped to the API key's client: two clients naming the same `userId`, `agentId`, or `orgId` meter separate counters ([ADR-005](adr/005-tenant-namespaced-storage-keys.md)).
+
 **Window semantics:** each counter's window starts on its first use and lasts `TOKEN_QUOTA_<LEVEL>_WINDOW` seconds (defaults: user 1 h, agent 1 h, org 24 h). When a window lapses the counter starts over on the next request. The agent level is capped at the smaller of `TOKEN_QUOTA_AGENT_LIMIT` and 80% of the user limit.
 
 ### Check Token Quota
@@ -332,11 +334,12 @@ Reserves the estimated tokens before the LLM call.
   "allowed": true,
   "remainingTokens": { "user": 998400, "agent": 498400, "org": 9998400 },
   "exceededLevel": null,
-  "retryAfter": null
+  "retryAfter": null,
+  "reservationId": "5f0c2a6e-8a53-4c43-9f53-8f0d7e1f3b0a"
 }
 ```
 
-`remainingTokens` is what is left at each requested level *after* this reservation.
+`remainingTokens` is what is left at each requested level *after* this reservation. `reservationId` names the reservation; pass it to `/reconcile`. The server keeps the estimate with it for `TOKEN_QUOTA_RESERVATION_TTL_SECONDS` (default 1 h).
 
 **Exceeded Response (429):**
 
@@ -389,20 +392,18 @@ curl -X POST http://localhost:8080/v1/quota/check \
 
 ### Reconcile Token Usage
 
-After the LLM responds, replaces the estimate with actual usage. The difference (`actual − estimated`, per direction) is applied to every level named in the request in one atomic write. Actual usage is recorded even when it lands past the limit; the next check for that identity is then rejected until the window resets.
+After the LLM responds, replaces a reservation's estimate with actual usage. The difference (`actual − estimated`, per direction) is applied to every level the check reserved, in one atomic write with marking the reservation reconciled. The estimate is the one stored with the reservation, never a value from the request, so a reconcile can only give back its own reservation's charge. Actual usage is recorded even when it lands past the limit; the next check for that identity is then rejected until the window resets.
+
+A reservation reconciles **once**. Sending the same actual usage again returns the same `200` and changes nothing, so a retry after a lost response is safe; different usage returns `409`. If a level's window has rolled over since the check, the estimate was never charged to the new window, so that level only records usage above the estimate and never refunds.
 
 **Endpoint:** `POST /v1/quota/reconcile`
 
 **Request:**
 ```json
 {
-  "userId": "user:alice",
-  "agentId": "agent:planner",
-  "orgId": "org:acme",
+  "reservationId": "5f0c2a6e-8a53-4c43-9f53-8f0d7e1f3b0a",
   "actualInputTokens": 1000,
-  "actualOutputTokens": 550,
-  "estimatedInputTokens": 1200,
-  "estimatedOutputTokens": 400
+  "actualOutputTokens": 550
 }
 ```
 
@@ -410,27 +411,37 @@ After the LLM responds, replaces the estimate with actual usage. The difference 
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `userId` | string | Yes | Same identity the check used |
-| `agentId` | string | No | Same as the check, if it was given |
-| `orgId` | string | No | Same as the check, if it was given |
+| `reservationId` | string | Yes | From the check's `200` response |
 | `actualInputTokens` | integer | Yes | Prompt tokens the provider billed (≥ 0) |
 | `actualOutputTokens` | integer | Yes | Completion tokens the provider billed (≥ 0) |
-| `estimatedInputTokens` | integer | Yes | The value sent to `/check` (≥ 0) |
-| `estimatedOutputTokens` | integer | Yes | The value sent to `/check` (≥ 0) |
+
+Earlier versions took `userId`, `agentId`, `orgId`, and the estimates here. Those fields are now ignored; a request without `reservationId` answers `422`.
 
 **Reconciled Response (200):**
 ```json
 { "status": "reconciled", "inputDelta": -200, "outputDelta": 150 }
 ```
 
-A reconcile whose deltas are both zero changes nothing and still returns `200`.
+The deltas are `actual − estimated` against the stored estimate.
+
+**Not Found (404):**
+```json
+{ "error": "reservation_not_found", "message": "No live reservation with this ID for this key: unknown, expired, or another client's" }
+```
+
+The three cases are deliberately indistinguishable. Nothing was written, and the estimate stays counted.
+
+**Already Reconciled (409):**
+```json
+{ "error": "already_reconciled", "message": "Reservation already reconciled with 1000 input and 550 output tokens" }
+```
 
 **Contended Response (503):**
 
 Headers: `Retry-After: 1`
 
 ```json
-{ "status": "contended", "inputDelta": -200, "outputDelta": 150 }
+{ "error": "contended", "message": "reconciliation contended after 25 attempts; nothing was recorded, retry shortly" }
 ```
 
 The adjustment was **not** recorded; send the same request again.
@@ -441,12 +452,9 @@ curl -X POST http://localhost:8080/v1/quota/reconcile \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer test-api-key" \
   -d '{
-    "userId": "user:alice",
-    "orgId": "org:acme",
+    "reservationId": "5f0c2a6e-8a53-4c43-9f53-8f0d7e1f3b0a",
     "actualInputTokens": 1000,
-    "actualOutputTokens": 550,
-    "estimatedInputTokens": 1200,
-    "estimatedOutputTokens": 400
+    "actualOutputTokens": 550
   }'
 ```
 

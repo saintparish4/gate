@@ -148,6 +148,7 @@ case class TokenQuotaConfig(
     agentWindowSeconds: Long = 3600,
     orgLimit: Long = 10_000_000,
     orgWindowSeconds: Long = 86400,
+    reservationTtlSeconds: Long = 3600,
 ) derives ConfigReader
 // Resilience configuration
 case class CircuitBreakerConfig(
