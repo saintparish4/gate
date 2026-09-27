@@ -104,6 +104,16 @@ class HttpApiIntegrationSpec
         tier = ClientTier.Enterprise,
         permissions = Permission.admin,
       ),
+    ) ++ Permission.standard.map(missing =>
+      // Every standard permission but one, so a refusal can only come from
+      // the route's own check.
+      s"lacks-$missing" -> AuthenticatedClient(
+        apiKeyId = s"lacks-$missing",
+        clientId = s"lacks-$missing",
+        clientName = s"Lacks $missing",
+        tier = ClientTier.Free,
+        permissions = Permission.standard - missing,
+      ),
     )
   }
 
@@ -572,6 +582,54 @@ class HttpApiIntegrationSpec
 
     "an unknown profile is 400" in httpApp.run(checkNaming("gold", "test-key"))
       .asserting(_.status shouldBe Status.BadRequest)
+
+    // Only /metrics used to check a permission, so a key's grants decided
+    // nothing on these routes, and quota and complete had no permission to
+    // grant. Each route must refuse exactly the key that lacks its own.
+    def jsonPost(path: Uri, body: String): Request[IO] =
+      Request[IO](Method.POST, path).withEntity(body)
+        .putHeaders(headers.`Content-Type`(MediaType.application.json))
+
+    val guarded: List[(Permission, Request[IO])] = List(
+      Permission.RateLimitCheck ->
+        jsonPost(uri"/v1/ratelimit/check", """{"key": "perm-guard"}"""),
+      Permission.RateLimitStatus ->
+        Request[IO](Method.GET, uri"/v1/ratelimit/status/perm-guard"),
+      Permission.IdempotencyCheck -> jsonPost(
+        uri"/v1/idempotency/check",
+        """{"idempotencyKey": "perm-guard"}""",
+      ),
+      Permission.IdempotencyComplete -> jsonPost(
+        uri"/v1/idempotency/perm-guard/complete",
+        """{"statusCode": 200, "body": "{}"}""",
+      ),
+      Permission.QuotaCheck -> jsonPost(
+        uri"/v1/quota/check",
+        """{"userId": "perm-guard", "estimatedInputTokens": 1}""",
+      ),
+      Permission.QuotaReconcile -> jsonPost(
+        uri"/v1/quota/reconcile",
+        """{"userId": "perm-guard", "actualInputTokens": 1, "actualOutputTokens": 0, "estimatedInputTokens": 1, "estimatedOutputTokens": 0}""",
+      ),
+    )
+
+    "every standard permission guards a route" in
+      IO(guarded.map(_._1).toSet shouldBe Permission.standard)
+
+    guarded.foreach { case (permission, request) =>
+      s"${request.method} ${request
+          .uri} is 403 without $permission and served with it" in {
+        for {
+          refused <- httpApp.run(withKey(request, s"lacks-$permission"))
+          body <- refused.as[String]
+          served <- httpApp.run(withKey(request, "test-key"))
+        } yield {
+          refused.status shouldBe Status.Forbidden
+          body should include(permission.toString)
+          served.status should not be Status.Forbidden
+        }
+      }
+    }
 
     "GET /metrics without a key is 401" in metrics(None)
       .asserting(_.status shouldBe Status.Unauthorized)

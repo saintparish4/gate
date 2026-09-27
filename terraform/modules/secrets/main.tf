@@ -33,14 +33,19 @@ resource "aws_secretsmanager_secret" "api_keys" {
 resource "aws_secretsmanager_secret_version" "api_keys_initial" {
   secret_id = aws_secretsmanager_secret.api_keys.id
   
-  # Initial placeholder - should be updated via CI/CD or manually
+  # An inactive placeholder. The app refuses to start until the secret holds at
+  # least one active key, so write real keys before the service's first task
+  # starts. scripts/deploy-demo.sh does that for the demo.
   secret_string = jsonencode([
     {
       apiKey      = "REPLACE_WITH_ACTUAL_KEY_1"
       apiKeyId    = "key_001"
       clientName  = "Default Client"
       tier        = "basic"
-      permissions = ["ratelimit_check", "ratelimit_status", "idempotency_check"]
+      permissions = [
+        "ratelimit_check", "ratelimit_status", "idempotency_check",
+        "idempotency_complete", "quota_check", "quota_reconcile",
+      ]
       active      = false
     }
   ])

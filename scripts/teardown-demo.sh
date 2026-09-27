@@ -48,6 +48,9 @@ if [ -n "$REMAINING" ]; then
   exit 1
 fi
 
+# The keys died with their secret, and the next deploy writes new ones.
+rm -f "$TF_DIR/../.demo-keys.env"
+
 echo
 if [ "$DESTROY_STATUS" -ne 0 ]; then
   echo "terraform destroy exited $DESTROY_STATUS, but Terraform state is empty."

@@ -84,11 +84,10 @@ case class TracingConfig(
     exporterEndpoint: String = "http://localhost:4317",
 ) derives ConfigReader
 
-// Security configuration
+// Security configuration. `enabled`, `header-name` and `api-key-prefix` used to
+// sit here too: nothing read them, auth was always on, and the headers were
+// hard-coded, so each one was a switch that did nothing.
 case class AuthenticationConfig(
-    enabled: Boolean = true,
-    headerName: String = "Authorization",
-    apiKeyPrefix: String = "Bearer",
     rateLimitPerMinute: Int = 1000,
     maxFailedAttempts: Int = 10,
 ) derives ConfigReader
@@ -104,6 +103,7 @@ case class SecretsConfig(
 case class SecurityConfig(
     authentication: AuthenticationConfig,
     secrets: SecretsConfig,
+    allowBuiltInKeys: Boolean = false,
 ) derives ConfigReader
 
 // Rate limiting profile
@@ -298,6 +298,18 @@ object AppConfig:
             .toList.sorted.mkString(", ")}",
       )
 
+  /** The built-in keys are public and include an admin key. Secrets Manager
+    * defaulted off, so every Terraform deploy served them on a public ALB. They
+    * now need an explicit flag, which only docker-compose and `make run` set.
+    *
+    * @return
+    *   Some(message) when the service has no key source it may use.
+    */
+  def validateKeySource(security: SecurityConfig): Option[String] =
+    if security.secrets.enabled || security.allowBuiltInKeys then None
+    else
+      Some("no API key source: set SECRETS_MANAGER_ENABLED=true to load keys from Secrets Manager, or ALLOW_BUILT_IN_KEYS=true for local development only (the built-in keys are public and include an admin key)")
+
   /** Every rule `load` enforces beyond what the types already do. */
   def validate(config: AppConfig): List[String] =
     val profileErrors = config.rateLimit.profiles.toList
@@ -311,7 +323,8 @@ object AppConfig:
       else Nil
     val degradationErrors =
       validateDegradationMode(config.resilience.degradationMode).toList
-    profileErrors ++ quotaErrors ++ degradationErrors
+    val keySourceErrors = validateKeySource(config.security).toList
+    profileErrors ++ quotaErrors ++ degradationErrors ++ keySourceErrors
 
   /** Load and validate, failing on any error.
     *

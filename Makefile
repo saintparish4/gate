@@ -5,7 +5,11 @@
 COMPOSE ?= docker compose
 APP_URL ?= http://localhost:8080
 LOCALSTACK_URL ?= http://localhost:4566
+# The built-in development keys. Against a deployed stack, which refuses them,
+# `source .demo-keys.env` first: deploy-demo.sh writes the demo's keys there.
 API_KEY ?= test-api-key
+# A Free-tier key; invariant A drains its 20-token bucket.
+FREE_API_KEY ?= free-api-key
 # Holds AdminMetrics; invariant A reads /metrics with it.
 ADMIN_API_KEY ?= admin-api-key
 
@@ -74,6 +78,7 @@ run: ## Run the app with sbt against a running LocalStack
 	AWS_ACCESS_KEY_ID=test \
 	AWS_SECRET_ACCESS_KEY=test \
 	AWS_REGION=us-east-1 \
+	ALLOW_BUILT_IN_KEYS=true \
 	sbt run
 
 dev: up run ## Start LocalStack, then run the app with sbt
@@ -96,7 +101,7 @@ test-all: test test-it ## Run unit and integration tests
 
 correctness: ## Check the correctness invariants (APP_URL=... to target a deployed stack)
 	$(NEED_SBT)
-	sbt "loadSim/run --scenario correctness --url $(APP_URL) --admin-key $(ADMIN_API_KEY)"
+	sbt "loadSim/run --scenario correctness --url $(APP_URL) --api-key $(API_KEY) --free-key $(FREE_API_KEY) --admin-key $(ADMIN_API_KEY)"
 
 ##@ Probes
 

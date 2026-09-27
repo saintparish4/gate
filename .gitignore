@@ -55,6 +55,8 @@ book/
 .env
 .env.local
 .env.*.local
+# Demo API keys written by scripts/deploy-demo.sh
+.demo-keys.env
 
 **/.terraform/*
 

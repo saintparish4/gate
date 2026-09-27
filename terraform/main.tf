@@ -146,11 +146,15 @@ module "ecs" {
     # I set this explicitly: application.conf defaults it off, and without it
     # /v1/quota/check answers 404 even though its table and IAM are provisioned.
     TOKEN_QUOTA_ENABLED = "true"
-    # These three compose the Secrets Manager lookup key and must agree with the
-    # secret's name in modules/secrets/main.tf. SECRETS_ENABLED/SECRETS_MANAGER
-    # naming matters: the app reads SECRETS_MANAGER_ENABLED, and the previous
+    # Always on. It was a variable defaulting to false, so every deploy served
+    # the public built-in keys, admin included, on a public ALB. The app now
+    # refuses those keys unless ALLOW_BUILT_IN_KEYS is set, which Terraform never
+    # sets, so "false" here could only produce a task that refuses to start.
+    # The name matters: the app reads SECRETS_MANAGER_ENABLED, and an earlier
     # SECRETS_ENABLED was silently ignored.
-    SECRETS_MANAGER_ENABLED = var.enable_secrets_manager ? "true" : "false"
+    SECRETS_MANAGER_ENABLED = "true"
+    # These three compose the Secrets Manager lookup key and must agree with the
+    # secret's name in modules/secrets/main.tf.
     SECRETS_PREFIX          = var.project_name
     SECRETS_ENVIRONMENT     = var.environment
     API_KEYS_SECRET_NAME    = "api-keys"

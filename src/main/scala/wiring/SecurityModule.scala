@@ -18,8 +18,8 @@ object SecurityModule:
       config: AppConfig,
   ): Resource[F, SecurityModule[F]] =
     for
-      apiKeyStore <- config.security.secrets.enabled match
-        case true =>
+      apiKeyStore <- config.security match
+        case security if security.secrets.enabled =>
           for
             secretsClient <- SecretsManagerStore.clientResource[F](config.aws)
             secretsConfig = SecretsConfig(
@@ -35,9 +35,19 @@ object SecurityModule:
               config.security.secrets.cacheTtl,
             ))
           yield store
-        case false => Resource.pure[F, ApiKeyStore[F]](
-            ApiKeyStore.inMemory[F](ApiKeyStore.testKeys),
+        case security if security.allowBuiltInKeys =>
+          Resource.eval(
+            Logger[F].warn("Serving the built-in API keys (ALLOW_BUILT_IN_KEYS=true). They are public and include an admin key: local development only.")
+              .as(ApiKeyStore.inMemory[F](ApiKeyStore.testKeys)),
           )
+        // AppConfig.validate already refuses this. I check again here because
+        // this is where the keys are chosen, and a config built in code skips
+        // validate.
+        case security => Resource
+            .raiseError[F, ApiKeyStore[F], Throwable](new IllegalStateException(
+              AppConfig.validateKeySource(security)
+                .getOrElse("no API key source"),
+            ))
 
       authRateLimiter <- Resource.eval(AuthRateLimiter.inMemory[F](
         maxRequestsPerMinute = config.security.authentication.rateLimitPerMinute,
