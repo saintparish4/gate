@@ -68,9 +68,12 @@ class RateLimitApi[F[_]: Async: Tracer](
     for
       _ <- logger.debug(s"Rate limit check: key=${checkReq.key}, cost=${checkReq
           .cost}, tier=${client.tier}")
-      decision <- TracingMiddleware.traced("checkAndConsume")(
-        store.checkAndConsume(checkReq.key, checkReq.cost, profile),
-      )
+      decision <- TracingMiddleware
+        .traced("checkAndConsume")(store.checkAndConsume(
+          TenantKey(client.clientId, checkReq.key),
+          checkReq.cost,
+          profile,
+        ))
 
       // Record metrics
       latency <- Clock[F].realTime.map(_.toMillis - startTime)
@@ -115,12 +118,13 @@ class RateLimitApi[F[_]: Async: Tracer](
 
   /** GET /v1/ratelimit/status/:key
     *
-    * Get current rate limit status for a key.
+    * Get current rate limit status for a key. Like check, it reads the caller's
+    * own bucket: another client's use of the same key is invisible.
     */
   def status(key: String, client: AuthenticatedClient): F[Response[F]] =
     val profile = RateLimitApi.tierProfile(config, client.tier)
     for
-      maybeStatus <- store.getStatus(key, profile)
+      maybeStatus <- store.getStatus(TenantKey(client.clientId, key), profile)
       nowMs <- Clock[F].realTime.map(_.toMillis)
       response <- maybeStatus match
         case Some(state) =>

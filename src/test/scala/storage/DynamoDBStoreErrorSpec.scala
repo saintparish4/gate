@@ -255,8 +255,11 @@ class DynamoDBStoreErrorSpec
             requestHash: Option[String] = None,
         ): IO[IdempotencyResult] = IO
           .raiseError(new CorruptIdempotencyRecordException(key, detail))
-        def storeResponse(key: String, response: StoredResponse): IO[Boolean] =
-          IO.pure(false)
+        def storeResponse(
+            key: String,
+            clientId: String,
+            response: StoredResponse,
+        ): IO[Boolean] = IO.pure(false)
         def markFailed(key: String): IO[Boolean] = IO.pure(false)
         def get(key: String): IO[Option[IdempotencyRecord]] = IO.pure(None)
         def healthCheck: IO[Either[String, Unit]] = IO.pure(Right(()))

@@ -183,14 +183,19 @@ object TokenQuotaStore:
         override def healthCheck: F[Either[String, Unit]] = Async[F].pure(Right(()))
     }
 
+/** Quota checks and reconciliation. `clientId` scopes every counter (ADR-005):
+  * two clients naming the same user, agent, or org meter separate counters.
+  */
 trait TokenQuotaService[F[_]]:
   def checkQuota(
+      clientId: String,
       identifier: QuotaIdentifier,
       estimatedInputTokens: Long,
       estimatedOutputTokens: Long,
   ): F[QuotaDecision]
 
   def reconcile(
+      clientId: String,
       identifier: QuotaIdentifier,
       actualInputTokens: Long,
       actualOutputTokens: Long,
@@ -209,11 +214,12 @@ object TokenQuotaService:
   ): TokenQuotaService[F] = new TokenQuotaService[F]:
 
     override def checkQuota(
+        clientId: String,
         identifier: QuotaIdentifier,
         estimatedInputTokens: Long,
         estimatedOutputTokens: Long,
     ): F[QuotaDecision] =
-      val levels = levelsFor(identifier)
+      val levels = levelsFor(clientId, identifier)
       for
         nowMs <- Clock[F].realTime.map(_.toMillis)
         outcome <- metrics
@@ -242,6 +248,7 @@ object TokenQuotaService:
       )
 
     override def reconcile(
+        clientId: String,
         identifier: QuotaIdentifier,
         actualInputTokens: Long,
         actualOutputTokens: Long,
@@ -253,7 +260,7 @@ object TokenQuotaService:
       if inputDelta == 0 && outputDelta == 0 then
         Async[F].pure(ReconcileResult.Reconciled(0, 0))
       else
-        val levels = levelsFor(identifier)
+        val levels = levelsFor(clientId, identifier)
         // Actual usage already happened, so I record it even past the limit.
         val unlimited = levels.map(_.target.copy(limit = None))
         for
@@ -316,8 +323,9 @@ object TokenQuotaService:
             s"Store reported unknown quota target $pk",
           ))
 
-    private def levelsFor(id: QuotaIdentifier): List[Level] =
+    private def levelsFor(clientId: String, id: QuotaIdentifier): List[Level] =
       val user = mkLevel(
+        clientId,
         QuotaLevel.User,
         id.userId,
         config.userLimit,
@@ -325,14 +333,27 @@ object TokenQuotaService:
       )
       val agent = id.agentId.map { aid =>
         val limit = math.min(config.agentLimit, (config.userLimit * 0.8).toLong)
-        mkLevel(QuotaLevel.Agent, aid, limit, config.agentWindowSeconds)
+        mkLevel(
+          clientId,
+          QuotaLevel.Agent,
+          aid,
+          limit,
+          config.agentWindowSeconds,
+        )
       }
       val org = id.orgId.map(oid =>
-        mkLevel(QuotaLevel.Org, oid, config.orgLimit, config.orgWindowSeconds),
+        mkLevel(
+          clientId,
+          QuotaLevel.Org,
+          oid,
+          config.orgLimit,
+          config.orgWindowSeconds,
+        ),
       )
       user :: agent.toList ::: org.toList
 
     private def mkLevel(
+        clientId: String,
         l: QuotaLevel,
         id: String,
         limit: Long,
@@ -340,7 +361,11 @@ object TokenQuotaService:
     ): Level = Level(
       l,
       limit,
-      QuotaTarget(s"${l.prefix}:$id:${windowSec}s", windowSec, Some(limit)),
+      QuotaTarget(
+        s"${l.prefix}:${TenantKey(clientId, id)}:${windowSec}s",
+        windowSec,
+        Some(limit),
+      ),
     )
 
     private def secondsUntilReset(

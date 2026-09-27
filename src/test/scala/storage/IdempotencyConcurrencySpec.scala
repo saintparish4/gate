@@ -86,7 +86,7 @@ class IdempotencyConcurrencySpec
         for
           store <- InMemoryIdempotencyStore.create[IO]
           _ <- store.check("done-key", clientId, ttlSeconds)
-          _ <- store.storeResponse("done-key", response)
+          _ <- store.storeResponse("done-key", clientId, response)
           results <- IO.parSequenceN(concurrency)(
             List.fill(concurrency)(store.check("done-key", clientId, ttlSeconds)),
           )

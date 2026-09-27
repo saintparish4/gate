@@ -97,6 +97,14 @@ class HttpApiIntegrationSpec
         tier = ClientTier.Free, // Use Free tier (capacity 10) to match test expectations
         permissions = Permission.standard,
       ),
+      // A second standard tenant, for the isolation tests.
+      "other-key" -> AuthenticatedClient(
+        apiKeyId = "other-client-1",
+        clientId = "other-client-1",
+        clientName = "Other Client",
+        tier = ClientTier.Free,
+        permissions = Permission.standard,
+      ),
       "admin-key" -> AuthenticatedClient(
         apiKeyId = "admin-client-1",
         clientId = "admin-client-1",
@@ -186,6 +194,151 @@ class HttpApiIntegrationSpec
     clearTable(testDynamoDBConfig.rateLimitTable)
     clearTable(testDynamoDBConfig.idempotencyTable)
     clearTable(tokenQuotaTableName)
+  }
+
+  "Tenant isolation" - {
+    // Every key used to be global, so two clients naming the same key shared
+    // one bucket, one idempotency record, and one quota counter (ADR-005). Each
+    // route is driven here by two clients using the same visible key.
+
+    def as(key: String)(request: Request[IO]): Request[IO] = request
+      .putHeaders(headers.Authorization(Credentials.Token(ci"Bearer", key)))
+
+    def post(path: Uri, body: String): Request[IO] =
+      Request[IO](Method.POST, path).withEntity(body)
+        .putHeaders(headers.`Content-Type`(MediaType.application.json))
+
+    def json(response: Response[IO]): IO[io.circe.Json] = response.as[String]
+      .flatMap(body => IO.fromEither(parse(body)))
+
+    "POST /v1/ratelimit/check: draining a key leaves another client's bucket full" in {
+      val check = post(uri"/v1/ratelimit/check", """{"key": "shared-rl"}""")
+      for {
+        _ <- List.fill(10)(check).traverse(r => httpApp.run(as("test-key")(r)))
+        blocked <- httpApp.run(as("test-key")(check))
+        other <- httpApp.run(as("other-key")(check))
+        body <- json(other)
+      } yield {
+        blocked.status shouldBe Status.TooManyRequests
+        other.status shouldBe Status.Ok
+        body.hcursor.get[Int]("tokensRemaining").toOption shouldBe Some(9)
+      }
+    }
+
+    "GET /v1/ratelimit/status/:key: a client sees only its own bucket" in {
+      val status =
+        Request[IO](Method.GET, uri"/v1/ratelimit/status/shared-status")
+      for {
+        _ <- httpApp.run(as("test-key")(post(
+          uri"/v1/ratelimit/check",
+          """{"key": "shared-status", "cost": 3}""",
+        )))
+        mine <- httpApp.run(as("test-key")(status)).flatMap(json)
+        theirs <- httpApp.run(as("other-key")(status)).flatMap(json)
+      } yield {
+        mine.hcursor.get[Int]("tokensRemaining").toOption shouldBe Some(7)
+        theirs.hcursor.get[Int]("tokensRemaining").toOption shouldBe Some(10)
+      }
+    }
+
+    "POST /v1/idempotency/check: the same key is new once per client" in {
+      val check =
+        post(uri"/v1/idempotency/check", """{"idempotencyKey": "shared-idem"}""")
+      for {
+        mine <- httpApp.run(as("test-key")(check))
+        mineBody <- json(mine)
+        theirs <- httpApp.run(as("other-key")(check))
+        theirsBody <- json(theirs)
+      } yield {
+        mineBody.hcursor.get[String]("status").toOption shouldBe Some("new")
+        theirs.status shouldBe Status.Ok
+        theirsBody.hcursor.get[String]("status").toOption shouldBe Some("new")
+        // The caller's key comes back, never the scoped storage key.
+        theirsBody.hcursor.get[String]("idempotencyKey").toOption shouldBe
+          Some("shared-idem")
+      }
+    }
+
+    "POST /v1/idempotency/:key/complete: a client cannot complete another's pending key" in {
+      val check = post(
+        uri"/v1/idempotency/check",
+        """{"idempotencyKey": "shared-complete"}""",
+      )
+      val complete = post(
+        uri"/v1/idempotency/shared-complete/complete",
+        """{"statusCode": 200, "body": "forged"}""",
+      )
+      for {
+        _ <- httpApp.run(as("test-key")(check))
+        forged <- httpApp.run(as("other-key")(complete))
+        after <- httpApp.run(as("test-key")(check))
+        afterBody <- json(after)
+      } yield {
+        forged.status shouldBe Status.Conflict
+        after.status shouldBe Status.Accepted
+        afterBody.hcursor.get[String]("status").toOption shouldBe
+          Some("in_progress")
+      }
+    }
+
+    "a completed response is replayed to its own client only" in {
+      val check = post(
+        uri"/v1/idempotency/check",
+        """{"idempotencyKey": "shared-replay"}""",
+      )
+      val complete = post(
+        uri"/v1/idempotency/shared-replay/complete",
+        """{"statusCode": 201, "body": "secret"}""",
+      )
+      for {
+        _ <- httpApp.run(as("test-key")(check))
+        _ <- httpApp.run(as("test-key")(complete))
+        theirs <- httpApp.run(as("other-key")(check)).flatMap(json)
+        mine <- httpApp.run(as("test-key")(check)).flatMap(json)
+      } yield {
+        theirs.hcursor.get[String]("status").toOption shouldBe Some("new")
+        (theirs.noSpaces should not).include("secret")
+        mine.hcursor.get[String]("status").toOption shouldBe Some("duplicate")
+        mine.hcursor.downField("originalResponse").get[String]("body")
+          .toOption shouldBe Some("secret")
+      }
+    }
+
+    "POST /v1/quota/check: two clients naming the same user meter separate quotas" in {
+      def check(tokens: Int) = post(
+        uri"/v1/quota/check",
+        s"""{"userId": "shared-user", "estimatedInputTokens": $tokens}""",
+      )
+      for {
+        filled <- httpApp.run(as("test-key")(check(100)))
+        refused <- httpApp.run(as("test-key")(check(1)))
+        theirs <- httpApp.run(as("other-key")(check(100)))
+      } yield {
+        filled.status shouldBe Status.Ok
+        refused.status shouldBe Status.TooManyRequests
+        theirs.status shouldBe Status.Ok
+      }
+    }
+
+    "POST /v1/quota/reconcile: another client's reconcile cannot free a quota" in {
+      val fill = post(
+        uri"/v1/quota/check",
+        """{"userId": "shared-reconcile", "estimatedInputTokens": 100}""",
+      )
+      val erase = post(
+        uri"/v1/quota/reconcile",
+        """{"userId": "shared-reconcile", "actualInputTokens": 0, "actualOutputTokens": 0, "estimatedInputTokens": 100, "estimatedOutputTokens": 0}""",
+      )
+      val next = post(
+        uri"/v1/quota/check",
+        """{"userId": "shared-reconcile", "estimatedInputTokens": 1}""",
+      )
+      for {
+        _ <- httpApp.run(as("test-key")(fill))
+        _ <- httpApp.run(as("other-key")(erase))
+        after <- httpApp.run(as("test-key")(next))
+      } yield after.status shouldBe Status.TooManyRequests
+    }
   }
 
   "Token quota endpoints" - {

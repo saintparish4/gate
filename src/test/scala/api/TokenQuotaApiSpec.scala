@@ -60,11 +60,13 @@ class TokenQuotaApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
       reconciled: ReconcileResult,
   ): TokenQuotaService[IO] = new TokenQuotaService[IO]:
     def checkQuota(
+        clientId: String,
         identifier: QuotaIdentifier,
         estimatedInputTokens: Long,
         estimatedOutputTokens: Long,
     ): IO[QuotaDecision] = IO.pure(decision)
     def reconcile(
+        clientId: String,
         identifier: QuotaIdentifier,
         actualInputTokens: Long,
         actualOutputTokens: Long,

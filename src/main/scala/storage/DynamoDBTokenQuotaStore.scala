@@ -19,7 +19,9 @@ import DynamoDBOps.*
 /** DynamoDB-backed token quota store.
   *
   * Table schema (gate-token-quotas):
-  *   - pk (S): "{level}:{id}:{window}" e.g. "user:u123:3600s"
+  *   - pk (S): "{level}:{scoped id}:{window}", where the id is scoped to the
+  *     client by core.TenantKey (ADR-005), e.g.
+  *     "user:t1:10:client_abc:u123:3600s"
   *   - input_tokens (N): cumulative input tokens in current window
   *   - output_tokens (N): cumulative output tokens in current window
   *   - window_start (N): epoch millis when the current window began

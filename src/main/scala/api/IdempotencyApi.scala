@@ -58,19 +58,21 @@ class IdempotencyApi[F[_]: Async: Tracer](
       requestHash = checkReq.requestBody.map(sha256)
 
       _ <- logger.debug(s"Idempotency check: key=${checkReq
-          .idempotencyKey}, client=${client.apiKeyId}, hasHash=${requestHash
+          .idempotencyKey}, client=${client.clientId}, hasHash=${requestHash
           .isDefined}")
-      result <- TracingMiddleware.traced("executeIdempotent")(
+      scoped <- TracingMiddleware.traced("executeIdempotent")(
         metricsPublisher.timed(
           "IdempotencyStoreLatency",
           Map("operation" -> "idempotency_check"),
         )(store.check(
-          checkReq.idempotencyKey,
-          client.apiKeyId,
+          TenantKey(client.clientId, checkReq.idempotencyKey),
+          client.clientId,
           ttlSeconds,
           requestHash,
         )),
       )
+      // The store saw the scoped key; the caller and the events see theirs.
+      result = IdempotencyApi.withKey(scoped, checkReq.idempotencyKey)
 
       // Record metrics
       latency <- Clock[F].realTime.map(_.toMillis - startTime)
@@ -106,8 +108,12 @@ class IdempotencyApi[F[_]: Async: Tracer](
     )
 
     _ <- logger
-      .debug(s"Completing idempotency key: $key, client=${client.apiKeyId}")
-    success <- store.storeResponse(key, storedResponse)
+      .debug(s"Completing idempotency key: $key, client=${client.clientId}")
+    success <- store.storeResponse(
+      TenantKey(client.clientId, key),
+      client.clientId,
+      storedResponse,
+    )
 
     response <-
       if success then
@@ -317,6 +323,16 @@ case class IdempotencyCompleteResponse(
 )
 
 object IdempotencyApi:
+  /** `result` with its key replaced by `key`. The store works on the scoped key
+    * (ADR-005), which must not leak into responses or events.
+    */
+  def withKey(result: IdempotencyResult, key: String): IdempotencyResult =
+    result match
+      case r: IdempotencyResult.New => r.copy(idempotencyKey = key)
+      case r: IdempotencyResult.Duplicate => r.copy(idempotencyKey = key)
+      case r: IdempotencyResult.InProgress => r.copy(idempotencyKey = key)
+      case r: IdempotencyResult.KeyConflict => r.copy(idempotencyKey = key)
+
   def apply[F[_]: Async: Tracer](
       store: IdempotencyStore[F],
       idempotencyConfig: IdempotencyConfig,

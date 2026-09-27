@@ -37,11 +37,15 @@ class TokenQuotaServiceSpec
       (TokenQuotaService[IO](s, config, MetricsPublisher.noop[IO], summon), s),
     )
 
-  def userPk(id: String): String =
-    s"user:$id:${defaultConfig.userWindowSeconds}s"
+  // Every call in this spec runs as one client; the cross-client cases name
+  // their own.
+  val client = "client-1"
+
+  def userPk(id: String, clientId: String = client): String =
+    s"user:${TenantKey(clientId, id)}:${defaultConfig.userWindowSeconds}s"
 
   def orgPk(id: String, config: TokenQuotaConfig): String =
-    s"org:$id:${config.orgWindowSeconds}s"
+    s"org:${TenantKey(client, id)}:${config.orgWindowSeconds}s"
 
   /** A store that loses every conditional write. */
   def contendedStore(attempts: Int): TokenQuotaStore[IO] =
@@ -77,14 +81,19 @@ class TokenQuotaServiceSpec
 
     "an admitted check counts its estimate at every level it reserved" in
       withProm(
-        _.checkQuota(QuotaIdentifier("u", Some("a"), Some("o")), 1000, 500).void,
+        _.checkQuota(
+          client,
+          QuotaIdentifier("u", Some("a"), Some("o")),
+          1000,
+          500,
+        ).void,
       ).asserting(prom =>
         List("user", "agent", "org").map(admitted(prom, _)) shouldBe
           List(1500.0, 1500.0, 1500.0),
       )
 
     "a refused check counts nothing" in
-      withProm(_.checkQuota(QuotaIdentifier("u"), 50_000, 0).void)
+      withProm(_.checkQuota(client, QuotaIdentifier("u"), 50_000, 0).void)
         .asserting(prom => admitted(prom, "user") shouldBe 0.0)
   }
 
@@ -93,15 +102,15 @@ class TokenQuotaServiceSpec
     "allows a request under the limit and reports remaining tokens per level" in {
       for
         (svc, _) <- service()
-        result <- svc.checkQuota(QuotaIdentifier("user1"), 1000, 500)
+        result <- svc.checkQuota(client, QuotaIdentifier("user1"), 1000, 500)
       yield result shouldBe QuotaDecision.Available(Map(QuotaLevel.User -> 8500L))
     }
 
     "rejects once the window usage would exceed the limit" in {
       for
         (svc, _) <- service()
-        _ <- svc.checkQuota(QuotaIdentifier("user1"), 8000, 0)
-        result <- svc.checkQuota(QuotaIdentifier("user1"), 5000, 0)
+        _ <- svc.checkQuota(client, QuotaIdentifier("user1"), 8000, 0)
+        result <- svc.checkQuota(client, QuotaIdentifier("user1"), 5000, 0)
       yield result match
         case QuotaDecision.Exceeded(level, limit, used, _) =>
           level shouldBe QuotaLevel.User
@@ -113,8 +122,8 @@ class TokenQuotaServiceSpec
     "does not record a rejected request" in {
       for
         (svc, store) <- service()
-        _ <- svc.checkQuota(QuotaIdentifier("user1"), 8000, 0)
-        _ <- svc.checkQuota(QuotaIdentifier("user1"), 5000, 0)
+        _ <- svc.checkQuota(client, QuotaIdentifier("user1"), 8000, 0)
+        _ <- svc.checkQuota(client, QuotaIdentifier("user1"), 5000, 0)
         state <- store.getQuota(userPk("user1"))
       yield state.map(_.totalTokens) shouldBe Some(8000L)
     }
@@ -123,9 +132,9 @@ class TokenQuotaServiceSpec
       val program =
         for
           (svc, _) <- service()
-          _ <- svc.checkQuota(QuotaIdentifier("user1"), 8000, 0)
+          _ <- svc.checkQuota(client, QuotaIdentifier("user1"), 8000, 0)
           _ <- IO.sleep(59.minutes)
-          result <- svc.checkQuota(QuotaIdentifier("user1"), 5000, 0)
+          result <- svc.checkQuota(client, QuotaIdentifier("user1"), 5000, 0)
         yield result
 
       TestControl.executeEmbed(program).asserting {
@@ -139,9 +148,9 @@ class TokenQuotaServiceSpec
       val program =
         for
           (svc, _) <- service()
-          _ <- svc.checkQuota(QuotaIdentifier("user1"), 8000, 0)
+          _ <- svc.checkQuota(client, QuotaIdentifier("user1"), 8000, 0)
           _ <- IO.sleep(61.minutes)
-          result <- svc.checkQuota(QuotaIdentifier("user1"), 5000, 0)
+          result <- svc.checkQuota(client, QuotaIdentifier("user1"), 5000, 0)
         yield result
 
       TestControl.executeEmbed(program).asserting(
@@ -154,6 +163,7 @@ class TokenQuotaServiceSpec
       for
         (svc, _) <- service(config)
         result <- svc.checkQuota(
+          client,
           QuotaIdentifier("user1", agentId = Some("agent1")),
           8500,
           0,
@@ -169,8 +179,12 @@ class TokenQuotaServiceSpec
       val config = defaultConfig.copy(orgLimit = 1_000)
       for
         (svc, store) <- service(config)
-        result <- svc
-          .checkQuota(QuotaIdentifier("user1", orgId = Some("org1")), 5000, 0)
+        result <- svc.checkQuota(
+          client,
+          QuotaIdentifier("user1", orgId = Some("org1")),
+          5000,
+          0,
+        )
         user <- store.getQuota(userPk("user1"))
         org <- store.getQuota(orgPk("org1", config))
       yield
@@ -183,8 +197,9 @@ class TokenQuotaServiceSpec
       val perRequest = 300L
       for
         (svc, store) <- service()
-        decisions <- (1 to 50).toList
-          .parTraverse(_ => svc.checkQuota(QuotaIdentifier("hot"), perRequest, 0))
+        decisions <- (1 to 50).toList.parTraverse(_ =>
+          svc.checkQuota(client, QuotaIdentifier("hot"), perRequest, 0),
+        )
         state <- store.getQuota(userPk("hot"))
       yield
         val admitted = decisions.count(_.isInstanceOf[QuotaDecision.Available])
@@ -195,7 +210,7 @@ class TokenQuotaServiceSpec
     "fails closed when the store cannot win a write" in {
       for
         (svc, _) <- service(store = Some(contendedStore(25)))
-        result <- svc.checkQuota(QuotaIdentifier("user1"), 10, 0)
+        result <- svc.checkQuota(client, QuotaIdentifier("user1"), 10, 0)
       yield result shouldBe QuotaDecision.Contended(25)
     }
   }
@@ -205,8 +220,9 @@ class TokenQuotaServiceSpec
     "replaces the estimate with actual usage" in {
       for
         (svc, store) <- service()
-        _ <- svc.checkQuota(QuotaIdentifier("user1"), 1000, 0)
+        _ <- svc.checkQuota(client, QuotaIdentifier("user1"), 1000, 0)
         result <- svc.reconcile(
+          client,
           QuotaIdentifier("user1"),
           actualInputTokens = 800,
           actualOutputTokens = 0,
@@ -222,10 +238,10 @@ class TokenQuotaServiceSpec
     "records overshoot past the limit so the next check is rejected" in {
       for
         (svc, store) <- service()
-        _ <- svc.checkQuota(QuotaIdentifier("user1"), 9000, 0)
-        _ <- svc.reconcile(QuotaIdentifier("user1"), 9000, 3000, 9000, 0)
+        _ <- svc.checkQuota(client, QuotaIdentifier("user1"), 9000, 0)
+        _ <- svc.reconcile(client, QuotaIdentifier("user1"), 9000, 3000, 9000, 0)
         state <- store.getQuota(userPk("user1"))
-        next <- svc.checkQuota(QuotaIdentifier("user1"), 1, 0)
+        next <- svc.checkQuota(client, QuotaIdentifier("user1"), 1, 0)
       yield
         state.map(_.totalTokens) shouldBe Some(12_000L)
         next match
@@ -236,7 +252,8 @@ class TokenQuotaServiceSpec
     "is a no-op when actual usage equals the estimate" in {
       for
         (svc, store) <- service()
-        result <- svc.reconcile(QuotaIdentifier("user1"), 500, 100, 500, 100)
+        result <- svc
+          .reconcile(client, QuotaIdentifier("user1"), 500, 100, 500, 100)
         state <- store.getQuota(userPk("user1"))
       yield
         result shouldBe ReconcileResult.Reconciled(0, 0)
@@ -246,7 +263,38 @@ class TokenQuotaServiceSpec
     "surfaces contention instead of dropping the adjustment" in {
       for
         (svc, _) <- service(store = Some(contendedStore(25)))
-        result <- svc.reconcile(QuotaIdentifier("user1"), 800, 0, 1000, 0)
+        result <- svc
+          .reconcile(client, QuotaIdentifier("user1"), 800, 0, 1000, 0)
       yield result shouldBe ReconcileResult.Contended(25)
+    }
+  }
+
+  "tenant isolation" - {
+    // Counters were keyed by the caller's user ID alone, so two clients naming
+    // the same user shared one quota, and either could reconcile the other's.
+
+    "two clients naming the same user meter separate counters" in {
+      for
+        (svc, store) <- service()
+        mine <- svc.checkQuota("client-a", QuotaIdentifier("shared"), 10_000, 0)
+        full <- svc.checkQuota("client-a", QuotaIdentifier("shared"), 1, 0)
+        theirs <- svc.checkQuota("client-b", QuotaIdentifier("shared"), 1, 0)
+        counterA <- store.getQuota(userPk("shared", "client-a"))
+        counterB <- store.getQuota(userPk("shared", "client-b"))
+      yield
+        mine shouldBe a[QuotaDecision.Available]
+        full shouldBe a[QuotaDecision.Exceeded]
+        theirs shouldBe QuotaDecision.Available(Map(QuotaLevel.User -> 9_999L))
+        counterA.map(_.totalTokens) shouldBe Some(10_000L)
+        counterB.map(_.totalTokens) shouldBe Some(1L)
+    }
+
+    "a reconcile from another client leaves the counter untouched" in {
+      for
+        (svc, store) <- service()
+        _ <- svc.checkQuota("client-a", QuotaIdentifier("shared"), 9_000, 0)
+        _ <- svc.reconcile("client-b", QuotaIdentifier("shared"), 0, 0, 9_000, 0)
+        counterA <- store.getQuota(userPk("shared", "client-a"))
+      yield counterA.map(_.totalTokens) shouldBe Some(9_000L)
     }
   }

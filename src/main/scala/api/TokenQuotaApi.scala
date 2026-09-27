@@ -63,7 +63,7 @@ class TokenQuotaApi[F[_]: Async: Tracer](
         req.actualOutputTokens,
         req.estimatedInputTokens,
         req.estimatedOutputTokens,
-      )("token counts must be non-negative")(runReconcile(req, startTime))
+      )("token counts must be non-negative")(runReconcile(req, client, startTime))
     yield response
 
   private def runCheck(
@@ -74,6 +74,7 @@ class TokenQuotaApi[F[_]: Async: Tracer](
     val identifier = QuotaIdentifier(req.userId, req.agentId, req.orgId)
     for
       decision <- TracingMiddleware.traced("checkQuota")(quotaService.checkQuota(
+        client.clientId,
         identifier,
         req.estimatedInputTokens,
         req.estimatedOutputTokens,
@@ -88,11 +89,13 @@ class TokenQuotaApi[F[_]: Async: Tracer](
 
   private def runReconcile(
       req: TokenQuotaReconcileRequest,
+      client: AuthenticatedClient,
       startTime: Long,
   ): F[Response[F]] =
     val identifier = QuotaIdentifier(req.userId, req.agentId, req.orgId)
     for
       result <- quotaService.reconcile(
+        client.clientId,
         identifier,
         req.actualInputTokens,
         req.actualOutputTokens,
