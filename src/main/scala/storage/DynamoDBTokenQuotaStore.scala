@@ -9,9 +9,13 @@ import cats.effect.*
 import cats.syntax.all.*
 import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient
 import software.amazon.awssdk.services.dynamodb.model.*
+import io.circe.generic.auto.*
+import io.circe.parser.decode
+import io.circe.syntax.*
 import core.{
-  PlannedWrite, QuotaReservation, QuotaTarget, ReserveOutcome, TokenQuotaState,
-  TokenQuotaStore,
+  ChargedTarget, NewReservation, PlannedWrite, QuotaReconciliation,
+  QuotaReservation, QuotaTarget, ReconcileOutcome, ReconciledUsage,
+  ReservationRecord, ReserveOutcome, TokenQuotaState, TokenQuotaStore,
 }
 import observability.MetricsPublisher
 import DynamoDBOps.*
@@ -33,6 +37,24 @@ import DynamoDBOps.*
   * version-conditional puts: one PutItem for a single target,
   * TransactWriteItems for several. Any condition failure re-reads and retries,
   * so the limit check and the write can never disagree about the state.
+  *
+  * An admitted check then writes its reservation record with its own
+  * conditional PutItem. It used to share the counters' transaction, which made
+  * every check a transaction: twice the write cost, and on LocalStack a
+  * contended key stalled requests past the 10 s read timeout. The record's key
+  * is unique, so this write never contends. If it cannot be written, the
+  * counters are released and the check answers Contended, so no caller proceeds
+  * without a reservation it can reconcile:
+  *   - pk (S): "reservation:{scoped id}"
+  *   - targets (S): JSON list of the counters charged and their window starts
+  *   - estimated_input / estimated_output (N): the estimate reserved
+  *   - status (S): "pending" or "reconciled"
+  *   - actual_input / actual_output (N): the usage it was reconciled with
+  *   - ttl (N): epoch seconds after which reconcile no longer finds it
+  *
+  * Reconcile reads the record and its counters, then writes the adjusted
+  * counters and flips the record to "reconciled" in one transaction conditioned
+  * on it still being "pending", so it applies at most once.
   */
 class DynamoDBTokenQuotaStore[F[_]: Async](
     client: DynamoDbAsyncClient,
@@ -43,11 +65,16 @@ class DynamoDBTokenQuotaStore[F[_]: Async](
 
   private val MaxAttempts = 25
 
+  private sealed trait WriteItem
+
   private case class ConditionalItem(
       item: Map[String, AttributeValue],
       condition: String,
       values: Map[String, AttributeValue],
-  )
+  ) extends WriteItem
+
+  // Flips a pending reservation to reconciled; fails if it is not pending.
+  private case class ReconciledMark(record: ReservationRecord) extends WriteItem
 
   override def getQuota(pk: String): F[Option[TokenQuotaState]] =
     val request = GetItemRequest.builder().tableName(tableName)
@@ -70,9 +97,31 @@ class DynamoDBTokenQuotaStore[F[_]: Async](
       inputDelta: Long,
       outputDelta: Long,
       nowMs: Long,
+      reservation: Option[NewReservation],
   ): F[ReserveOutcome] =
     if targets.isEmpty then Async[F].pure(ReserveOutcome.Reserved(Map.empty))
-    else attemptReserve(targets, inputDelta, outputDelta, nowMs, attempt = 1)
+    else
+      attemptReserve(
+        targets,
+        inputDelta,
+        outputDelta,
+        nowMs,
+        reservation,
+        attempt = 1,
+      )
+
+  override def reconcile(
+      reservationPk: String,
+      actualInput: Long,
+      actualOutput: Long,
+      nowMs: Long,
+  ): F[ReconcileOutcome] = attemptReconcile(
+    reservationPk,
+    actualInput,
+    actualOutput,
+    nowMs,
+    attempt = 1,
+  )
 
   override def healthCheck: F[Either[String, Unit]] =
     dynamoHealthCheck(client, tableName)
@@ -82,6 +131,7 @@ class DynamoDBTokenQuotaStore[F[_]: Async](
       inputDelta: Long,
       outputDelta: Long,
       nowMs: Long,
+      reservation: Option[NewReservation],
       attempt: Int,
   ): F[ReserveOutcome] =
     for
@@ -89,24 +139,36 @@ class DynamoDBTokenQuotaStore[F[_]: Async](
       outcome <- QuotaReservation
         .plan(targets, current, inputDelta, outputDelta, nowMs) match
         case Left(exceeded) => Async[F].pure(exceeded)
-        case Right(planned) => write(planned, nowMs).flatMap {
-            case true => Async[F].pure(ReserveOutcome.Reserved(
-                planned.map(p => p.target.pk -> p.after).toMap,
-              ))
-            case false if attempt < MaxAttempts =>
-              metrics.increment("TokenQuotaOCCRetry") *>
-                jitteredBackoff(attempt) *> attemptReserve(
-                  targets,
-                  inputDelta,
-                  outputDelta,
-                  nowMs,
-                  attempt + 1,
-                )
-            case false => logger
-                .warn(s"OCC retries exhausted reserving quota for ${targets
-                    .map(_.pk).mkString(", ")}")
-                .as(ReserveOutcome.Contended(attempt))
-          }
+        case Right(planned) => write(planned.map(conditionalItem(_, nowMs)))
+            .flatMap {
+              case true =>
+                val reserved = ReserveOutcome
+                  .Reserved(planned.map(p => p.target.pk -> p.after).toMap)
+                reservation match
+                  case None => Async[F].pure(reserved)
+                  case Some(r) => recordOrRelease(
+                      r.record(planned, inputDelta, outputDelta),
+                      targets,
+                      nowMs,
+                    ).map(recorded =>
+                      if recorded then reserved
+                      else ReserveOutcome.Contended(attempt),
+                    )
+              case false if attempt < MaxAttempts =>
+                metrics.increment("TokenQuotaOCCRetry") *>
+                  jitteredBackoff(attempt) *> attemptReserve(
+                    targets,
+                    inputDelta,
+                    outputDelta,
+                    nowMs,
+                    reservation,
+                    attempt + 1,
+                  )
+              case false => logger
+                  .warn(s"OCC retries exhausted reserving quota for ${targets
+                      .map(_.pk).mkString(", ")}")
+                  .as(ReserveOutcome.Contended(attempt))
+            }
     yield outcome
 
   private def readCurrent(
@@ -116,10 +178,69 @@ class DynamoDBTokenQuotaStore[F[_]: Async](
       case (pk, Some(state)) => pk -> state
     }.toMap)
 
-  private def write(planned: List[PlannedWrite], nowMs: Long): F[Boolean] =
-    planned.map(conditionalItem(_, nowMs)) match
-      case single :: Nil => putOne(single)
-      case many => putAll(many)
+  private def attemptReconcile(
+      reservationPk: String,
+      actualInput: Long,
+      actualOutput: Long,
+      nowMs: Long,
+      attempt: Int,
+  ): F[ReconcileOutcome] = getReservation(reservationPk).flatMap {
+    case None => Async[F].pure(ReconcileOutcome.NotFound)
+    case Some(record) if record.expired(nowMs) =>
+      // DynamoDB deletes expired items lazily, so expiry is checked here too.
+      Async[F].pure(ReconcileOutcome.NotFound)
+    case Some(record) if record.reconciled.isDefined =>
+      Async[F].pure(ReconcileOutcome.AlreadyReconciled(record))
+    case Some(record) =>
+      val targets = record.targets
+        .map(t => QuotaTarget(t.pk, t.windowSeconds, limit = None))
+      val done = record
+        .copy(reconciled = Some(ReconciledUsage(actualInput, actualOutput)))
+      for
+        current <- readCurrent(targets)
+        planned = QuotaReconciliation
+          .plan(record, current, actualInput, actualOutput, nowMs)
+        written <-
+          write(planned.map(conditionalItem(_, nowMs)) :+ markReconciled(done))
+        outcome <-
+          if written then Async[F].pure(ReconcileOutcome.Applied(done))
+          else if attempt < MaxAttempts then
+            // Either a counter moved or another reconcile won; the re-read
+            // tells which.
+            metrics.increment("TokenQuotaOCCRetry") *>
+              jitteredBackoff(attempt) *> attemptReconcile(
+                reservationPk,
+                actualInput,
+                actualOutput,
+                nowMs,
+                attempt + 1,
+              )
+          else
+            logger.warn(s"OCC retries exhausted reconciling $reservationPk")
+              .as(ReconcileOutcome.Contended(attempt))
+      yield outcome
+  }
+
+  private def getReservation(pk: String): F[Option[ReservationRecord]] =
+    val request = GetItemRequest.builder().tableName(tableName)
+      .key(Map("pk" -> attr(pk)).asJava).consistentRead(true).build()
+    Async[F].fromCompletableFuture(
+      Async[F].delay(client.getItem(request).toCompletableFuture),
+    ).flatMap(response =>
+      if response.hasItem && !response.item().isEmpty then
+        parseReservation(pk, response.item().asScala.toMap) match
+          case Right(record) => Async[F].pure(Some(record))
+          // A record that cannot be read cannot be reconciled safely; the
+          // estimate stays counted, which errs toward under-issue.
+          case Left(err) => logger
+              .error(s"Corrupt quota reservation pk=$pk: $err") *>
+              metrics.increment("CorruptStateRead") *> Async[F].pure(None)
+      else Async[F].pure(None),
+    )
+
+  private def write(items: List[WriteItem]): F[Boolean] = items match
+    case (single: ConditionalItem) :: Nil => putOne(single)
+    case many => writeAll(many)
 
   private def conditionalItem(p: PlannedWrite, nowMs: Long): ConditionalItem =
     // 60 s of grace past the window so a late reconcile still finds the item
@@ -150,20 +271,127 @@ class DynamoDBTokenQuotaStore[F[_]: Async](
       case _: TransactionConflictException => false
     }
 
-  private def putAll(items: List[ConditionalItem]): F[Boolean] =
-    val actions = items.map { ci =>
-      val put = Put.builder().tableName(tableName).item(ci.item.asJava)
-        .conditionExpression(ci.condition)
-      val withValues =
-        if ci.values.isEmpty then put
-        else put.expressionAttributeValues(ci.values.asJava)
-      TransactWriteItem.builder().put(withValues.build()).build()
+  private def writeAll(items: List[WriteItem]): F[Boolean] =
+    val actions = items.map {
+      case ci: ConditionalItem =>
+        val put = Put.builder().tableName(tableName).item(ci.item.asJava)
+          .conditionExpression(ci.condition)
+        val withValues =
+          if ci.values.isEmpty then put
+          else put.expressionAttributeValues(ci.values.asJava)
+        TransactWriteItem.builder().put(withValues.build()).build()
+      case ReconciledMark(record) =>
+        val usage = record.reconciled.getOrElse(ReconciledUsage(0, 0))
+        val update = Update.builder().tableName(tableName)
+          .key(Map("pk" -> attr(record.pk)).asJava).updateExpression(
+            "SET #status = :reconciled, actual_input = :ai, actual_output = :ao",
+          ).conditionExpression("#status = :pending")
+          .expressionAttributeNames(Map("#status" -> "status").asJava)
+          .expressionAttributeValues(
+            Map(
+              ":reconciled" -> attr("reconciled"),
+              ":pending" -> attr("pending"),
+              ":ai" -> attrN(usage.actualInput),
+              ":ao" -> attrN(usage.actualOutput),
+            ).asJava,
+          ).build()
+        TransactWriteItem.builder().update(update).build()
     }
     val request = TransactWriteItemsRequest.builder()
       .transactItems(actions.asJava).build()
     Async[F].fromCompletableFuture(
       Async[F].delay(client.transactWriteItems(request).toCompletableFuture),
     ).as(true).recover { case _: TransactionCanceledException => false }
+
+  private def markReconciled(record: ReservationRecord): WriteItem =
+    ReconciledMark(record)
+
+  // The counters are already charged. The record's key is unique, so a failure
+  // here is transient, not contention: three tries, then the charge is given
+  // back and the check refused. Even if the release fails, the caller was
+  // refused and makes no call, so the stale charge can only under-issue.
+  private def recordOrRelease(
+      record: ReservationRecord,
+      targets: List[QuotaTarget],
+      nowMs: Long,
+  ): F[Boolean] =
+    def put(attempt: Int): F[Boolean] = putOne(newReservationItem(record))
+      .handleErrorWith(e =>
+        logger.warn(s"Writing quota reservation ${record
+            .pk} failed (attempt $attempt): ${e.getMessage}").as(false),
+      ).flatMap {
+        case false if attempt < 3 => jitteredBackoff(attempt) *> put(attempt + 1)
+        case recorded => Async[F].pure(recorded)
+      }
+    put(1).flatTap(recorded =>
+      if recorded then Async[F].unit else release(record, targets, nowMs),
+    )
+
+  private def release(
+      record: ReservationRecord,
+      targets: List[QuotaTarget],
+      nowMs: Long,
+  ): F[Unit] = metrics.increment("TokenQuotaReservationReleased") *>
+    attemptReserve(
+      targets.map(_.copy(limit = None)),
+      -record.estimatedInput,
+      -record.estimatedOutput,
+      nowMs,
+      reservation = None,
+      attempt = 1,
+    ).flatMap {
+      case _: ReserveOutcome.Reserved => logger
+          .error(s"Could not record quota reservation ${record
+              .pk}; released its charge and refused the check")
+      case other =>
+        logger.error(s"Could not record quota reservation ${record.pk}, and releasing its charge failed ($other); the estimate stays counted")
+    }
+
+  private def newReservationItem(record: ReservationRecord): ConditionalItem =
+    ConditionalItem(
+      Map(
+        "pk" -> attr(record.pk),
+        "targets" -> attr(record.targets.asJson.noSpaces),
+        "estimated_input" -> attrN(record.estimatedInput),
+        "estimated_output" -> attrN(record.estimatedOutput),
+        "status" -> attr("pending"),
+        "ttl" -> attrN(record.expiresAtSeconds),
+      ),
+      "attribute_not_exists(pk)",
+      Map.empty,
+    )
+
+  private def parseReservation(
+      pk: String,
+      item: Map[String, AttributeValue],
+  ): Either[String, ReservationRecord] =
+    def num(name: String): Either[String, Long] = item.get(name)
+      .toRight(s"missing '$name'")
+      .flatMap(a => a.n().toLongOption.toRight(s"malformed '$name'"))
+    for
+      targetsJson <- item.get("targets").toRight("missing 'targets'").map(_.s())
+      targets <- decode[List[ChargedTarget]](targetsJson).left
+        .map(e => s"malformed 'targets': ${e.getMessage}")
+      estimatedInput <- num("estimated_input")
+      estimatedOutput <- num("estimated_output")
+      ttl <- num("ttl")
+      status <- item.get("status").toRight("missing 'status'").map(_.s())
+      reconciled <- status match
+        case "pending" => Right(None)
+        case "reconciled" =>
+          for
+            ai <- num("actual_input")
+            ao <- num("actual_output")
+          yield Some(ReconciledUsage(ai, ao))
+        case other => Left(s"unknown status '$other'")
+    yield ReservationRecord(
+      pk,
+      targets,
+      estimatedInput,
+      estimatedOutput,
+      ttl,
+      reconciled,
+    )
 
   private def jitteredBackoff(attempt: Int): F[Unit] =
     val baseMs = math.min(1L << attempt, 64L)

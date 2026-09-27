@@ -67,11 +67,9 @@ class TokenQuotaApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
     ): IO[QuotaDecision] = IO.pure(decision)
     def reconcile(
         clientId: String,
-        identifier: QuotaIdentifier,
+        reservationId: String,
         actualInputTokens: Long,
         actualOutputTokens: Long,
-        estimatedInputTokens: Long,
-        estimatedOutputTokens: Long,
     ): IO[ReconcileResult] = IO.pure(reconciled)
 
   def makeApiWith(service: TokenQuotaService[IO]): TokenQuotaApi[IO] =
@@ -97,20 +95,29 @@ class TokenQuotaApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
     )
 
   def reconcileRequest(
-      userId: String,
+      reservationId: String,
       actualInput: Long,
       actualOutput: Long,
-      estimatedInput: Long,
-      estimatedOutput: Long,
   ): Request[IO] =
     Request[IO](method = Method.POST, uri = uri"/v1/quota/reconcile").withEntity(
       TokenQuotaReconcileRequest(
-        userId = userId,
+        reservationId = reservationId,
         actualInputTokens = actualInput,
         actualOutputTokens = actualOutput,
-        estimatedInputTokens = estimatedInput,
-        estimatedOutputTokens = estimatedOutput,
       ).asJson,
+    )
+
+  /** Checks, then returns the reservation ID from the 200 body. */
+  def reserve(
+      api: TokenQuotaApi[IO],
+      userId: String,
+      tokens: Long,
+  ): IO[String] = api
+    .check(checkRequest(userId, estimatedInput = tokens), testClient)
+    .flatMap(_.as[TokenQuotaCheckResponse]).flatMap(body =>
+      IO.fromOption(body.reservationId)(new AssertionError(
+        s"no reservationId in $body",
+      )),
     )
 
   "TokenQuotaApi" - {
@@ -136,19 +143,35 @@ class TokenQuotaApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
       api.check(checkRequest("user-c", estimatedInput = -1), testClient),
     ).asserting(_.status shouldBe Status.BadRequest)
 
-    "POST /v1/quota/reconcile returns 200 with correct delta" in
+    "POST /v1/quota/reconcile returns 200 with the delta against the stored estimate" in
       makeApi().flatMap(api =>
         for
-          _ <- api
-            .check(checkRequest("user-d", estimatedInput = 100), testClient)
-          resp <- api
-            .reconcile(reconcileRequest("user-d", 80, 10, 100, 0), testClient)
+          id <- reserve(api, "user-d", 100)
+          resp <- api.reconcile(reconcileRequest(id, 80, 10), testClient)
           body <- resp.as[TokenQuotaReconcileResponse]
         yield (resp.status, body),
       ).asserting { case (status, body) =>
         status shouldBe Status.Ok
         body.inputDelta shouldBe -20L // 80 actual - 100 estimated
         body.outputDelta shouldBe 10L // 10 actual - 0 estimated
+      }
+
+    "POST /v1/quota/reconcile returns 404 for a reservation it does not know" in
+      makeApi().flatMap(api =>
+        api.reconcile(reconcileRequest("unknown", 0, 0), testClient),
+      ).asserting(_.status shouldBe Status.NotFound)
+
+    "POST /v1/quota/reconcile returns 409 for a second reconcile with different usage" in
+      makeApi().flatMap(api =>
+        for
+          id <- reserve(api, "user-i", 100)
+          _ <- api.reconcile(reconcileRequest(id, 80, 0), testClient)
+          again <- api.reconcile(reconcileRequest(id, 0, 0), testClient)
+          body <- again.bodyText.compile.string
+        yield (again.status, body),
+      ).asserting { case (status, body) =>
+        status shouldBe Status.Conflict
+        body should include("already_reconciled")
       }
 
     "puts the same Retry-After in the header and the body when quota is exceeded" in
@@ -183,25 +206,23 @@ class TokenQuotaApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
         body.exceededLevel shouldBe None
     }
 
-    "returns 400 for negative reconcile counts" in makeApi().flatMap(api =>
-      api.reconcile(reconcileRequest("user-g", -1, 0, 10, 0), testClient),
-    ).asserting(_.status shouldBe Status.BadRequest)
+    "returns 400 for negative reconcile counts" in makeApi()
+      .flatMap(api => api.reconcile(reconcileRequest("any", -1, 0), testClient))
+      .asserting(_.status shouldBe Status.BadRequest)
 
     "POST /v1/quota/reconcile returns 503 when the adjustment cannot be recorded" in {
       val api = makeApiWith(stubService(
-        QuotaDecision.Available(Map.empty),
+        QuotaDecision.Available(Map.empty, "reservation-1"),
         ReconcileResult.Contended(25),
       ))
       for
         resp <- api
-          .reconcile(reconcileRequest("user-h", 80, 10, 100, 0), testClient)
-        body <- resp.as[TokenQuotaReconcileResponse]
+          .reconcile(reconcileRequest("reservation-1", 80, 10), testClient)
+        body <- resp.bodyText.compile.string
       yield
         resp.status shouldBe Status.ServiceUnavailable
         resp.headers.get(ci"Retry-After").map(_.head.value) shouldBe Some("1")
-        body.status shouldBe "contended"
-        body.inputDelta shouldBe -20L
-        body.outputDelta shouldBe 10L
+        body should include("contended")
     }
 
     "returns 404 when token-quota is disabled (tokenQuotaApi = None in Routes)" in {

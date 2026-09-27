@@ -30,7 +30,7 @@ DynamoDB, zero errors. See [Correctness](#correctness).
 |-----------|-----------|
 | **At most X requests per client and key, across every instance** | One token-bucket item per client and key in DynamoDB. Every consume is a strongly consistent `GetItem` followed by a `PutItem` conditioned on the item's `version`, so only one instance wins each state change. Up to 10 conflicting writes are retried with jittered backoff; after that the request is **rejected** (429, `Retry-After: 1`). The service under-issues at the tail rather than over-issuing past the limit. |
 | **Idempotent operations within a TTL** | First writer wins via a conditional `PutItem` (`attribute_not_exists(pk)`). Replays within the TTL get the stored response. A SHA-256 fingerprint of the request body turns a same-key different-body replay into `409 Conflict`. DynamoDB TTL expires the items. |
-| **Multi-level token quotas** | User, agent, and org quotas are enforced together on every check. The agent quota is clamped to 80% of the user quota. Pre-request estimation, then post-response reconciliation against actual usage. |
+| **Multi-level token quotas** | User, agent, and org quotas are enforced together on every check. The agent quota is clamped to 80% of the user quota. A check reserves an estimate and returns a `reservationId`; reconcile replaces the stored estimate with actual usage, once, and never takes an estimate from the caller. |
 | **Tenants never share state** | Every storage key is scoped to the authenticated client ([ADR-005](docs/adr/005-tenant-namespaced-storage-keys.md)). Two clients sending the same rate-limit key, idempotency key, or quota user get separate buckets, records, and counters. Completing an idempotency record also requires the client that created it. `HttpApiIntegrationSpec` drives all six routes with two clients on the same keys. |
 | **Stateless instances** | All rate-limit, idempotency, and quota state lives in DynamoDB. Any instance can serve any request; a crash loses nothing. |
 
@@ -232,12 +232,22 @@ curl -s -X POST http://localhost:8080/v1/quota/check \
   "allowed": true,
   "remainingTokens": { "user": 999500, "agent": 499500, "org": 9999500 },
   "exceededLevel": null,
-  "retryAfter": null
+  "retryAfter": null,
+  "reservationId": "5f0c2a6e-8a53-4c43-9f53-8f0d7e1f3b0a"
 }
 ```
 
-After the LLM call, `POST /v1/quota/reconcile` with the actual token counts
-corrects the counters.
+After the LLM call, send the `reservationId` with the actual token counts:
+
+```bash
+curl -s -X POST http://localhost:8080/v1/quota/reconcile \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer test-api-key" \
+  -d '{"reservationId": "5f0c2a6e-8a53-4c43-9f53-8f0d7e1f3b0a", "actualInputTokens": 420, "actualOutputTokens": 180}' | jq .
+```
+
+Reconcile replaces the estimate stored with the reservation, so it can only
+give back that reservation's own charge, and it applies once.
 
 **6. Metrics**
 

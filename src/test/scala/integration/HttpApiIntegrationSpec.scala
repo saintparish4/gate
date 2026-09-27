@@ -320,24 +320,26 @@ class HttpApiIntegrationSpec
       }
     }
 
-    "POST /v1/quota/reconcile: another client's reconcile cannot free a quota" in {
+    "POST /v1/quota/reconcile: another client cannot reconcile a reservation, even knowing its ID" in {
       val fill = post(
         uri"/v1/quota/check",
         """{"userId": "shared-reconcile", "estimatedInputTokens": 100}""",
       )
-      val erase = post(
-        uri"/v1/quota/reconcile",
-        """{"userId": "shared-reconcile", "actualInputTokens": 0, "actualOutputTokens": 0, "estimatedInputTokens": 100, "estimatedOutputTokens": 0}""",
-      )
+      def erase(id: String) =
+        post(uri"/v1/quota/reconcile", s"""{"reservationId": "$id", "actualInputTokens": 0, "actualOutputTokens": 0}""")
       val next = post(
         uri"/v1/quota/check",
         """{"userId": "shared-reconcile", "estimatedInputTokens": 1}""",
       )
       for {
-        _ <- httpApp.run(as("test-key")(fill))
-        _ <- httpApp.run(as("other-key")(erase))
+        filled <- httpApp.run(as("test-key")(fill)).flatMap(json)
+        id <- IO.fromEither(filled.hcursor.get[String]("reservationId"))
+        stolen <- httpApp.run(as("other-key")(erase(id)))
         after <- httpApp.run(as("test-key")(next))
-      } yield after.status shouldBe Status.TooManyRequests
+      } yield {
+        stolen.status shouldBe Status.NotFound
+        after.status shouldBe Status.TooManyRequests
+      }
     }
   }
 
@@ -352,20 +354,20 @@ class HttpApiIntegrationSpec
           .asJson,
       )
 
-    def quotaReconcile(
-        userId: String,
-        actual: Long,
-        estimated: Long,
-    ): Request[IO] = Request[IO](Method.POST, uri"/v1/quota/reconcile")
-      .putHeaders(headers.Authorization(Credentials.Token(ci"Bearer", "test-key")))
-      .withEntity(
+    def quotaReconcile(reservationId: String, actual: Long): Request[IO] =
+      Request[IO](Method.POST, uri"/v1/quota/reconcile").putHeaders(
+        headers.Authorization(Credentials.Token(ci"Bearer", "test-key")),
+      ).withEntity(
         TokenQuotaReconcileRequest(
-          userId = userId,
+          reservationId = reservationId,
           actualInputTokens = actual,
           actualOutputTokens = 0,
-          estimatedInputTokens = estimated,
-          estimatedOutputTokens = 0,
         ).asJson,
+      )
+
+    def reservationId(response: Response[IO]): IO[String] = response.as[String]
+      .flatMap(body =>
+        IO.fromEither(parse(body).flatMap(_.hcursor.get[String]("reservationId"))),
       )
 
     "POST /v1/quota/check admits under the limit, then rejects with Retry-After inside the window" in {
@@ -386,7 +388,8 @@ class HttpApiIntegrationSpec
     "POST /v1/quota/reconcile replaces the estimate so freed tokens can be reused" in {
       for {
         first <- httpApp.run(quotaCheck("quota-user-2", 60))
-        reconciled <- httpApp.run(quotaReconcile("quota-user-2", 30, 60))
+        id <- reservationId(first)
+        reconciled <- httpApp.run(quotaReconcile(id, 30))
         second <- httpApp.run(quotaCheck("quota-user-2", 60))
       } yield {
         first.status shouldBe Status.Ok
@@ -394,6 +397,37 @@ class HttpApiIntegrationSpec
         // 30 actually used + 60 requested = 90, inside the 100-token limit.
         second.status shouldBe Status.Ok
       }
+    }
+
+    "POST /v1/quota/reconcile applies once: a second reconcile cannot free tokens again" in {
+      for {
+        first <- httpApp.run(quotaCheck("quota-user-3", 90))
+        id <- reservationId(first)
+        _ <- httpApp.run(quotaReconcile(id, 90))
+        again <- httpApp.run(quotaReconcile(id, 0))
+        next <- httpApp.run(quotaCheck("quota-user-3", 20))
+      } yield {
+        again.status shouldBe Status.Conflict
+        // Still 90 used, so 20 more would pass the 100-token limit.
+        next.status shouldBe Status.TooManyRequests
+      }
+    }
+
+    "POST /v1/quota/reconcile ignores an estimate in the request" in {
+      // The old contract took the estimate from the caller, which let
+      // actual = 0 with a huge estimate zero the counter (finding B).
+      val forged = Request[IO](Method.POST, uri"/v1/quota/reconcile")
+        .putHeaders(headers.Authorization(
+          Credentials.Token(ci"Bearer", "test-key"),
+        ))
+      for {
+        first <- httpApp.run(quotaCheck("quota-user-4", 90))
+        id <- reservationId(first)
+        _ <- httpApp.run(
+          forged.withEntity(s"""{"reservationId": "$id", "actualInputTokens": 90, "actualOutputTokens": 0, "estimatedInputTokens": 1000000}"""),
+        )
+        next <- httpApp.run(quotaCheck("quota-user-4", 20))
+      } yield next.status shouldBe Status.TooManyRequests
     }
   }
 
