@@ -24,7 +24,7 @@ NEED_SBT = @command -v sbt >/dev/null 2>&1 || { echo "Error: sbt not found in PA
 
 .DEFAULT_GOAL := help
 .PHONY: help up up-clean down clean logs status run dev stack obs \
-        fmt test test-it test-all smoke health correctness env-drift monitoring-check tf-validate
+        fmt test test-it test-all smoke health correctness env-drift monitoring-check tf-validate tf-test
 
 help: ## Show this help
 	@awk 'BEGIN { FS = ":.*##"; printf "Usage: make <target>\n" } \
@@ -144,6 +144,13 @@ env-drift: ## Compare env vars across application.conf, compose and Terraform
 monitoring-check: ## Check every app metric the Terraform dashboard and alarms use is emitted
 	./scripts/check-monitoring-metrics.sh
 
-tf-validate: ## Initialise providers and validate the Terraform config
+# -backend=false: validation needs no state, so it runs without AWS access or
+# the S3 bucket bootstrap.sh creates.
+tf-validate: ## Validate both Terraform roots (no AWS access needed)
 	@command -v terraform >/dev/null 2>&1 || { echo "Error: terraform not found in PATH."; echo "  Install it: https://www.terraform.io/downloads"; exit 1; }
-	cd terraform && terraform init -upgrade && terraform validate
+	cd terraform && terraform init -backend=false -input=false >/dev/null && terraform validate
+	cd terraform/bootstrap && terraform init -backend=false -input=false >/dev/null && terraform validate
+
+tf-test: ## Plan the ALB's TLS and exposure rules against a mocked AWS provider
+	@command -v terraform >/dev/null 2>&1 || { echo "Error: terraform not found in PATH."; exit 1; }
+	cd terraform/modules/ecs && terraform init -backend=false -input=false >/dev/null && terraform test

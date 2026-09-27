@@ -90,3 +90,20 @@ variable "health_check_grace_period_seconds" {
   type        = number
   default     = 180
 }
+
+variable "certificate_arn" {
+  description = "ACM certificate for the HTTPS listener. Empty serves HTTP only, to alb_ingress_cidrs."
+  type        = string
+  default     = ""
+}
+
+variable "alb_ingress_cidrs" {
+  description = "Addresses allowed to reach the ALB"
+  type        = list(string)
+}
+
+variable "allow_public_plaintext" {
+  description = "Accept serving HTTP without a certificate to 0.0.0.0/0"
+  type        = bool
+  default     = false
+}

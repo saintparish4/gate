@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # publish-image.sh - Build the Gate image and push it to ECR, then print the URI.
 #
-# terraform/ has no aws_ecr_repository resource and container_image is a
-# required variable with no default, so the image has to exist in ECR before
-# deploy-demo.sh runs. This script closes that gap.
+# The repository and its lifecycle policy belong to terraform/bootstrap, so run
+# ./scripts/bootstrap.sh once first. This script used to create both with the
+# CLI, outside any Terraform state.
 #
 #   export ECR_IMAGE=$(./scripts/publish-image.sh)
 #   ./scripts/deploy-demo.sh
@@ -11,7 +11,14 @@ set -euo pipefail
 
 REPO="${ECR_REPO_NAME:-gate}"
 REGION="${AWS_REGION:-us-east-1}"
+
+# Tags are immutable, so a tag always names one image. A build from a tree
+# with uncommitted changes must not take the commit's tag, or that tag would
+# name code the commit never contained.
 TAG="${IMAGE_TAG:-$(git rev-parse --short HEAD)}"
+if [ -z "${IMAGE_TAG:-}" ] && [ -n "$(git status --porcelain)" ]; then
+  TAG="$TAG-dirty-$(date +%Y%m%d%H%M%S)"
+fi
 
 # Everything informational goes to stderr so the last stdout line is the URI.
 log() { echo "$@" >&2; }
@@ -23,46 +30,17 @@ URI="${REGISTRY}/${REPO}:${TAG}"
 log "Account $ACCOUNT / region $REGION / image $URI"
 
 if ! aws ecr describe-repositories --repository-names "$REPO" --region "$REGION" >/dev/null 2>&1; then
-  log "Creating ECR repository '$REPO'..."
-  aws ecr create-repository \
-    --repository-name "$REPO" \
-    --region "$REGION" \
-    --image-scanning-configuration scanOnPush=true >/dev/null
+  log "Error: ECR repository '$REPO' does not exist. Create it with:"
+  log "   ./scripts/bootstrap.sh"
+  exit 1
 fi
 
-# The repository lives outside Terraform state, so `terraform destroy` and
-# teardown-demo.sh both leave it behind and it gains an image per deploy. I
-# reapply this every run rather than only on create, so repositories made
-# before the policy existed pick it up too.
-log "Applying ECR lifecycle policy (expire untagged >1d, keep last 10)..."
-aws ecr put-lifecycle-policy \
-  --repository-name "$REPO" \
-  --region "$REGION" \
-  --lifecycle-policy-text '{
-    "rules": [
-      {
-        "rulePriority": 1,
-        "description": "Expire untagged images after 1 day",
-        "selection": {
-          "tagStatus": "untagged",
-          "countType": "sinceImagePushed",
-          "countUnit": "days",
-          "countNumber": 1
-        },
-        "action": { "type": "expire" }
-      },
-      {
-        "rulePriority": 2,
-        "description": "Keep only the 10 most recent images",
-        "selection": {
-          "tagStatus": "any",
-          "countType": "imageCountMoreThan",
-          "countNumber": 10
-        },
-        "action": { "type": "expire" }
-      }
-    ]
-  }' >/dev/null
+if aws ecr describe-images --repository-name "$REPO" --region "$REGION" \
+     --image-ids imageTag="$TAG" >/dev/null 2>&1; then
+  log "$URI is already in ECR; tags are immutable, so it is reused as is."
+  echo "$URI"
+  exit 0
+fi
 
 log "Logging Docker in to ECR..."
 aws ecr get-login-password --region "$REGION" \

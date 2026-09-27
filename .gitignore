@@ -57,6 +57,10 @@ book/
 .env.*.local
 # Demo API keys written by scripts/deploy-demo.sh
 .demo-keys.env
+# Names the account's state bucket; written by scripts/bootstrap.sh
+terraform/backend.hcl
+# Only root configurations pin providers; a module's lock file comes from tf-test
+terraform/modules/**/.terraform.lock.hcl
 
 **/.terraform/*
 

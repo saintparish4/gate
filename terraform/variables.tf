@@ -210,3 +210,28 @@ variable "container_port" {
   default     = 8080
 }
 
+# ---------------------------------------------------------------------------
+# TLS and ALB exposure
+#
+# The ALB served API keys over plain HTTP to 0.0.0.0/0. Now it serves HTTPS
+# when certificate_arn is set; without one, a plan that would open plaintext to
+# the whole internet is refused unless allow_public_plaintext is set.
+# ---------------------------------------------------------------------------
+
+variable "certificate_arn" {
+  description = "ACM certificate ARN for the HTTPS listener. Point your domain at the ALB; the certificate must cover it."
+  type        = string
+  default     = ""
+}
+
+variable "alb_ingress_cidrs" {
+  description = "CIDRs allowed to reach the ALB. deploy-demo.sh passes your current IP."
+  type        = list(string)
+  default     = ["0.0.0.0/0"]
+}
+
+variable "allow_public_plaintext" {
+  description = "Deliberately serve HTTP without a certificate to 0.0.0.0/0. API keys then cross the internet in cleartext."
+  type        = bool
+  default     = false
+}

@@ -4,8 +4,8 @@ output "load_balancer_dns" {
 }
 
 output "api_endpoint" {
-  description = "API endpoint URL"
-  value       = "http://${module.ecs.load_balancer_dns}"
+  description = "API endpoint URL. With a certificate, use your domain, which the certificate covers, rather than the ALB name."
+  value       = "${var.certificate_arn != "" ? "https" : "http"}://${module.ecs.load_balancer_dns}"
 }
 
 output "dynamodb_rate_limit_table" {
