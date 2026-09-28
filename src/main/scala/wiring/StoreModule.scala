@@ -66,7 +66,7 @@ object StoreModule:
         config.resilience.parsedDegradationMode,
       )
 
-      idempotencyStore <- config.storage.backend match
+      rawIdempotencyStore <- config.storage.backend match
         case "in-memory" => Resource.eval(IdempotencyStore.inMemory[F])
         case _ =>
           for
@@ -76,8 +76,20 @@ object StoreModule:
               config.dynamodb.idempotencyTable,
             )
           yield store
+      idempotencyGuard <- StoreGuard.resource[F](
+        "idempotency",
+        config.resilience.timeout.idempotencyCheck,
+        config.resilience.bulkhead,
+      )
+      idempotencyStore = StoreGuard
+        .idempotency(rawIdempotencyStore, idempotencyGuard)
 
-      tokenQuotaStore <-
+      quotaGuard <- StoreGuard.resource[F](
+        "quota",
+        config.resilience.timeout.quotaCheck,
+        config.resilience.bulkhead,
+      )
+      rawTokenQuotaStore <-
         if config.tokenQuota.enabled then
           config.storage.backend match
             case "in-memory" => Resource
@@ -98,5 +110,5 @@ object StoreModule:
       rateLimitStore,
       resilientStore,
       idempotencyStore,
-      tokenQuotaStore,
+      rawTokenQuotaStore.map(StoreGuard.tokenQuota(_, quotaGuard)),
     )

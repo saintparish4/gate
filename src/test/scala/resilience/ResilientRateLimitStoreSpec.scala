@@ -236,3 +236,29 @@ class ResilientRateLimitStoreSpec
       yield gauge shouldBe Some(1.0)
     }
   }
+
+  "a check that times out is not retried" - {
+    // The per-check timeout bounds the whole check. Retrying a timed-out call
+    // would multiply the worst case by the retry count, so a timeout is one
+    // attempt and then the degradation mode (audit row 21, decided one-shot).
+
+    "the underlying store is called once" in TestControl.executeEmbed(
+      for
+        calls <- Ref.of[IO, Int](0)
+        hanging = new RateLimitStore[IO]:
+          def checkAndConsume(
+              key: String,
+              cost: Int,
+              profile: RateLimitProfile,
+          ) = calls.update(_ + 1) *> IO.never
+          def getStatus(key: String, profile: RateLimitProfile) = IO.never
+          def healthCheck = IO.pure(Right(()))
+        decision <- buildStore(hanging)
+          .use(_.checkAndConsume("k", 1, testProfile))
+        n <- calls.get
+      yield (decision, n),
+    ).asserting { case (decision, n) =>
+      n shouldBe 1
+      decision shouldBe a[RateLimitDecision.Allowed] // AllowAll degradation
+    }
+  }

@@ -326,6 +326,36 @@ resource "aws_cloudwatch_metric_alarm" "circuit_breaker_open" {
   }
 }
 
+# A limiter or quota item that cannot be parsed. The store replaces it with
+# the most conservative valid state, so the key refuses until it refills or
+# its window ends. That is safe but not normal, so any occurrence alarms: an
+# operator should find out what is corrupting items.
+resource "aws_cloudwatch_metric_alarm" "corrupt_state" {
+  alarm_name          = "${var.project_name}-${var.environment}-corrupt-state"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  datapoints_to_alarm = 1
+  metric_name         = "CorruptStateRead"
+  namespace           = local.namespace
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 1
+  # Emitted only when a corrupt item is read; silence means none.
+  treat_missing_data = "notBreaching"
+
+  dimensions = {
+    Environment = var.environment
+  }
+
+  alarm_description = "A rate-limit or quota item could not be parsed and was replaced; its key refuses until it refills"
+  alarm_actions     = local.alarm_actions
+  ok_actions        = local.alarm_actions
+
+  tags = {
+    Name = "${var.project_name}-${var.environment}-corrupt-state"
+  }
+}
+
 data "aws_region" "current" {}
 
 # Outputs

@@ -177,6 +177,10 @@ case class TimeoutSettings(
       .Duration(500, "millis"),
     idempotencyCheck: FiniteDuration = scala.concurrent.duration
       .Duration(2, "seconds"),
+    // Longer than the others: a quota check runs its own OCC loop (up to 25
+    // attempts) inside this bound, and it guards an LLM call that takes
+    // seconds anyway.
+    quotaCheck: FiniteDuration = scala.concurrent.duration.Duration(5, "seconds"),
     healthCheck: FiniteDuration = scala.concurrent.duration
       .Duration(5, "seconds"),
 ) derives ConfigReader
@@ -256,6 +260,22 @@ object AppConfig:
     else
       Some("no API key source: set SECRETS_MANAGER_ENABLED=true to load keys from Secrets Manager, or ALLOW_BUILT_IN_KEYS=true for local development only (the built-in keys are public and include an admin key)")
 
+  val validAlgorithms: Set[String] =
+    Set("token-bucket", "leaky-bucket", "sliding-window")
+  val validStorageBackends: Set[String] = Set("dynamodb", "in-memory")
+
+  /** An unknown RATE_LIMIT_ALGORITHM used to become the token bucket and an
+    * unknown STORAGE_BACKEND became DynamoDB, so a typo quietly ran something
+    * nobody chose.
+    */
+  def validateChoices(config: AppConfig): List[String] =
+    def one(name: String, value: String, valid: Set[String]) = Option
+      .when(!valid.contains(value))(s"$name '$value' is not one of ${valid
+          .toList.sorted.mkString(", ")}")
+    one("rate-limit.algorithm", config.rateLimit.algorithm, validAlgorithms)
+      .toList ++
+      one("storage.backend", config.storage.backend, validStorageBackends)
+
   /** Every rule `load` enforces beyond what the types already do. */
   def validate(config: AppConfig): List[String] =
     val profileErrors = config.rateLimit.profiles.toList
@@ -270,7 +290,8 @@ object AppConfig:
     val degradationErrors =
       validateDegradationMode(config.resilience.degradationMode).toList
     val keySourceErrors = validateKeySource(config.security).toList
-    profileErrors ++ quotaErrors ++ degradationErrors ++ keySourceErrors
+    profileErrors ++ quotaErrors ++ degradationErrors ++ keySourceErrors ++
+      validateChoices(config)
 
   /** Load and validate, failing on any error.
     *

@@ -38,16 +38,18 @@ DynamoDB, zero errors. See [Correctness](#correctness).
 
 | Failure mode | Behaviour |
 |-------------|-----------|
-| **DynamoDB slow or partially down** | The rate-limit store is wrapped in a bulkhead (100 concurrent calls, 500 ms max wait), a process-wide circuit breaker (20 failures to open, 30 s reset, 3 half-open calls), a retry policy (3 retries, 100 ms base, 2x backoff, 10 s cap), and a 2 s timeout per check. When the breaker is open, `DEGRADATION_MODE` decides: `reject-all` (default, safe for payments) or `allow-all` (for AI infrastructure where availability wins). Every degraded decision increments `gate_degraded_total`. |
+| **DynamoDB slow or partially down** | The rate-limit store is wrapped in a bulkhead (100 concurrent calls, 500 ms max wait), a process-wide circuit breaker (20 failures to open, 30 s reset, 3 half-open calls), a retry policy for SDK and I/O errors (3 retries, 100 ms base, 2x backoff, 10 s cap), and a 2 s timeout per check. A timed-out check is not retried: the bound covers the whole check. When the breaker is open, `DEGRADATION_MODE` decides: `reject-all` (default, safe for payments) or `allow-all` (for AI infrastructure where availability wins). Every degraded decision increments `gate_degraded_total`. `GET /v1/ratelimit/status` answers `503` when the store cannot be read, rather than reporting a full bucket. |
+| **A corrupt limiter or quota item** | It fails closed and self-heals. The store replaces the item, conditioned on its raw stored version, with the most conservative valid state: an empty token bucket, a full leaky bucket or sliding window, an exhausted quota window starting now. The key refuses until it refills, drains, or the window ends. Each read counts `CorruptStateRead`, which has an alarm. A corrupt idempotency record answers `503`, since whether its operation ran is unknowable. |
 | **Instance crash** | No in-process state. The next instance reads current DynamoDB state and continues correctly. |
-| **Kinesis failure** | Events go into a bounded in-memory queue (10,000, drop-oldest) that a background fiber drains to Kinesis. A failed publish is retried once, then dropped and counted (`gate_events_dropped_total`, CloudWatch `DroppedKinesisEvent`). The request path never waits on Kinesis. |
+| **Kinesis failure** | Events go into a bounded in-memory queue (10,000, drop-oldest) that a background fiber drains to Kinesis. A failed publish is retried once, then dropped. Both an eviction from a full queue and a failed publish are counted, as `gate_events_dropped_total` and CloudWatch `DroppedKinesisEvent{reason=queue_full\|publish_failed}`. The request path never waits on Kinesis, and `/ready` reports a Kinesis fault as `degraded` without taking the task out of service. |
 | **OCC exhaustion on a hot key** | After 10 failed conditional writes the request is rejected with 429 instead of over-issuing. |
 | **Idempotency TOCTOU race** | If the conditional create fails and the follow-up read finds nothing (TTL deleted the item in between), the check retries up to 3 times instead of returning a false `new`. |
 
-The breaker, bulkhead, retry, and timeout wrap the rate-limit store only. The
-idempotency store answers `503` if DynamoDB fails; the quota store has its own
-conditional-write retry loop and answers `503` with `Retry-After: 1` under
-contention.
+The breaker and retry wrap the rate-limit store only. The idempotency and quota
+stores each have their own bulkhead and timeout (2 s and 5 s; the quota bound
+covers its own conditional-write retry loop). A store failure on either
+answers `503` with `storage_unavailable`, and quota contention answers `503`
+with `Retry-After: 1`.
 
 ## Architecture
 
@@ -299,7 +301,8 @@ Full request and response schemas: [API.md](docs/API.md).
 Everything is in [`application.conf`](src/main/resources/application.conf);
 each setting has an environment-variable override. A value Gate cannot honour
 (an unknown degradation mode, an invalid profile, an agent quota above 80% of
-the user quota, no API key source, a value of the wrong type) stops startup with `Refusing to
+the user quota, no API key source, an unknown algorithm or storage backend, a
+value of the wrong type) stops startup with `Refusing to
 start: ...` rather than running on defaults. The ones that matter most:
 
 | Env var | Default | Notes |
@@ -308,7 +311,7 @@ start: ...` rather than running on defaults. The ones that matter most:
 | `USE_LOCALSTACK` / `AWS_ENDPOINT` | `false` / unset | Compose points both at `http://localstack:4566` |
 | `RATE_LIMIT_TABLE` / `IDEMPOTENCY_TABLE` / `TOKEN_QUOTA_TABLE` | `rate-limits` / `idempotency` / `gate-token-quotas` | LocalStack names; Terraform passes its own (see [Deploying](#deploying-to-aws)) |
 | `KINESIS_STREAM` | `rate-limit-events` | Same split as the tables |
-| `RATE_LIMIT_ALGORITHM` | `token-bucket` | `leaky-bucket` and `sliding-window` are also implemented |
+| `RATE_LIMIT_ALGORITHM` | `token-bucket` | Or `leaky-bucket` or `sliding-window`; anything else stops startup |
 | `RATELIMIT_DEFAULT_CAPACITY` / `RATELIMIT_DEFAULT_REFILL_RATE` | `100` / `10.0` | Used when no profile applies |
 | `IDEMPOTENCY_DEFAULT_TTL` / `IDEMPOTENCY_MAX_TTL_SECONDS` | `86400` / `86400` | Client TTLs above the max are capped |
 | `TOKEN_QUOTA_ENABLED` | `false` | Compose and the demo deploy set `true` |
@@ -316,7 +319,7 @@ start: ...` rather than running on defaults. The ones that matter most:
 | `KINESIS_ENABLED` / `KINESIS_QUEUE_SIZE` | `true` / `10000` | |
 | `CIRCUIT_BREAKER_MAX_FAILURES` / `CIRCUIT_BREAKER_RESET_TIMEOUT` | `20` / `30 seconds` | One breaker for the whole rate-limit store |
 | `BULKHEAD_MAX_CONCURRENT` | `100` | |
-| `TIMEOUT_RATE_LIMIT_CHECK` / `TIMEOUT_IDEMPOTENCY_CHECK` | `2s` / `2s` | Compose raises both to 10 s for LocalStack |
+| `TIMEOUT_RATE_LIMIT_CHECK` / `TIMEOUT_IDEMPOTENCY_CHECK` / `TIMEOUT_QUOTA_CHECK` | `2s` / `2s` / `5s` | Compose raises all three to 10 s for LocalStack |
 | `DEGRADATION_MODE` | `reject-all` | Or `allow-all`. Anything else, including the former `use-cached`, stops startup |
 | `DASHBOARD_ENABLED` | `false` | Compose sets `true`; Terraform pins `false` |
 | `AUTH_RATE_LIMIT_PER_MINUTE` | `1000` | Compose and the demo raise it to 10,000,000 for load runs |
@@ -325,7 +328,7 @@ start: ...` rather than running on defaults. The ones that matter most:
 | `METRICS_ENABLED` / `METRICS_NAMESPACE` / `METRICS_ENVIRONMENT` | `true` / `RateLimiter` / `dev` | CloudWatch publishing is off whenever `USE_LOCALSTACK=true` |
 | `PROMETHEUS_ENABLED` | `true` | `/metrics` answers 404 to an admin key when off |
 | `TRACING_ENABLED` | `true` | The OpenTelemetry SDK reads `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_SERVICE_NAME` itself |
-| `STORAGE_BACKEND` | `dynamodb` | `in-memory` for single-process tests; not correct across instances |
+| `STORAGE_BACKEND` | `dynamodb` | `in-memory` for single-process tests, not correct across instances; anything else stops startup |
 
 ### Rate-limit profiles
 
@@ -526,7 +529,7 @@ experimental.
 | Kinesis `-events` | Decision event stream, KMS-encrypted |
 | ECS Fargate service + ALB | Target group health check on `/ready`, container health check on `/health`; CPU target-tracking autoscaling when enabled. HTTPS (TLS 1.2+) with an HTTP redirect when `certificate_arn` is set; otherwise HTTP only to `alb_ingress_cidrs` (see [TLS](#tls)) |
 | VPC | Two AZs, private subnets for tasks, two NAT gateways, interface endpoints for ECR, CloudWatch Logs, Secrets Manager and Kinesis, a gateway endpoint for DynamoDB |
-| CloudWatch | Log group `/ecs/<project>-<environment>` (7 days, 30 in `prod`), a dashboard, and four alarms (error rate, p99 latency, healthy tasks, circuit breaker open); they notify only when `alarm_sns_topic_arn` is set |
+| CloudWatch | Log group `/ecs/<project>-<environment>` (7 days, 30 in `prod`), a dashboard, and five alarms (error rate, p99 latency, healthy tasks, circuit breaker open, corrupt state read); they notify only when `alarm_sns_topic_arn` is set |
 | Secrets Manager | `<project>/<environment>/api-keys`, seeded with an inactive placeholder; the service refuses to start until it holds an active key |
 
 Local and AWS resource names differ. The app reads them from the environment,

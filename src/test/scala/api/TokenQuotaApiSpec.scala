@@ -1,5 +1,7 @@
 package api
 
+import scala.concurrent.duration.*
+
 import org.http4s.*
 import org.http4s.circe.*
 import org.http4s.circe.CirceEntityDecoder.*
@@ -239,5 +241,32 @@ class TokenQuotaApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
       routeResponse.asserting(maybeResp =>
         maybeResp.map(_.status) shouldBe Some(Status.NotFound),
       )
+    }
+
+    "a store failure is a 503 the caller can act on, not a 500" in {
+      val failing = new TokenQuotaService[IO]:
+        def checkQuota(
+            clientId: String,
+            identifier: QuotaIdentifier,
+            estimatedInputTokens: Long,
+            estimatedOutputTokens: Long,
+        ) = IO.raiseError(core.GateError.StoreTimeout("quota", 5.seconds))
+        def reconcile(
+            clientId: String,
+            reservationId: String,
+            actualInputTokens: Long,
+            actualOutputTokens: Long,
+        ) = IO.raiseError(new RuntimeException("dynamo down"))
+      val api = makeApiWith(failing)
+      for
+        check <- api
+          .check(checkRequest("user-z", estimatedInput = 10), testClient)
+        checkBody <- check.bodyText.compile.string
+        rec <- api.reconcile(reconcileRequest("r", 1, 0), testClient)
+      yield
+        check.status shouldBe Status.ServiceUnavailable
+        check.headers.get(ci"Retry-After") shouldBe defined
+        checkBody should include("storage_unavailable")
+        rec.status shouldBe Status.ServiceUnavailable
     }
   }

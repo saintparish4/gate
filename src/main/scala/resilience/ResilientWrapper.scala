@@ -122,12 +122,12 @@ object ResilientRateLimitStore:
             underlying.getStatus(key, profile),
           )
 
+        // A failure propagates. It used to become None, which the API renders
+        // as a key never seen, so a store outage reported every bucket full.
         applyPatterns(operation, "getStatus")
-          .flatTap(_ => healthTracker.recordSuccess).handleErrorWith(error =>
+          .flatTap(_ => healthTracker.recordSuccess).onError(error =>
             healthTracker.recordFailure(error) *>
-              logger
-                .warn(s"Failed to get status for $key, returning None: ${error
-                    .getMessage}") *> Temporal[F].pure(None),
+              logger.warn(s"Failed to get status for $key: ${error.getMessage}"),
           )
 
       override def healthCheck: F[Either[String, Unit]] = healthTracker

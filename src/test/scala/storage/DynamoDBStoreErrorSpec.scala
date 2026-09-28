@@ -107,7 +107,7 @@ class DynamoDBStoreErrorSpec
     *
     * NOTE: "NaN".toDouble succeeds in Scala/Java (returns Double.NaN). We must
     * use a string that actually throws NumberFormatException so that parseState
-    * returns Left and the store falls back to full-capacity (fails open).
+    * returns Left and the store takes the corrupt-state path.
     */
   private def corruptTokensResponse(key: String): GetItemResponse =
     val item = Map(
@@ -197,11 +197,12 @@ class DynamoDBStoreErrorSpec
 
   "DynamoDBRateLimitStore — corrupt stored state" - {
 
-    "fails open (grants full capacity) when stored tokens attribute is malformed" in {
-      // The stub returns a GetItemResponse with tokens = "NaN" which cannot be
-      // parsed as a Double.  DynamoDBRateLimitStore.getOrInitState detects the
-      // Left parse result, logs an ERROR, increments CorruptStateRead, and
-      // falls back to a fresh full-capacity bucket — i.e. allows the request.
+    "fails closed and replaces the item when stored tokens attribute is malformed" in {
+      // The stub returns an item whose tokens cannot be parsed. The store must
+      // never grant on state it cannot read: it replaces the item with an empty
+      // bucket and retries. This stub keeps returning the corrupt item and
+      // ignores write conditions, so the retries run out and the check is
+      // refused; the LocalStack spec shows the real heal.
       val key = "corrupt-state-key"
       val client = stubClient(corruptTokensResponse(key))
 
@@ -218,8 +219,8 @@ class DynamoDBStoreErrorSpec
         recorded <- metricNames.get
       yield (decision, logs, recorded)).asserting {
         case (decision, logs, recorded) =>
-          // 1. Fails open → request is allowed
-          decision shouldBe a[RateLimitDecision.Allowed]
+          // 1. Fails closed
+          decision shouldBe a[RateLimitDecision.Rejected]
 
           // 2. An ERROR is logged mentioning the key and the corrupt-state reason
           logs
@@ -227,7 +228,10 @@ class DynamoDBStoreErrorSpec
               msg.contains(key) && msg.contains("Corrupt"),
             ) shouldBe true
 
-          // 3. CorruptStateRead metric is incremented
+          // 3. The replacement was written
+          recorded should contain("CorruptStateHealed")
+
+          // 4. CorruptStateRead metric is incremented
           recorded should contain("CorruptStateRead")
       }
     }
