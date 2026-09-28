@@ -21,6 +21,20 @@ require_terraform() {
   fi
 }
 
+# Terraform's AWS provider cannot read every credential source the AWS CLI can:
+# an `aws login` session is one, and the first deploy with these scripts
+# failed on it with "No valid credential sources found" while the CLI worked.
+# The CLI hands over its resolved, temporary credentials as environment
+# variables, which every provider version reads.
+use_cli_credentials() {
+  [ -n "${AWS_ACCESS_KEY_ID:-}" ] && return 0
+  local creds
+  creds=$(aws configure export-credentials --format env 2>/dev/null) || {
+    echo "Error: the AWS CLI has no usable credentials. Run 'aws login' or configure a profile first." >&2
+    exit 1; }
+  eval "$creds"
+}
+
 require_backend() {
   [ -f "$BACKEND_HCL" ] || {
     echo "Error: $BACKEND_HCL is missing. Create the state bucket first:" >&2

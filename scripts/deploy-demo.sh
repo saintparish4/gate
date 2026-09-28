@@ -26,6 +26,7 @@ if ! aws sts get-caller-identity > /dev/null 2>&1; then
 fi
 
 require_terraform
+use_cli_credentials
 require_backend
 
 # Deploy infrastructure. State lives in S3 under the demo's own key.
@@ -149,9 +150,10 @@ fi
 echo ""
 echo "Demo ready at: $API"
 echo ""
-echo "Cost: roughly \$0.25/hour in us-east-1 - 2 NAT gateways (\$0.09), five"
-echo "interface VPC endpoints across 2 AZs (\$0.10), ALB (\$0.023), Fargate"
-echo "256/512 (\$0.012), one Kinesis shard (\$0.015). About \$6/day if left up."
+echo "Cost: roughly \$0.30/hour in us-east-1 - 2 NAT gateways (\$0.09), five"
+echo "interface VPC endpoints across 2 AZs (\$0.10), ALB (\$0.023), one Fargate"
+echo "task at 1 vCPU / 2 GB (demo.tfvars), one Kinesis shard (\$0.015)."
+echo "About \$7/day if left up."
 echo ""
 echo "TEAR IT DOWN WHEN DONE:  ./scripts/teardown-demo.sh"
 echo ""
