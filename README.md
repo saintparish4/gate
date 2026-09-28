@@ -453,10 +453,28 @@ different clients. Against a deployed stack all three come from
 
 ### On AWS
 
-The same three invariants, run from a laptop over the internet against the
-Terraform-deployed demo stack: one Fargate task (1024 CPU units / 2048 MB),
-DynamoDB on-demand, us-east-1. Run `1789440743789`, 2026-09-14. Zero errors,
-no degradation-mode decisions, every request served by the token bucket.
+Two runs, each from a laptop over the internet against the Terraform-deployed
+demo stack: one Fargate task (1024 CPU units / 2048 MB), DynamoDB on-demand,
+us-east-1. Two passing runs are evidence, not a reliability history.
+
+**2026-09-27, run `1790555564135`, all four invariants.** This demo:
+- loaded its keys from Secrets Manager, written by `deploy-demo.sh`, and
+  answered 401 to the built-in `test-api-key`;
+- served HTTP only to the deployer's IP;
+- ran with every storage key scoped per client.
+
+Zero errors on every invariant.
+
+| Invariant | Result | Detail | Throughput |
+|-----------|--------|--------|------------|
+| A — token bucket never over-issues | **PASS** | `allowed=78` within `20 <= 78 <= 91`; 5,281 blocked, 0 errors, `server-excess = -1.0 s` | ~178 RPS |
+| B — idempotency, exactly one `new` per key | **PASS** | `created=10` of 10 keys; 6,840 duplicates, 0 conflicts, 0 errors | ~228 RPS |
+| C — token quota never over-admits | **PASS** | `admitted=40 x 25,000 = 1,000,000`, the limit; 6,933 rejected, 0 errors | ~348 RPS |
+| D — tenants never share state | **PASS** | each client created its own 10 records and got its own 40 admissions (80 together); 974 of 974 cross-client reconciles refused; 0 conflicts, 0 errors | ~306 RPS |
+
+**2026-09-14, run `1789440743789`, invariants A-C** (D did not exist yet).
+Zero errors, no degradation-mode decisions, every request served by the token
+bucket.
 
 | Invariant | Result | Detail | Throughput |
 |-----------|--------|--------|------------|
