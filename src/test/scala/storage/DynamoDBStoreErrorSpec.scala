@@ -59,16 +59,14 @@ class DynamoDBStoreErrorSpec
     circuitBreaker = CircuitBreakerSettings(
       enabled = false,
       dynamodb = config.CircuitBreakerConfig(),
-      kinesis = config.CircuitBreakerConfig(),
     ),
-    retry = RetrySettings(
-      dynamodb = RetryConfig(
+    retry = RetrySettings(dynamodb =
+      RetryConfig(
         maxRetries = 0,
         baseDelay = 1.millis,
         maxDelay = 1.millis,
         multiplier = 1.0,
       ),
-      kinesis = RetryConfig(),
     ),
     bulkhead = BulkheadSettings(enabled = false),
     timeout = TimeoutSettings(rateLimitCheck = 5.seconds),
@@ -131,7 +129,6 @@ class DynamoDBStoreErrorSpec
         failingStore(ex),
         fastResilienceConfig,
         MetricsPublisher.noop[IO],
-        EventPublisher.noop[IO],
         GracefulDegradation.DegradationMode.AllowAll,
       ).use(resilientStore =>
         resilientStore.checkAndConsume("test-key", cost = 1, testProfile)
@@ -153,7 +150,6 @@ class DynamoDBStoreErrorSpec
         failingStore(ex),
         fastResilienceConfig,
         MetricsPublisher.noop[IO],
-        EventPublisher.noop[IO],
         GracefulDegradation.DegradationMode.AllowAll,
       ).use(resilientStore =>
         resilientStore.checkAndConsume("throttled-key", cost = 1, testProfile)
@@ -172,7 +168,6 @@ class DynamoDBStoreErrorSpec
           failingStore(ex),
           fastResilienceConfig,
           metrics,
-          EventPublisher.noop[IO],
           GracefulDegradation.DegradationMode.AllowAll,
         ).use(resilientStore =>
           resilientStore.checkAndConsume("metric-key", cost = 1, testProfile),
@@ -190,7 +185,6 @@ class DynamoDBStoreErrorSpec
         failingStore(ex),
         fastResilienceConfig,
         MetricsPublisher.noop[IO],
-        EventPublisher.noop[IO],
         GracefulDegradation.DegradationMode.RejectAll,
       ).use(resilientStore =>
         resilientStore.checkAndConsume("reject-key", cost = 1, testProfile)

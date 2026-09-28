@@ -280,7 +280,7 @@ Authentication accepts `Authorization: Bearer <key>`, `Authorization: ApiKey
 empty body. A valid key without the route's permission answers 403 naming the
 permission, before the route touches any state. The built-in `test-api-key`
 and `free-api-key` hold the six standard permissions; `admin-api-key` also
-holds `AdminMetrics` and `AdminConfig`. Each key is also throttled to
+holds `AdminMetrics`. Each key is also throttled to
 `AUTH_RATE_LIMIT_PER_MINUTE` authentications (default 1,000); past that the
 answer is **429** with `Retry-After`, distinct from a bucket rejection.
 Malformed JSON answers 400 and JSON that does not match the schema answers
@@ -618,8 +618,8 @@ aws secretsmanager put-secret-value \
 
 Every field is required, `active` included. Permission names are
 `ratelimit_check`, `ratelimit_status`, `idempotency_check`,
-`idempotency_complete`, `quota_check`, `quota_reconcile`, `admin_metrics`, and
-`admin_config`; tiers are `free`, `basic`, `premium`, and `enterprise`. An
+`idempotency_complete`, `quota_check`, `quota_reconcile`, and `admin_metrics`;
+tiers are `free`, `basic`, `premium`, and `enterprise`. An
 entry with an unknown tier is skipped, and an unknown permission name is
 dropped. The app composes the secret name from `SECRETS_PREFIX`,
 `SECRETS_ENVIRONMENT`, and `API_KEYS_SECRET_NAME`, which Terraform sets to

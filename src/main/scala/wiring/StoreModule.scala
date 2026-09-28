@@ -63,7 +63,6 @@ object StoreModule:
         rateLimitStore,
         config.resilience,
         metrics,
-        events,
         config.resilience.parsedDegradationMode,
       )
 

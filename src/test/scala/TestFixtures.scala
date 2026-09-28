@@ -49,12 +49,6 @@ package object testutil:
           state: String,
           failures: Int,
       ): IO[Unit] = IO.unit
-      def recordCacheMetrics(
-          cacheName: String,
-          hitRate: Double,
-          size: Long,
-      ): IO[Unit] = IO.unit
-      def recordDegradedOperation(operation: String): IO[Unit] = IO.unit
       override def timed[A](name: String, dims: Map[String, String] = Map.empty)(
           fa: IO[A],
       ): IO[A] = fa

@@ -223,13 +223,4 @@ object PrometheusMetrics:
           case _ => -1.0,
       ))
 
-    override def recordCacheMetrics(
-        cacheName: String,
-        hitRate: Double,
-        size: Long,
-    ): F[Unit] = primary.recordCacheMetrics(cacheName, hitRate, size)
-
-    override def recordDegradedOperation(operation: String): F[Unit] = primary
-      .recordDegradedOperation(operation)
-
     override def flush: F[Unit] = primary.flush

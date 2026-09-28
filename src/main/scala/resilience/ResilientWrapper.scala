@@ -6,25 +6,13 @@ import org.typelevel.log4cats.Logger
 
 import cats.effect.*
 import cats.syntax.all.*
-import config.{
-  BulkheadSettings, CircuitBreakerSettings, ResilienceConfig, RetryConfig,
-  RetrySettings, TimeoutSettings,
-}
-import resilience.CircuitBreakerConfig
+import config.ResilienceConfig
 import core.{RateLimitDecision, RateLimitProfile, RateLimitStore}
-import events.{EventPublisher, RateLimitEvent}
 import observability.MetricsPublisher
 
-/** Resilient wrapper that applies production hardening patterns to the rate
-  * limit store.
-  *
-  * Provides:
-  *   - Circuit breaker protection against cascading failures
-  *   - Retry with exponential backoff for transient failures
-  *   - Local caching for reduced latency and backend protection
-  *   - Bulkhead isolation to prevent resource exhaustion
-  *   - Graceful degradation when dependencies fail
-  *   - Comprehensive metrics and logging
+/** Wraps the rate-limit store in a bulkhead, a circuit breaker, retries with
+  * backoff, and a per-check timeout. When the store cannot answer, the decision
+  * follows `degradationMode`.
   */
 object ResilientRateLimitStore:
 
@@ -61,10 +49,8 @@ object ResilientRateLimitStore:
       underlying: RateLimitStore[F],
       config: ResilienceConfig,
       metrics: MetricsPublisher[F],
-      eventPublisher: EventPublisher[F],
       degradationMode: GracefulDegradation.DegradationMode =
         GracefulDegradation.DegradationMode.AllowAll,
-      degradationCache: Option[LocalCache[F, String, RateLimitDecision]] = None,
   ): Resource[F, RateLimitStore[F]] =
     for
       // Create circuit breaker
@@ -97,8 +83,6 @@ object ResilientRateLimitStore:
 
       // Create health tracker
       healthTracker <- Resource.eval(HealthAwareService.tracker[F]())
-      reducedLimitRef <- Resource
-        .eval(Ref.of[F, Map[String, (Long, Int)]](Map.empty))
     yield new RateLimitStore[F]:
       private val logger = Logger[F]
 
@@ -124,10 +108,10 @@ object ResilientRateLimitStore:
         val wrappedOp = applyPatterns(operation, "checkAndConsume")
 
         // Handle failures with graceful degradation
-        wrappedOp.flatTap(decision => recordDecision(key, decision))
-          .flatTap(_ => healthTracker.recordSuccess).handleErrorWith(error =>
+        wrappedOp.flatTap(_ => healthTracker.recordSuccess).handleErrorWith(
+          error =>
             healthTracker.recordFailure(error) *> handleDegradation(key, error),
-          )
+        )
 
       override def getStatus(
           key: String,
@@ -193,55 +177,20 @@ object ResilientRateLimitStore:
           ) *> metrics.increment(
             "RateLimitDegraded",
             Map("reason" -> "circuit_breaker"),
-          ) *> GracefulDegradation.degradedDecision(
-            degradationMode,
-            key,
-            cache = degradationCache,
-            reducedLimitState = Some(reducedLimitRef),
-          )
+          ) *> GracefulDegradation.degradedDecision(degradationMode)
 
         case _: BulkheadRejected => logger.warn(
             s"Bulkhead rejected for key $key, applying degradation mode",
           ) *>
             metrics
               .increment("RateLimitDegraded", Map("reason" -> "bulkhead")) *>
-            GracefulDegradation.degradedDecision(
-              degradationMode,
-              key,
-              cache = degradationCache,
-              reducedLimitState = Some(reducedLimitRef),
-            )
+            GracefulDegradation.degradedDecision(degradationMode)
 
         case _ => logger.error(error)(
             s"Unexpected error for key $key, applying degradation mode",
           ) *>
             metrics.increment("RateLimitDegraded", Map("reason" -> "error")) *>
-            GracefulDegradation.degradedDecision(
-              degradationMode,
-              key,
-              cache = degradationCache,
-              reducedLimitState = Some(reducedLimitRef),
-            )
-
-      private def recordDecision(
-          key: String,
-          decision: RateLimitDecision,
-      ): F[Unit] = decision match
-        case RateLimitDecision.Allowed(tokens, _) => metrics
-            .increment("RateLimitAllowed") *> metrics.gauge(
-            "TokensRemaining",
-            tokens.toDouble,
-            Map("key_prefix" -> keyPrefix(key)),
-          )
-        case RateLimitDecision.Rejected(retryAfter, _) => metrics
-            .increment("RateLimitRejected") *> metrics.gauge(
-            "RetryAfterSeconds",
-            retryAfter.toDouble,
-            Map("key_prefix" -> keyPrefix(key)),
-          )
-
-      private def keyPrefix(key: String): String = key.split(":").headOption
-        .getOrElse("unknown")
+            GracefulDegradation.degradedDecision(degradationMode)
 
       private def isRetryable(error: Throwable): Boolean = error match
         case _: software.amazon.awssdk.services.dynamodb.model.ProvisionedThroughputExceededException =>
@@ -251,53 +200,3 @@ object ResilientRateLimitStore:
         case _: java.util.concurrent.TimeoutException => true
         case _: java.io.IOException => true
         case _ => false
-
-/** Immutable builder for creating resilient stores with fluent API.
-  */
-case class ResilientStoreBuilder[F[_]: Async: Logger](
-    underlying: RateLimitStore[F],
-    config: ResilienceConfig = ResilientStoreBuilder.defaultConfig,
-    metrics: MetricsPublisher[F],
-    events: EventPublisher[F],
-    degradationMode: GracefulDegradation.DegradationMode =
-      GracefulDegradation.DegradationMode.AllowAll,
-):
-  def withConfig(c: ResilienceConfig): ResilientStoreBuilder[F] =
-    copy(config = c)
-
-  def withMetrics(m: MetricsPublisher[F]): ResilientStoreBuilder[F] =
-    copy(metrics = m)
-
-  def withEvents(e: EventPublisher[F]): ResilientStoreBuilder[F] =
-    copy(events = e)
-
-  def withDegradationMode(
-      mode: GracefulDegradation.DegradationMode,
-  ): ResilientStoreBuilder[F] = copy(degradationMode = mode)
-
-  def build: Resource[F, RateLimitStore[F]] =
-    ResilientRateLimitStore(underlying, config, metrics, events, degradationMode)
-
-object ResilientStoreBuilder:
-  def apply[F[_]: Async: Logger](
-      store: RateLimitStore[F],
-  ): ResilientStoreBuilder[F] = ResilientStoreBuilder[F](
-    underlying = store,
-    config = defaultConfig,
-    metrics = MetricsPublisher.noop[F],
-    events = EventPublisher.noop[F],
-    degradationMode = GracefulDegradation.DegradationMode.AllowAll,
-  )
-
-  private[resilience] def defaultConfig: ResilienceConfig =
-    import config.*
-    ResilienceConfig(
-      circuitBreaker = CircuitBreakerSettings(
-        enabled = true,
-        dynamodb = config.CircuitBreakerConfig(),
-        kinesis = config.CircuitBreakerConfig(),
-      ),
-      retry = RetrySettings(dynamodb = RetryConfig(), kinesis = RetryConfig()),
-      bulkhead = BulkheadSettings(),
-      timeout = TimeoutSettings(),
-    )

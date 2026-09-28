@@ -22,10 +22,12 @@ import observability.MetricsPublisher
   * ==Design==
   *   - `publish`/`publishBatch` enqueue events non-blocking into a
   *     `circularBuffer` queue; when the queue is full the oldest event is
-  *     silently dropped (drop-oldest semantics).
+  *     evicted, counted as `DroppedKinesisEvent{reason=queue_full}`. Evictions
+  *     used to be silent while the docs said every drop was counted.
   *   - A single background fiber dequeues events and publishes them to Kinesis.
   *     On transient failure the fiber retries once; if the retry also fails the
-  *     event is dropped and a `DroppedKinesisEvent` metric is emitted.
+  *     event is dropped, counted as
+  *     `DroppedKinesisEvent{reason=publish_failed}`.
   *   - The drain fiber is managed by `KinesisPublisher.resource` and is
   *     cancelled on Resource release.
   *
@@ -43,11 +45,20 @@ class KinesisPublisher[F[_]: Async: Logger: Temporal](
   private val logger = Logger[F]
 
   override def publish(event: RateLimitEvent): F[Unit] =
-    if !config.enabled then Async[F].unit else queue.offer(event)
+    if !config.enabled then Async[F].unit else enqueue(event)
 
   override def publishBatch(events: List[RateLimitEvent]): F[Unit] =
     if !config.enabled || events.isEmpty then Async[F].unit
-    else events.traverse_(queue.offer)
+    else events.traverse_(enqueue)
+
+  // A full circular buffer evicts its oldest event on offer. The size check
+  // races other publishers, so the count can be off by the number of
+  // concurrent offers at the boundary, never by more.
+  private def enqueue(event: RateLimitEvent): F[Unit] = queue.size.flatMap(n =>
+    if n >= config.queueSize then
+      metrics.increment("DroppedKinesisEvent", Map("reason" -> "queue_full"))
+    else Async[F].unit,
+  ) *> queue.offer(event)
 
   override def healthCheck: F[Either[String, Unit]] =
     val request = DescribeStreamSummaryRequest.builder()
@@ -87,7 +98,10 @@ class KinesisPublisher[F[_]: Async: Logger: Temporal](
           case Left(e2) => logger.error(e2)(
               s"Kinesis publish failed after retry, dropping event: ${event
                   .eventType}",
-            ) *> metrics.increment("DroppedKinesisEvent")
+            ) *> metrics.increment(
+              "DroppedKinesisEvent",
+              Map("reason" -> "publish_failed"),
+            )
         }
     }
 

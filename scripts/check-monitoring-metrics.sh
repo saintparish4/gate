@@ -18,9 +18,9 @@
 # so keep each reference next to the call that emits it in mind when editing.
 #
 # A name counts as emitted when it appears as a string literal in
-# src/main/scala. A helper that is defined but never called still counts, so
-# the unwired recordDegradedOperation and recordCacheMetrics weaken this check
-# until they are deleted.
+# src/main/scala, so a helper that is defined but never called would still
+# pass. Delete dead emitters rather than leave them: the unwired
+# recordDegradedOperation and recordCacheMetrics were removed for this reason.
 #
 # Exits 1 on any mismatch, so it can gate CI.
 set -euo pipefail

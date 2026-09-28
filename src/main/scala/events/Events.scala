@@ -71,31 +71,6 @@ object RateLimitEvent:
     val eventType = "idempotency_new"
     val partitionKey = clientId
 
-  /** Circuit breaker state change.
-    */
-  case class CircuitBreakerStateChange(
-      timestamp: Instant,
-      name: String,
-      previousState: String,
-      newState: String,
-      failureCount: Int,
-      override val traceId: Option[String] = None,
-  ) extends RateLimitEvent:
-    val eventType = "circuit_breaker_state_change"
-    val partitionKey = name
-
-  /** Degraded mode activated/deactivated.
-    */
-  case class DegradedModeChange(
-      timestamp: Instant,
-      service: String,
-      degraded: Boolean,
-      reason: String,
-      override val traceId: Option[String] = None,
-  ) extends RateLimitEvent:
-    val eventType = "degraded_mode_change"
-    val partitionKey = service
-
   /** Token quota exceeded for an AI workload. */
   case class TokenQuotaExceeded(
       timestamp: Instant,
@@ -147,8 +122,6 @@ object RateLimitEvent:
       case e: Rejected => (e.asJson, e.eventType)
       case e: IdempotencyHit => (e.asJson, e.eventType)
       case e: IdempotencyNew => (e.asJson, e.eventType)
-      case e: CircuitBreakerStateChange => (e.asJson, e.eventType)
-      case e: DegradedModeChange => (e.asJson, e.eventType)
       case e: TokenQuotaExceeded => (e.asJson, e.eventType)
       case e: AuditEvent => (e.asJson, e.eventType)
     withMetadata(json, eventType, event.traceId)

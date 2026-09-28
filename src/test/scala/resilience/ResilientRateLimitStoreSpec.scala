@@ -30,16 +30,14 @@ class ResilientRateLimitStoreSpec
         resetTimeout = 1.second,
         halfOpenMaxCalls = 1,
       ),
-      kinesis = config.CircuitBreakerConfig(),
     ),
-    retry = RetrySettings(
-      dynamodb = RetryConfig(
+    retry = RetrySettings(dynamodb =
+      RetryConfig(
         maxRetries = 2,
         baseDelay = 10.millis,
         maxDelay = 100.millis,
         multiplier = 2.0,
       ),
-      kinesis = RetryConfig(),
     ),
     bulkhead =
       BulkheadSettings(enabled = true, maxConcurrent = 2, maxWait = 50.millis),
@@ -56,7 +54,6 @@ class ResilientRateLimitStoreSpec
     underlying = underlying,
     config = config,
     metrics = MetricsPublisher.noop[IO],
-    eventPublisher = EventPublisher.noop[IO],
     degradationMode = GracefulDegradation.DegradationMode.AllowAll,
   )
 
@@ -88,13 +85,12 @@ class ResilientRateLimitStoreSpec
     "transitions from Open to HalfOpen after resetTimeout (deterministic)" in {
       val ex = new RuntimeException("dynamo unavailable")
       val config: ResilienceConfig = testConfig.copy(
-        circuitBreaker = testConfig.circuitBreaker.copy(
-          dynamodb = CircuitBreakerConfig(
+        circuitBreaker = testConfig.circuitBreaker.copy(dynamodb =
+          CircuitBreakerConfig(
             maxFailures = 1,
             resetTimeout = 500.millis,
             halfOpenMaxCalls = 1,
           ),
-          kinesis = testConfig.circuitBreaker.kinesis,
         ),
         retry = testConfig.retry.copy(dynamodb = RetryConfig(maxRetries = 0)),
       )
@@ -119,13 +115,12 @@ class ResilientRateLimitStoreSpec
     "closes circuit breaker after successful calls in HalfOpen" in {
       // Use a store that fails first then succeeds.
       val halfOpenConfig: ResilienceConfig = testConfig.copy(
-        circuitBreaker = testConfig.circuitBreaker.copy(
-          dynamodb = CircuitBreakerConfig(
+        circuitBreaker = testConfig.circuitBreaker.copy(dynamodb =
+          CircuitBreakerConfig(
             maxFailures = 1,
             resetTimeout = 200.millis,
             halfOpenMaxCalls = 1,
           ),
-          kinesis = testConfig.circuitBreaker.kinesis,
         ),
         retry = testConfig.retry.copy(dynamodb = RetryConfig(maxRetries = 0)),
       )
@@ -225,7 +220,6 @@ class ResilientRateLimitStoreSpec
           config = testConfig,
           metrics = observability.PrometheusMetrics
             .dual(MetricsPublisher.noop[IO], prom),
-          eventPublisher = EventPublisher.noop[IO],
           degradationMode = GracefulDegradation.DegradationMode.RejectAll,
         ).use(store =>
           // maxFailures = 3 opens it; the fourth call is refused by the open

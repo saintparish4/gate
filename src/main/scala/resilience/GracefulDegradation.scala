@@ -8,149 +8,37 @@ import cats.effect.*
 import cats.effect.syntax.monadCancel.*
 import cats.syntax.all.*
 
-/** Graceful degradation strategies for when dependencies fail.
+/** What a rate-limit check answers when the store cannot: the circuit breaker
+  * is open, the bulkhead is full, or the call failed.
   *
-  * These utilities help the rate limiter remain functional even when DynamoDB
-  * or Kinesis are unavailable, trading off some accuracy for availability.
+  * Only the two modes config can select exist. `UseCached` and `ReducedLimit`
+  * used to be here too, with a cache and a per-key counter behind them, but
+  * config only ever mapped to allow-all or reject-all, so they were
+  * unreachable. A configured `use-cached` now stops startup
+  * (AppConfig.validateDegradationMode).
   */
 object GracefulDegradation:
 
-  /** Degradation mode when primary storage is unavailable.
-    */
   sealed trait DegradationMode
   object DegradationMode:
-    /** Fail open - allow all requests (use when availability > accuracy) */
+    /** Fail open: admit everything, so downstream spend is unbounded while
+      * degraded.
+      */
     case object AllowAll extends DegradationMode
 
-    /** Fail closed - reject all requests (use when accuracy > availability) */
+    /** Fail closed: refuse everything. The default. */
     case object RejectAll extends DegradationMode
 
-    /** Use cached/stale data if available */
-    case object UseCached extends DegradationMode
-
-    /** Apply a reduced rate limit */
-    case class ReducedLimit(tokensPerSecond: Int) extends DegradationMode
-
-  /** Degradation configuration.
-    */
-  case class DegradationConfig(
-      mode: DegradationMode = DegradationMode.AllowAll,
-      degradationWindow: FiniteDuration = 30.seconds,
-      logSampling: Int = 100, // Log 1 in N degraded requests
-  )
-
-  /** Policy when a cache lookup misses (UseCached mode with no cached
-    * decision).
-    */
-  sealed trait CacheMissPolicy
-  object CacheMissPolicy:
-    case object AllowAll extends CacheMissPolicy
-    case object RejectAll extends CacheMissPolicy
-
-  /** Execute with fallback behavior when the primary operation fails.
-    *
-    * @param primary
-    *   The primary operation to attempt
-    * @param fallback
-    *   The fallback operation if primary fails
-    * @param operationName
-    *   Name for logging
-    */
-  def withFallback[F[_]: Temporal: Logger, A](
-      primary: F[A],
-      fallback: F[A],
-      operationName: String,
-  ): F[A] =
-    val logger = Logger[F]
-    primary.handleErrorWith(error =>
-      logger
-        .warn(s"$operationName failed, using fallback: ${error.getMessage}") *>
-        fallback,
-    )
-
-  /** Execute with a timeout and fallback.
-    */
-  def withTimeoutAndFallback[F[_]: Temporal: Logger, A](
-      primary: F[A],
-      fallback: F[A],
-      timeout: FiniteDuration,
-      operationName: String,
-  ): F[A] =
-    val logger = Logger[F]
-    Temporal[F].timeout(primary, timeout).handleErrorWith(error =>
-      logger.warn(s"$operationName timed out or failed after $timeout: ${error
-          .getMessage}") *> fallback,
-    )
-
-  /** Create a rate limit decision for degraded mode.
-    *
-    * UseCached: if `cache` is provided, looks up the key and returns the cached
-    * decision on hit; on miss (or no cache) uses `cacheMissPolicy`.
-    * ReducedLimit: if `reducedLimitState` is provided, tracks per-key
-    * per-window usage and allows up to tps per second; otherwise returns
-    * Allowed(tps, resetAt).
-    */
   def degradedDecision[F[_]: Temporal](
       mode: DegradationMode,
-      key: String,
-      cache: Option[LocalCache[F, String, core.RateLimitDecision]] = None,
-      cacheMissPolicy: CacheMissPolicy = CacheMissPolicy.AllowAll,
-      reducedLimitState: Option[Ref[F, Map[String, (Long, Int)]]] = None,
-  ): F[core.RateLimitDecision] =
-    import core.RateLimitDecision.*
-
-    Clock[F].realTime.flatMap { now =>
-      val nowMs = now.toMillis
-      val resetAt = java.time.Instant.ofEpochMilli(nowMs + 60000)
-
-      mode match
-        case DegradationMode.AllowAll => Temporal[F]
-            .pure(Allowed(tokensRemaining = 100, resetAt = resetAt))
-
-        case DegradationMode.RejectAll => Temporal[F]
-            .pure(Rejected(retryAfterSeconds = 60, resetAt = resetAt))
-
-        case DegradationMode.UseCached => cache match
-            case Some(c) => c.get(key).map {
-                case Some(decision) => decision
-                case None => cacheMissPolicy match
-                    case CacheMissPolicy.AllowAll =>
-                      Allowed(tokensRemaining = 100, resetAt = resetAt)
-                    case CacheMissPolicy.RejectAll =>
-                      Rejected(retryAfterSeconds = 60, resetAt = resetAt)
-              }
-            case None => Temporal[F].pure(
-                cacheMissPolicy match
-                  case CacheMissPolicy.AllowAll =>
-                    Allowed(tokensRemaining = 100, resetAt = resetAt)
-                  case CacheMissPolicy.RejectAll =>
-                    Rejected(retryAfterSeconds = 60, resetAt = resetAt),
-              )
-
-        case DegradationMode.ReducedLimit(tps) => reducedLimitState match
-            case Some(stateRef) =>
-              val windowStart = nowMs / 1000 * 1000 // floor to current second
-              stateRef.modify { map =>
-                val (ws, count) = map.getOrElse(key, (windowStart, 0))
-                if ws == windowStart then
-                  if count < tps then
-                    (
-                      map.updated(key, (windowStart, count + 1)),
-                      Allowed(
-                        tokensRemaining = tps - count - 1,
-                        resetAt = resetAt,
-                      ),
-                    )
-                  else (map, Rejected(retryAfterSeconds = 1, resetAt = resetAt))
-                else
-                  (
-                    map.updated(key, (windowStart, 1)),
-                    Allowed(tokensRemaining = tps - 1, resetAt = resetAt),
-                  )
-              }
-            case None => Temporal[F]
-                .pure(Allowed(tokensRemaining = tps, resetAt = resetAt))
-    }
+  ): F[core.RateLimitDecision] = Clock[F].realTime.map { now =>
+    val resetAt = java.time.Instant.ofEpochMilli(now.toMillis + 60000)
+    mode match
+      case DegradationMode.AllowAll => core.RateLimitDecision
+          .Allowed(tokensRemaining = 100, resetAt = resetAt)
+      case DegradationMode.RejectAll => core.RateLimitDecision
+          .Rejected(retryAfterSeconds = 60, resetAt = resetAt)
+  }
 
 /** Bulkhead pattern implementation for isolating failures.
   *
