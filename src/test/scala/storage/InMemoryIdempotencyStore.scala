@@ -128,16 +128,21 @@ class InMemoryIdempotencyStore[F[_]: Temporal](
       )
     yield result
 
-  override def markFailed(idempotencyKey: String): F[Boolean] =
+  override def markFailed(
+      idempotencyKey: String,
+      clientId: String,
+  ): F[Boolean] =
     for
       now <- Clock[F].realTime.map(d => Instant.ofEpochMilli(d.toMillis))
       result <- stateRef.modify(stateMap =>
         stateMap.get(idempotencyKey) match
-          case Some(record) =>
+          case Some(record)
+              if record.status == IdempotencyStatus.Pending &&
+                record.clientId == clientId =>
             val updated = record
               .copy(status = IdempotencyStatus.Failed, updatedAt = now)
             (stateMap.updated(idempotencyKey, updated), true)
-          case None => (stateMap, false),
+          case _ => (stateMap, false),
       )
     yield result
 

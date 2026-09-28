@@ -258,7 +258,8 @@ class DynamoDBStoreErrorSpec
             clientId: String,
             response: StoredResponse,
         ): IO[Boolean] = IO.pure(false)
-        def markFailed(key: String): IO[Boolean] = IO.pure(false)
+        def markFailed(key: String, clientId: String): IO[Boolean] = IO
+          .pure(false)
         def get(key: String): IO[Option[IdempotencyRecord]] = IO.pure(None)
         def healthCheck: IO[Either[String, Unit]] = IO.pure(Right(()))
 

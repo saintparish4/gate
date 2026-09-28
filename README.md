@@ -31,7 +31,7 @@ DynamoDB, zero errors. See [Correctness](#correctness).
 | **At most X requests per client and key, across every instance** | One token-bucket item per client and key in DynamoDB. Every consume is a strongly consistent `GetItem` followed by a `PutItem` conditioned on the item's `version`, so only one instance wins each state change. Up to 10 conflicting writes are retried with jittered backoff; after that the request is **rejected** (429, `Retry-After: 1`). The service under-issues at the tail rather than over-issuing past the limit. |
 | **Idempotent operations within a TTL** | First writer wins via a conditional `PutItem` (`attribute_not_exists(pk)`). Replays within the TTL get the stored response. A SHA-256 fingerprint of the request body turns a same-key different-body replay into `409 Conflict`. DynamoDB TTL expires the items. |
 | **Multi-level token quotas** | User, agent, and org quotas are enforced together on every check. The agent quota is clamped to 80% of the user quota. A check reserves an estimate and returns a `reservationId`; reconcile replaces the stored estimate with actual usage, once, and never takes an estimate from the caller. |
-| **Tenants never share state** | Every storage key is scoped to the authenticated client ([ADR-005](docs/adr/005-tenant-namespaced-storage-keys.md)). Two clients sending the same rate-limit key, idempotency key, or quota user get separate buckets, records, and counters. Completing an idempotency record also requires the client that created it. `HttpApiIntegrationSpec` drives all six routes with two clients on the same keys. |
+| **Tenants never share state** | Every storage key is scoped to the authenticated client ([ADR-005](docs/adr/005-tenant-namespaced-storage-keys.md)). Two clients sending the same rate-limit key, idempotency key, or quota user get separate buckets, records, and counters. Completing or failing an idempotency record also requires the client that created it. `HttpApiIntegrationSpec` drives all seven routes with two clients on the same keys. |
 | **Stateless instances** | All rate-limit, idempotency, and quota state lives in DynamoDB. Any instance can serve any request; a crash loses nothing. |
 
 ### What this system is designed to survive
@@ -219,7 +219,9 @@ the first operation has not completed, so the client must not run the payment
 twice. Store the result with `POST /v1/idempotency/payment:demo-001/complete`
 and a body of `{"statusCode": 200, "body": "..."}`; from then on replays answer
 `{"status":"duplicate", ...}` with the stored response. A replay whose
-`requestBody` hashes differently answers `409` with `"status":"conflict"`.
+`requestBody` hashes differently answers `409` with `"status":"conflict"`. If
+the operation fails without effect, `POST /v1/idempotency/payment:demo-001/fail`
+releases the key, and the next check answers `new` again.
 
 **5. Token quota**
 
@@ -268,7 +270,8 @@ curl -s -H "Authorization: Bearer admin-api-key" http://localhost:8080/metrics |
 | `POST` | `/v1/ratelimit/check` | `RateLimitCheck` | Consume `cost` tokens (default 1) for `key`; optional `profile` and `endpoint` |
 | `GET` | `/v1/ratelimit/status/:key` | `RateLimitStatus` | Current bucket state for a key, without consuming |
 | `POST` | `/v1/idempotency/check` | `IdempotencyCheck` | `new` (200), `in_progress` (202), `duplicate` (200) or `conflict` (409) |
-| `POST` | `/v1/idempotency/:key/complete` | `IdempotencyComplete` | Store the response for a key; 409 if it is not pending |
+| `POST` | `/v1/idempotency/:key/complete` | `IdempotencyComplete` | Store the response for a key; 409 if it is not pending; 413 if the response, encoded, is over 350 KB |
+| `POST` | `/v1/idempotency/:key/fail` | `IdempotencyComplete` | Release a pending key so a retry is `new`; 409 if it is not pending |
 | `POST` | `/v1/quota/check` | `QuotaCheck` | Pre-request user / agent / org quota check; 429 with `Retry-After` when exceeded |
 | `POST` | `/v1/quota/reconcile` | `QuotaReconcile` | Post-response reconciliation of estimated versus actual tokens |
 | `GET` | `/health` | none, unauthenticated | Liveness |
@@ -362,6 +365,16 @@ creation. The first successful create answers `new`; while it is pending,
 replays answer `in_progress`; after `/complete`, replays answer `duplicate`
 with the stored response. A replay whose `requestBody` hashes differently
 answers `conflict` (409).
+
+`/fail` releases a pending key after its operation failed without effect, so
+the next check claims it again. Without it a failed key stayed pending until
+its TTL. `/complete` and `/fail` apply only to a pending record created by the
+same client, so a completed operation is never reopened.
+
+The stored response is inline in the DynamoDB item, and a replay returns it
+whole: nothing is streamed. `/complete` refuses a response over 350 KB, as
+encoded JSON, with `413 response_too_large`, because a DynamoDB item holds at
+most 400 KB. The key stays pending; store a reference to the result instead.
 
 ## Observability
 

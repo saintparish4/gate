@@ -281,6 +281,25 @@ class HttpApiIntegrationSpec
       }
     }
 
+    "POST /v1/idempotency/:key/fail: a client cannot release another's pending key" in {
+      val check =
+        post(uri"/v1/idempotency/check", """{"idempotencyKey": "shared-fail"}""")
+      val fail = Request[IO](Method.POST, uri"/v1/idempotency/shared-fail/fail")
+      for {
+        _ <- httpApp.run(as("test-key")(check))
+        forged <- httpApp.run(as("other-key")(fail))
+        stillMine <- httpApp.run(as("test-key")(check)).flatMap(json)
+        released <- httpApp.run(as("test-key")(fail))
+        again <- httpApp.run(as("test-key")(check)).flatMap(json)
+      } yield {
+        forged.status shouldBe Status.Conflict
+        stillMine.hcursor.get[String]("status").toOption shouldBe
+          Some("in_progress")
+        released.status shouldBe Status.Ok
+        again.hcursor.get[String]("status").toOption shouldBe Some("new")
+      }
+    }
+
     "a completed response is replayed to its own client only" in {
       val check = post(
         uri"/v1/idempotency/check",
@@ -790,6 +809,8 @@ class HttpApiIntegrationSpec
         uri"/v1/idempotency/perm-guard/complete",
         """{"statusCode": 200, "body": "{}"}""",
       ),
+      Permission.IdempotencyComplete ->
+        Request[IO](Method.POST, uri"/v1/idempotency/perm-guard/fail"),
       Permission.QuotaCheck -> jsonPost(
         uri"/v1/quota/check",
         """{"userId": "perm-guard", "estimatedInputTokens": 1}""",

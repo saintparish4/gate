@@ -62,8 +62,10 @@ object StoreGuard:
         response: StoredResponse,
     ): F[Boolean] =
       guard(underlying.storeResponse(idempotencyKey, clientId, response))
-    override def markFailed(idempotencyKey: String): F[Boolean] =
-      guard(underlying.markFailed(idempotencyKey))
+    override def markFailed(
+        idempotencyKey: String,
+        clientId: String,
+    ): F[Boolean] = guard(underlying.markFailed(idempotencyKey, clientId))
     override def get(idempotencyKey: String): F[Option[IdempotencyRecord]] =
       guard(underlying.get(idempotencyKey))
     override def healthCheck: F[Either[String, Unit]] = underlying.healthCheck

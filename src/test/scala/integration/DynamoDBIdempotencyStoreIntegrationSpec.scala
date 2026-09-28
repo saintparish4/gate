@@ -190,7 +190,7 @@ class DynamoDBIdempotencyStoreIntegrationSpec
           .check("retry-key", clientId = "client-1", ttlSeconds = 3600)
 
         // Mark as failed
-        marked <- store.markFailed("retry-key")
+        marked <- store.markFailed("retry-key", "client-1")
 
         // Should be able to retry
         retry <- store
@@ -201,6 +201,66 @@ class DynamoDBIdempotencyStoreIntegrationSpec
         first shouldBe a[IdempotencyResult.New]
         marked shouldBe true
         retry shouldBe a[IdempotencyResult.New] // Can retry after failure
+      }
+    }
+
+    // The condition used to be only attribute_exists(pk), so a Completed
+    // record could be reopened and its operation run again.
+    "markFailed refuses a completed record and another client's record" in {
+      val done = StoredResponse(200, "ok", Map.empty, Instant.EPOCH)
+      val test = for {
+        _ <- store.check("fail-done", clientId = "client-1", ttlSeconds = 3600)
+        _ <- store.storeResponse("fail-done", "client-1", done)
+        reopened <- store.markFailed("fail-done", "client-1")
+        _ <- store.check("fail-theirs", clientId = "client-1", ttlSeconds = 3600)
+        forged <- store.markFailed("fail-theirs", "client-2")
+        missing <- store.markFailed("fail-missing", "client-1")
+        replay <- store
+          .check("fail-done", clientId = "client-1", ttlSeconds = 3600)
+        pending <- store
+          .check("fail-theirs", clientId = "client-1", ttlSeconds = 3600)
+      } yield (reopened, forged, missing, replay, pending)
+
+      test.asserting { case (reopened, forged, missing, replay, pending) =>
+        reopened shouldBe false
+        forged shouldBe false
+        missing shouldBe false
+        replay shouldBe a[IdempotencyResult.Duplicate]
+        pending shouldBe a[IdempotencyResult.InProgress]
+      }
+    }
+
+    // The API caps the encoded response at MaxStoredResponseBytes (413 above
+    // it). This proves the cap fits a real item with a partition key near its
+    // own 2 KB limit, and that the item limit it guards against is real.
+    "a response at the API's cap is stored and replayed; one past the item limit is not" in {
+      val at = Instant.ofEpochMilli(1_700_000_000_000L)
+      val empty = StoredResponse(200, "", Map.empty, at)
+      val atCap = empty.copy(body =
+        "a" *
+          (api.IdempotencyApi.MaxStoredResponseBytes -
+            api.IdempotencyApi.storedSize(empty)),
+      )
+      val longKey = "k" * 1900
+      val tooBig = empty.copy(body = "a" * (410 * 1024))
+      val test = for {
+        _ <- store.check(longKey, clientId = "client-1", ttlSeconds = 3600)
+        stored <- store.storeResponse(longKey, "client-1", atCap)
+        replay <- store.check(longKey, clientId = "client-1", ttlSeconds = 3600)
+        _ <- store.check("too-big", clientId = "client-1", ttlSeconds = 3600)
+        refused <- store.storeResponse("too-big", "client-1", tooBig).attempt
+      } yield (stored, replay, refused)
+
+      test.asserting { case (stored, replay, refused) =>
+        api.IdempotencyApi.storedSize(atCap) shouldBe
+          api.IdempotencyApi.MaxStoredResponseBytes
+        stored shouldBe true
+        replay match {
+          case IdempotencyResult.Duplicate(_, Some(r), _) =>
+            r.body.length shouldBe atCap.body.length
+          case other => fail(s"expected a replay, got $other")
+        }
+        refused.isLeft shouldBe true
       }
     }
 

@@ -106,32 +106,77 @@ class IdempotencyApi[F[_]: Async: Tracer](
       headers = completeReq.headers.getOrElse(Map.empty),
       completedAt = now,
     )
+    storedBytes = IdempotencyApi.storedSize(storedResponse)
 
     _ <- logger
       .debug(s"Completing idempotency key: $key, client=${client.clientId}")
-    success <- store.storeResponse(
-      TenantKey(client.clientId, key),
-      client.clientId,
-      storedResponse,
-    )
-
     response <-
-      if success then
+      if storedBytes > IdempotencyApi.MaxStoredResponseBytes then
+        PayloadTooLarge {
+          io.circe.Json.obj(
+            "error" -> io.circe.Json.fromString("response_too_large"),
+            "message" -> io.circe.Json.fromString(
+              s"The response to store is $storedBytes bytes encoded; the limit is ${IdempotencyApi
+                  .MaxStoredResponseBytes}. The key stays pending: store a smaller response, such as a reference to the result, or mark the key failed.",
+            ),
+          )
+        }
+      else
+        store.storeResponse(
+          TenantKey(client.clientId, key),
+          client.clientId,
+          storedResponse,
+        ).flatMap(success =>
+          if success then
+            Ok(
+              IdempotencyUpdateResponse(
+                idempotencyKey = key,
+                status = "completed",
+              ).asJson,
+            )
+          else
+            // "conflict", as fail's 409 says: this said "failed", which is
+            // also what a successful fail answers.
+            Conflict(
+              IdempotencyUpdateResponse(
+                idempotencyKey = key,
+                status = "conflict",
+                message =
+                  Some("Could not store response - key may not exist or is not pending"),
+              ).asJson,
+            ),
+        )
+  yield response).handleErrorWith(storageFailure("complete"))
+
+  /** POST /v1/idempotency/:key/fail
+    *
+    * Release a pending key after its operation failed without effect, so the
+    * next check with the key claims it again and the caller can retry. Without
+    * this route a failed operation left its key Pending until TTL, and every
+    * retry in between answered in_progress. Only the client that claimed the
+    * key can fail it, and only while it is Pending: a completed operation ran,
+    * so reopening it would let a retry run it twice.
+    */
+  def fail(key: String, client: AuthenticatedClient): F[Response[F]] = (for
+    _ <- logger
+      .debug(s"Failing idempotency key: $key, client=${client.clientId}")
+    marked <- store.markFailed(TenantKey(client.clientId, key), client.clientId)
+    response <-
+      if marked then
         Ok(
-          IdempotencyCompleteResponse(idempotencyKey = key, status = "completed")
+          IdempotencyUpdateResponse(idempotencyKey = key, status = "failed")
             .asJson,
         )
       else
         Conflict(
-          IdempotencyCompleteResponse(
+          IdempotencyUpdateResponse(
             idempotencyKey = key,
-            status = "failed",
-            message = Some(
-              "Could not store response - key may not exist or is not pending",
-            ),
+            status = "conflict",
+            message =
+              Some("Could not mark failed - key may not exist or is not pending"),
           ).asJson,
         )
-  yield response).handleErrorWith(storageFailure("complete"))
+  yield response).handleErrorWith(storageFailure("fail"))
 
   /** Corrupt records and unexpected store failures both become a structured 503
     * so the caller knows not to proceed; body decoding failures pass through so
@@ -316,13 +361,27 @@ case class IdempotencyCompleteRequest(
     headers: Option[Map[String, String]] = None,
 )
 
-case class IdempotencyCompleteResponse(
+case class IdempotencyUpdateResponse(
     idempotencyKey: String,
     status: String,
     message: Option[String] = None,
 )
 
 object IdempotencyApi:
+  /** The largest stored response, in bytes of its encoded JSON. A DynamoDB item
+    * holds at most 400 KB, and the response is stored inline in the record
+    * (replay is not streamed), so a larger one failed the write and answered
+    * 503 as if the store were down. The margin covers the record's other
+    * attributes, whose largest is the key (at most 2 KB as a partition key).
+    */
+  val MaxStoredResponseBytes: Int = 350 * 1024
+
+  /** The size the store writes: the response as encoded JSON, so escaping in
+    * the body and the headers count, not just the body's characters.
+    */
+  def storedSize(response: StoredResponse): Int = response.asJson.noSpaces
+    .getBytes(java.nio.charset.StandardCharsets.UTF_8).length
+
   /** `result` with its key replaced by `key`. The store works on the scoped key
     * (ADR-005), which must not leak into responses or events.
     */

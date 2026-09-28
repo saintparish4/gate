@@ -133,16 +133,22 @@ trait IdempotencyStore[F[_]]:
       response: StoredResponse,
   ): F[Boolean]
 
-  /** Mark an operation as failed.
+  /** Mark a pending operation as failed, so the next check with this key claims
+    * it again and the caller can retry.
     *
-    * This allows the key to be retried (by deleting or marking as failed).
+    * Like `storeResponse`, it applies only to a Pending record created by
+    * `clientId`. A Completed record is never reopened: its operation ran, and
+    * reopening it would let a retry run it twice.
     *
     * @param idempotencyKey
     *   The key from the original check
+    * @param clientId
+    *   The client failing it; must match the client that created it
     * @return
-    *   true if marked successfully
+    *   true if marked; false if the record is missing, not Pending, or owned by
+    *   another client
     */
-  def markFailed(idempotencyKey: String): F[Boolean]
+  def markFailed(idempotencyKey: String, clientId: String): F[Boolean]
 
   /** Get the current status of an idempotency key.
     *
@@ -284,16 +290,21 @@ object IdempotencyStore:
             )
           yield result
 
-        override def markFailed(idempotencyKey: String): F[Boolean] =
+        override def markFailed(
+            idempotencyKey: String,
+            clientId: String,
+        ): F[Boolean] =
           for
             now <- Clock[F].realTime.map(d => Instant.ofEpochMilli(d.toMillis))
             result <- stateRef.modify(records =>
               records.get(idempotencyKey) match
-                case Some(existing) =>
+                case Some(existing)
+                    if existing.status == IdempotencyStatus.Pending &&
+                      existing.clientId == clientId =>
                   val updated = existing
                     .copy(status = IdempotencyStatus.Failed, updatedAt = now)
                   (records + (idempotencyKey -> updated), true)
-                case None => (records, false),
+                case _ => (records, false),
             )
           yield result
 
