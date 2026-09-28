@@ -332,4 +332,28 @@ class DynamoDBStoreErrorSpec
       store.checkAndConsume("k", 1, testProfile).attempt
         .asserting(_ shouldBe Left(ex))
     }
+
+    // The leaky and sliding stores kept the one-case lambda the token bucket
+    // lost, so the resilience wrapper saw a MatchError and never retried.
+    "leaky bucket propagates it as itself too" in {
+      val ex = software.amazon.awssdk.core.exception.SdkClientException.builder()
+        .message("connection reset").build()
+      LeakyBucketRateLimitStore[IO](
+        failingGetItemClient(ex),
+        "rate-limits",
+        MetricsPublisher.noop[IO],
+      ).checkAndConsume("k", 1, testProfile).attempt
+        .asserting(_ shouldBe Left(ex))
+    }
+
+    "sliding window propagates it as itself too" in {
+      val ex = software.amazon.awssdk.core.exception.SdkClientException.builder()
+        .message("connection reset").build()
+      DynamoDBSlidingWindowStore[IO](
+        failingGetItemClient(ex),
+        "rate-limits",
+        MetricsPublisher.noop[IO],
+      ).checkAndConsume("k", 1, testProfile).attempt
+        .asserting(_ shouldBe Left(ex))
+    }
   }

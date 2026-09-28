@@ -45,12 +45,17 @@ class LeakyBucketRateLimitStore[F[_]: Async: Logger](
   ): F[RateLimitDecision] = Retry
     .retryWithTracking(retryPolicy, s"OCC-leaky($key)")(
       singleAttempt(key, cost, profile),
-    ).map(_.result).handleErrorWith { case _: OCCConflictException =>
-      Clock[F].realTime.map(_.toMillis).map { now =>
-        val secToAllow = cost.toDouble / profile.refillRatePerSecond
-        val resetAt = Instant.ofEpochMilli(now + (secToAllow * 1000).toLong)
-        RateLimitDecision.Rejected(secToAllow.ceil.toInt.max(1), resetAt)
-      }
+    ).map(_.result).handleErrorWith {
+      case _: OCCConflictException => Clock[F].realTime.map(_.toMillis)
+          .map { now =>
+            val secToAllow = cost.toDouble / profile.refillRatePerSecond
+            val resetAt = Instant.ofEpochMilli(now + (secToAllow * 1000).toLong)
+            RateLimitDecision.Rejected(secToAllow.ceil.toInt.max(1), resetAt)
+          }
+      // A lambda of one case is total: any other error became a MatchError,
+      // which the resilience wrapper does not retry. The token bucket had the
+      // same bug.
+      case other => Async[F].raiseError(other)
     }
 
   /** Single attempt: one read-compute-write cycle. On OCC conflict

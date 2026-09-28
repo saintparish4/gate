@@ -64,16 +64,19 @@ class DynamoDBSlidingWindowStore[F[_]: Async: Logger](
       singleAttempt(key, cost, profile),
     ).flatMap(r =>
       metrics.gauge("SlidingWindowOCCAttempts", r.attempts.toDouble).as(r.result),
-    ).handleErrorWith { case _: OCCConflictException =>
+    ).handleErrorWith {
       // OCC exhausted: reject conservatively rather than over-admit.
-      Clock[F].realTime.map(_.toMillis).map { nowMs =>
-        val windowMs = profile.ttlSeconds * 1000L
-        val active = SlidingWindow
-          .activeSubWindowStarts(nowMs, windowMs, subWindowCount)
-        val reset = SlidingWindow.resetAt(Map.empty, active, windowMs)
-        RateLimitDecision
-          .Rejected(SlidingWindow.retryAfterSeconds(reset, nowMs), reset)
-      }
+      case _: OCCConflictException => Clock[F].realTime.map(_.toMillis)
+          .map { nowMs =>
+            val windowMs = profile.ttlSeconds * 1000L
+            val active = SlidingWindow
+              .activeSubWindowStarts(nowMs, windowMs, subWindowCount)
+            val reset = SlidingWindow.resetAt(Map.empty, active, windowMs)
+            RateLimitDecision
+              .Rejected(SlidingWindow.retryAfterSeconds(reset, nowMs), reset)
+          }
+      // Any other error propagates as itself; see LeakyBucketRateLimitStore.
+      case other => Async[F].raiseError(other)
     }
 
   /** Single OCC attempt: read → compute → conditional write. */
