@@ -16,8 +16,8 @@ DynamoDB, zero errors. See [Correctness](#correctness).
 
 ### Why Gate
 
-- **Public or partner APIs** — per-tenant RPS and burst limits across many
-  stateless containers, with one source of truth in DynamoDB
+- **Public or partner APIs** — per-key RPS and burst limits, sized by the
+  client's tier, across many stateless containers, with one source of truth in DynamoDB
   ([token bucket + OCC](#optimistic-concurrency-control-flow)).
 - **AI / LLM gateways** — stack request limits with user / agent / org token
   quotas so spend and abuse stay bounded ([token quotas](#token-quotas)).
@@ -38,18 +38,36 @@ DynamoDB, zero errors. See [Correctness](#correctness).
 
 | Failure mode | Behaviour |
 |-------------|-----------|
-| **DynamoDB slow or partially down** | The rate-limit store is wrapped in a bulkhead (100 concurrent calls, 500 ms max wait), a process-wide circuit breaker (20 failures to open, 30 s reset, 3 half-open calls), a retry policy for SDK and I/O errors (3 retries, 100 ms base, 2x backoff, 10 s cap), and a 2 s timeout per check. A timed-out check is not retried: the bound covers the whole check. When the breaker is open, `DEGRADATION_MODE` decides: `reject-all` (default, safe for payments) or `allow-all` (for AI infrastructure where availability wins). Every degraded decision increments `gate_degraded_total`. `GET /v1/ratelimit/status` answers `503` when the store cannot be read, rather than reporting a full bucket. |
+| **DynamoDB slow or partially down** | The rate-limit store is wrapped in a bulkhead (100 concurrent calls, 500 ms max wait), a process-wide circuit breaker (20 failures to open, 30 s reset, 3 half-open calls), a retry policy for SDK and I/O errors (3 retries, 100 ms base, 2x backoff, 10 s cap), and a 2 s timeout per check. A timed-out check is not retried: the bound covers the whole check. When a check reaches no decision (the breaker is open, the bulkhead is full, or the store times out or fails after retries), `DEGRADATION_MODE` decides: `reject-all` (default, safe for payments) or `allow-all` (for AI infrastructure where availability wins). Every degraded decision increments `gate_degraded_total`. `GET /v1/ratelimit/status` answers `503` when the store cannot be read, rather than reporting a full bucket. |
 | **A corrupt limiter or quota item** | It fails closed and self-heals. The store replaces the item, conditioned on its raw stored version, with the most conservative valid state: an empty token bucket, a full leaky bucket or sliding window, an exhausted quota window starting now. The key refuses until it refills, drains, or the window ends. Each read counts `CorruptStateRead`, which has an alarm. A corrupt idempotency record answers `503`, since whether its operation ran is unknowable. |
 | **Instance crash** | No in-process state. The next instance reads current DynamoDB state and continues correctly. |
 | **Kinesis failure** | Events go into a bounded in-memory queue (10,000, drop-oldest) that a background fiber drains to Kinesis. A failed publish is retried once, then dropped. Both an eviction from a full queue and a failed publish are counted, as `gate_events_dropped_total` and CloudWatch `DroppedKinesisEvent{reason=queue_full\|publish_failed}`. The request path never waits on Kinesis, and `/ready` reports a Kinesis fault as `degraded` without taking the task out of service. |
 | **OCC exhaustion on a hot key** | After 10 failed conditional writes the request is rejected with 429 instead of over-issuing. |
-| **Idempotency TOCTOU race** | If the conditional create fails and the follow-up read finds nothing (TTL deleted the item in between), the check retries up to 3 times instead of returning a false `new`. |
+| **Idempotency TOCTOU race** | If the conditional create fails and the follow-up read finds nothing (TTL deleted the item in between) or a `Failed` record (released in between), the check claims again, up to 3 times, instead of returning a `new` it does not own. |
 
 The breaker and retry wrap the rate-limit store only. The idempotency and quota
 stores each have their own bulkhead and timeout (2 s and 5 s; the quota bound
 covers its own conditional-write retry loop). A store failure on either
 answers `503` with `storage_unavailable`, and quota contention answers `503`
 with `Retry-After: 1`.
+
+### Scope
+
+What the code does today, what exists only in part or on paper, and what is
+deliberately out of scope for now.
+
+| Area | Implemented | Planned | Excluded |
+| --- | --- | --- | --- |
+| Rate limiting | Token bucket, leaky bucket, and sliding window on DynamoDB with OCC; profiles by client tier; `/status` | | A fourth algorithm |
+| Idempotency | Conditional claim, replay, request-hash conflicts, `/complete`, `/fail`, a 350 KB stored-response cap | | Streaming replay (SSE capture, partial replay, body offload) |
+| Token quotas | User, agent, and org fixed windows; reserve, then reconcile against the stored reservation | | |
+| Tenancy | Every storage key scoped to the authenticated client ([ADR-005](docs/adr/005-tenant-namespaced-storage-keys.md)), with cross-tenant tests and invariant D | | Hosted multi-tenant service: accounts, billing, a managed control plane |
+| Access | API keys from Secrets Manager, a permission per route, a per-task auth throttle | Audit records for failed authentication and permission refusals | SSO and role management |
+| Failure behavior | Resilience stack on the rate-limit path; timeout and bulkhead on idempotency and quota; corrupt state fails closed and self-heals | | Serving decisions from a local cache during an outage |
+| Events and audit | Kinesis events at most once; `AUDIT` log lines | Firehose to S3 (Parquet), Glue, Athena, and 7-year retention: in Terraform, never deployed ([COMPLIANCE.md](docs/COMPLIANCE.md)) | |
+| Consistency | One AWS Region is the consistency boundary | A written statement of the single-region semantics | Exact limits across Regions (global tables) |
+| Evidence | Invariants A-D in CI and against a Terraform deploy on AWS; LocalStack latency figures | A benchmark report on real AWS | |
+| Interfaces | HTTP API; a local demo dashboard (Terraform pins it off) | | A product web UI or admin console |
 
 ## Architecture
 
@@ -134,7 +152,7 @@ of HTTP 500s.
 curl -s http://localhost:8080/health
 # {"status":"healthy","version":"0.1.0"}
 curl -s http://localhost:8080/ready
-# {"status":"ok","components":[{"name":"dynamodb_ratelimit","status":"ok","details":null}, ...]}
+# {"status":"ok","components":[{"name":"dynamodb_ratelimit","status":"ok","required":true,"details":null}, ...]}
 ```
 
 `/health` is liveness only and answers 200 whenever the process is up.
@@ -174,7 +192,7 @@ curl -s -X POST http://localhost:8080/v1/ratelimit/check \
 ```
 
 Allowed responses carry `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and
-`X-RateLimit-Reset` (epoch seconds). Every response echoes `X-Request-Id`.
+`X-RateLimit-Reset` (epoch seconds). Every response from a route, including authentication's 401, 403 and 429, echoes `X-Request-Id`; the 400/422 body-decoding answers and a 404 for an unknown path do not.
 
 **3. Exhaust a bucket**
 
@@ -677,13 +695,14 @@ terraform output api_endpoint
 ## Documentation
 
 - [API reference](docs/API.md) — request and response schemas for every route
-- [Architecture](docs/ARCHITECTURE.md) — design rationale and trade-offs
+- [Architecture](docs/ARCHITECTURE.md) — what the code does on each path, and why
 - [Performance](docs/PERFORMANCE.md) — fixed-RPS latency and DynamoDB cost per decision
-- [Compliance notes](docs/COMPLIANCE.md) — audit trail design against PCI DSS 4.0.1
+- [Compliance notes](docs/COMPLIANCE.md) — what the audit trail records today, and what is planned
 - ADRs: [DynamoDB over Redis](docs/adr/001-dynamodb-over-redis.md),
   [hand-rolled circuit breaker](docs/adr/002-hand-rolled-circuit-breaker.md),
   [fire-and-forget event publishing](docs/adr/003-fire-and-forget-event-publishing.md),
-  [OCC over pessimistic locking](docs/adr/004-occ-over-pessimistic-locking.md)
+  [OCC over pessimistic locking](docs/adr/004-occ-over-pessimistic-locking.md),
+  [tenant-namespaced storage keys](docs/adr/005-tenant-namespaced-storage-keys.md)
 
 ## Technology stack
 
