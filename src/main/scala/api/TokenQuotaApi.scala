@@ -161,6 +161,14 @@ class TokenQuotaApi[F[_]: Async: Tracer](
               Some(s"${level.prefix} quota exceeded: $used/$limit tokens used"),
           ).asJson,
         ).map(withRetryAfter(retryAfter))
+      case QuotaDecision.NeverFits(level, limit, requested) =>
+        BadRequest(io.circe.Json.obj(
+          "error" -> io.circe.Json.fromString("validation_error"),
+          "message" ->
+            io.circe.Json
+              .fromString(s"estimate of $requested tokens exceeds the ${level
+                  .prefix} limit of $limit, so it can never be admitted"),
+        ))
       case QuotaDecision.Contended(attempts) => ServiceUnavailable(
           TokenQuotaCheckResponse(
             allowed = false,

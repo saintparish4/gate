@@ -56,6 +56,13 @@ class RateLimitApi[F[_]: Async: Tracer](
           RateLimitApi
             .selectProfile(config, client.tier, checkReq.profile) match
             case Left(refusal) => refuseProfile(refusal, client)
+            // It could never be admitted, yet got a Retry-After that promised
+            // it would be.
+            case Right(profile) if checkReq.cost > profile.capacity =>
+              validationError(
+                s"cost ${checkReq.cost} exceeds the profile's capacity ${profile
+                    .capacity}, so it can never be admitted",
+              )
             case Right(profile) => consume(checkReq, profile, client, startTime)
     yield response
 
@@ -330,13 +337,18 @@ object RateLimitApi:
         config.defaultTtlSeconds,
       ))
 
-  // Both dimensions: a larger burst at a slower refill still beats the tier
-  // over a short window, and a faster refill beats it over a long one.
+  // Every dimension: a larger burst at a slower refill still beats the tier
+  // over a short window, and a faster refill beats it over a long one. Under
+  // the sliding window ttlSeconds is the window, so the same capacity over a
+  // shorter one widens the limit; it went unchecked. For the buckets it is how
+  // long idle state lives, and a shorter life only loses state sooner, so the
+  // rule is the same for every algorithm.
   private def withinTier(
       asked: RateLimitProfile,
       own: RateLimitProfile,
   ): Boolean = asked.capacity <= own.capacity &&
-    asked.refillRatePerSecond <= own.refillRatePerSecond
+    asked.refillRatePerSecond <= own.refillRatePerSecond &&
+    asked.ttlSeconds >= own.ttlSeconds
 
   def apply[F[_]: Async: Tracer](
       store: RateLimitStore[F],

@@ -44,9 +44,25 @@ class IdempotencyApi[F[_]: Async: Tracer](
     (for
       startTime <- Clock[F].realTime.map(_.toMillis)
       checkReq <- request.as[IdempotencyCheckRequest]
+      response <- checkReq.ttl.filter(_ <= 0) match
+        // It used to be accepted, and wrote a record that was already expired.
+        case Some(ttl) => BadRequest(io.circe.Json.obj(
+            "error" -> io.circe.Json.fromString("validation_error"),
+            "message" ->
+              io.circe.Json.fromString(s"ttl must be positive, got $ttl"),
+          ))
+        case None => runCheck(checkReq, client, startTime)
+    yield response).handleErrorWith(storageFailure("check"))
 
-      requestedTtl = checkReq.ttl.getOrElse(idempotencyConfig.defaultTtlSeconds)
-      ttlSeconds = math.min(requestedTtl, idempotencyConfig.maxTtlSeconds)
+  private def runCheck(
+      checkReq: IdempotencyCheckRequest,
+      client: AuthenticatedClient,
+      startTime: Long,
+  ): F[Response[F]] =
+    val requestedTtl = checkReq.ttl
+      .getOrElse(idempotencyConfig.defaultTtlSeconds)
+    val ttlSeconds = math.min(requestedTtl, idempotencyConfig.maxTtlSeconds)
+    for
       _ <-
         if requestedTtl > idempotencyConfig.maxTtlSeconds then
           logger.warn(
@@ -86,7 +102,7 @@ class IdempotencyApi[F[_]: Async: Tracer](
 
       // Build response
       response <- buildCheckResponse(result)
-    yield response).handleErrorWith(storageFailure("check"))
+    yield response
 
   /** POST /v1/idempotency/:key/complete
     *

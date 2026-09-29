@@ -141,6 +141,23 @@ class TokenQuotaApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
         response.headers.get(ci"Retry-After") shouldBe defined
       }
 
+    // It was a 429 with a Retry-After that could never come true.
+    "an estimate above a level's limit is 400 and reserves nothing" in
+      makeApi().flatMap(api =>
+        for
+          r <- api
+            .check(checkRequest("user-big", estimatedInput = 101), testClient)
+          message <- r.bodyText.compile.string
+          whole <- api
+            .check(checkRequest("user-big", estimatedInput = 100), testClient)
+        yield (r.status, r.headers.get(ci"Retry-After"), message, whole.status),
+      ).asserting { case (status, retryAfter, message, whole) =>
+        status shouldBe Status.BadRequest
+        retryAfter shouldBe None
+        message should include("exceeds the user limit of 100")
+        whole shouldBe Status.Ok
+      }
+
     "returns 400 for negative token estimates" in makeApi().flatMap(api =>
       api.check(checkRequest("user-c", estimatedInput = -1), testClient),
     ).asserting(_.status shouldBe Status.BadRequest)

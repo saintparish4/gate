@@ -93,7 +93,7 @@ The built-in keys are `test-api-key` and `free-api-key` (standard permissions) a
 
 ## Rate limiting
 
-A check names a `key` and a `cost` (default 1; zero or negative is a 400). The client's tier picks a profile from `rate-limit.profiles` (`free`, `basic`, `premium`, `enterprise`), falling back to the `default-*` values. A `profile` named in the request may only narrow the tier's own ([RateLimitApi.selectProfile](../src/main/scala/api/RateLimitApi.scala)). An unknown name is a 400, and one with a larger capacity or a faster refill is a 403: the named profile used to win outright, so a free key could ask for enterprise limits. The store receives `TenantKey(clientId, key)`.
+A check names a `key` and a `cost` (default 1; zero or negative, or above the profile's capacity, is a 400). The client's tier picks a profile from `rate-limit.profiles` (`free`, `basic`, `premium`, `enterprise`), falling back to the `default-*` values. A `profile` named in the request may only narrow the tier's own ([RateLimitApi.selectProfile](../src/main/scala/api/RateLimitApi.scala)). An unknown name is a 400, and one with a larger capacity, a faster refill, or a shorter `ttl-seconds` (the window, under the sliding window) is a 403: the named profile used to win outright, so a free key could ask for enterprise limits. The store receives `TenantKey(clientId, key)`.
 
 ### Algorithms
 
