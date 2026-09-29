@@ -12,18 +12,19 @@ import cats.effect.*
 import cats.syntax.all.*
 import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient
 import software.amazon.awssdk.services.dynamodb.model.*
-import core.{RateLimitDecision, RateLimitProfile, RateLimitStore}
+import core.{
+  LeakyBucket, LeakyBucketState, RateLimitDecision, RateLimitProfile,
+  RateLimitStore,
+}
 import observability.MetricsPublisher
 import resilience.{OCCConflictException, Retry, RetryPolicy}
 import DynamoDBOps.*
 
 /** DynamoDB implementation of RateLimitStore using leaky bucket algorithm.
   *
-  * State per key: level (current "water"), lastLeakMs, version. Leak:
-  * leakAmount = (now_ms - lastLeakMs) / 1000.0 * leakRatePerSecond newLevel =
-  * max(0, level - leakAmount) Allow if newLevel + cost <= capacity; then level =
-  * newLevel + cost, lastLeakMs = now. Reject with resetAt = now + (newLevel +
-  * cost - capacity) / leakRatePerSecond seconds.
+  * State per key: level (current "water"), lastLeakMs, version. The leak and
+  * pour are [[core.LeakyBucket]], which clamps clock corrections. Reject with
+  * resetAt = now + (newLevel + cost - capacity) / leakRatePerSecond seconds.
   *
   * Profile: Reuses RateLimitProfile — capacity = bucket size,
   * refillRatePerSecond = leak rate. DynamoDB: Same schema as token bucket (pk,
@@ -70,14 +71,11 @@ class LeakyBucketRateLimitStore[F[_]: Async: Logger](
     for
       now <- Clock[F].realTime.map(_.toMillis)
       currentState <- getOrInitState(key, profile, now)
-      elapsedSec = (now - currentState.lastLeakMs) / 1000.0
-      leakAmount = elapsedSec * profile.refillRatePerSecond
-      newLevel = math.max(0.0, currentState.level - leakAmount)
-      decision <-
-        if newLevel + cost <= profile.capacity then
-          val updatedLevel = newLevel + cost
-          val newState =
-            LeakyBucketState(updatedLevel, now, currentState.version + 1)
+      leaked = LeakyBucket.leak(currentState, now, profile)
+      newLevel = leaked.level
+      decision <- LeakyBucket.pour(leaked, cost, now, profile) match
+        case Some(newState) =>
+          val updatedLevel = newState.level
           attemptUpdate(
             key,
             currentState.version,
@@ -95,9 +93,9 @@ class LeakyBucketRateLimitStore[F[_]: Async: Logger](
               )
             case false => Async[F].raiseError(OCCConflictException(key, 0))
           }
-        else
-          val secToAllow =
-            (newLevel + cost - profile.capacity) / profile.refillRatePerSecond
+        case None =>
+          val secToAllow = (newLevel + cost - profile.capacity) /
+            profile.refillRatePerSecond
           val resetAt = Instant.ofEpochMilli(now + (secToAllow * 1000).toLong)
           Async[F].pure(
             RateLimitDecision.Rejected(secToAllow.ceil.toInt.max(1), resetAt),
@@ -113,9 +111,7 @@ class LeakyBucketRateLimitStore[F[_]: Async: Logger](
       maybeState <- getState(key)
       result <- maybeState match
         case Some(Right(state)) =>
-          val elapsedSec = (now - state.lastLeakMs) / 1000.0
-          val leakAmount = elapsedSec * profile.refillRatePerSecond
-          val newLevel = math.max(0.0, state.level - leakAmount)
+          val newLevel = LeakyBucket.leak(state, now, profile).level
           val remaining = (profile.capacity - newLevel).toInt
           val resetAt = Instant.ofEpochMilli(
             now + (newLevel / profile.refillRatePerSecond * 1000).toLong,
@@ -231,12 +227,6 @@ class LeakyBucketRateLimitStore[F[_]: Async: Logger](
           ).build()
 
     conditionalPut(client, request)
-
-  private case class LeakyBucketState(
-      level: Double,
-      lastLeakMs: Long,
-      version: Long,
-  )
 
 object LeakyBucketRateLimitStore:
   def apply[F[_]: Async: Logger](

@@ -68,10 +68,18 @@ class SlidingWindowSpec extends AnyFunSuite with Matchers:
     SlidingWindow.retryAfterSeconds(resetFar, nowMs) shouldBe 3
   }
 
-  test("pruneStale removes counts outside active window") {
-    val stale = activeStarts.last - subDurMs
-    val counts = Map(activeStarts.head -> 5L, stale -> 99L)
-    val pruned = SlidingWindow.pruneStale(counts, activeStarts)
-    pruned.contains(stale) shouldBe false
+  test("pruneStale keeps one window of history before the active window") {
+    val justKept = activeStarts.last - windowMs
+    val dropped = justKept - subDurMs
+    val counts = Map(activeStarts.head -> 5L, justKept -> 2L, dropped -> 99L)
+    val pruned = SlidingWindow.pruneStale(counts, activeStarts, windowMs)
+    pruned.contains(dropped) shouldBe false
+    pruned.get(justKept) shouldBe Some(2L)
     pruned.get(activeStarts.head) shouldBe Some(5L)
+  }
+
+  test("resetAt counts a sub-window ahead of the local clock") {
+    val ahead = activeStarts.head + 2 * subDurMs
+    val reset = SlidingWindow.resetAt(Map(ahead -> 1L), activeStarts, windowMs)
+    reset shouldBe Instant.ofEpochMilli(ahead + windowMs)
   }

@@ -126,7 +126,8 @@ class DynamoDBIdempotencyStore[F[_]: Async](
                     // on the Failed record did win was also told New, and both
                     // ran the operation. Exposing markFailed made it reachable.
                     case IdempotencyStatus.Failed => reclaim
-                // TTL deleted the record between tryCreatePending and get.
+                // Deleted by TTL between tryCreatePending and get, or expired
+                // by then (the claim condition checks an earlier now).
                 case None => reclaim
               }
           }
@@ -208,16 +209,23 @@ class DynamoDBIdempotencyStore[F[_]: Async](
       .key(Map("pk" -> attr(s"idempotency#$idempotencyKey")).asJava)
       .consistentRead(true).build()
 
-    Async[F].fromCompletableFuture(
-      Async[F].delay(client.getItem(request).toCompletableFuture),
-    ).flatMap(response =>
-      if response.hasItem && !response.item().isEmpty then
-        parseRecord(idempotencyKey, response.item().asScala.toMap) match
-          case Right(record) => Async[F].pure(Some(record))
-          case Left(StoreError.CorruptRecord(key, detail)) => Async[F]
-              .raiseError(new CorruptIdempotencyRecordException(key, detail))
-      else Async[F].pure(None),
-    )
+    Clock[F].realTime.map(d => Instant.ofEpochMilli(d.toMillis)).flatMap {
+      now =>
+        Async[F].fromCompletableFuture(
+          Async[F].delay(client.getItem(request).toCompletableFuture),
+        ).flatMap { response =>
+          if response.hasItem && !response.item().isEmpty then
+            parseRecord(idempotencyKey, response.item().asScala.toMap) match
+              // DynamoDB deletes expired items lazily, often days late. Until
+              // then an expired record answered in_progress or replayed, and a
+              // crashed owner's key stayed stuck that long.
+              case Right(record) if record.expired(now) => Async[F].pure(None)
+              case Right(record) => Async[F].pure(Some(record))
+              case Left(StoreError.CorruptRecord(key, detail)) => Async[F]
+                  .raiseError(new CorruptIdempotencyRecordException(key, detail))
+          else Async[F].pure(None)
+        }
+    }
 
   override def healthCheck: F[Either[String, Unit]] = Async[F]
     .fromCompletableFuture(Async[F].delay(
@@ -250,9 +258,16 @@ class DynamoDBIdempotencyStore[F[_]: Async](
       case None => baseItem
 
     val request = PutItemRequest.builder().tableName(tableName).item(item.asJava)
-      .conditionExpression("attribute_not_exists(pk) OR #status = :failed")
-      .expressionAttributeNames(Map("#status" -> "status").asJava)
-      .expressionAttributeValues(Map(":failed" -> attr("Failed")).asJava).build()
+      // An expired record is claimable, as if TTL had already deleted it; get
+      // reads it as absent by the same rule. A missing ttl never compares.
+      .conditionExpression(
+        "attribute_not_exists(pk) OR #status = :failed OR #ttl < :now",
+      ).expressionAttributeNames(
+        Map("#status" -> "status", "#ttl" -> "ttl").asJava,
+      ).expressionAttributeValues(
+        Map(":failed" -> attr("Failed"), ":now" -> attrN(now.getEpochSecond))
+          .asJava,
+      ).build()
 
     conditionalPut(client, request)
 
@@ -299,7 +314,8 @@ class DynamoDBIdempotencyStore[F[_]: Async](
       response = response,
       createdAt = createdAt,
       updatedAt = updatedAt,
-      ttl = item.get("ttl").map(_.n().toLong).getOrElse(0L),
+      // No ttl never expires, matching the claim condition.
+      ttl = item.get("ttl").map(_.n().toLong).getOrElse(Long.MaxValue),
       version = item.get("version").map(_.n().toLong).getOrElse(0L),
       requestHash = requestHash,
     )

@@ -58,7 +58,12 @@ case class IdempotencyRecord(
     ttl: Long,
     version: Long,
     requestHash: Option[String] = None,
-)
+):
+  /** Past its TTL (epoch seconds, as DynamoDB TTL reads it). DynamoDB deletes
+    * an expired item lazily, often days later, so every read and claim checks
+    * this itself.
+    */
+  def expired(now: Instant): Boolean = ttl < now.getEpochSecond
 
 sealed trait IdempotencyStatus
 object IdempotencyStatus:
@@ -155,7 +160,8 @@ trait IdempotencyStore[F[_]]:
     * @param idempotencyKey
     *   The key to check
     * @return
-    *   The record if it exists
+    *   The record if it exists and has not expired; an expired record reads as
+    *   absent, whether or not the backend has deleted it yet
     */
   def get(idempotencyKey: String): F[Option[IdempotencyRecord]]
 
@@ -186,7 +192,7 @@ object IdempotencyStore:
           for
             now <- Clock[F].realTime.map(d => Instant.ofEpochMilli(d.toMillis))
             result <- stateRef.modify { records =>
-              records.get(idempotencyKey) match
+              records.get(idempotencyKey).filterNot(_.expired(now)) match
                 case Some(existing) => existing.status match
                     case IdempotencyStatus.Pending =>
                       val conflict =
@@ -309,7 +315,10 @@ object IdempotencyStore:
           yield result
 
         override def get(idempotencyKey: String): F[Option[IdempotencyRecord]] =
-          stateRef.get.map(_.get(idempotencyKey))
+          for
+            now <- Clock[F].realTime.map(d => Instant.ofEpochMilli(d.toMillis))
+            records <- stateRef.get
+          yield records.get(idempotencyKey).filterNot(_.expired(now))
 
         override def healthCheck: F[Either[String, Unit]] = Temporal[F]
           .pure(Right(()))

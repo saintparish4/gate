@@ -8,11 +8,26 @@ import java.time.Instant
   * duration. Sub-window boundaries are epoch-aligned so every service instance
   * independently computes identical window boundaries
   *
+  * ==Clock skew==
+  * Boundaries are identical across tasks, but each task reads its own wall
+  * clock, and those clocks disagree by the skew between tasks (or by a step on
+  * one task). The state is shared, so a sub-window may hold counts that another
+  * task wrote from a clock ahead of this one. Those counts are live: they sit
+  * inside every window that ends after them. This used to sum only the
+  * `subWindowCount` starts derived from the local clock and prune everything
+  * else, so a trailing task ignored, then erased, the newest counts of a
+  * leading one, and admitted up to capacity again within one window.
+  *
+  *   - A count is live if its sub-window starts at or after the oldest active
+  *     one, however far ahead of the local clock.
+  *   - Pruning keeps one extra window of history, so a task ahead by up to one
+  *     window cannot erase counts that a trailing task still has in its window.
+  *     The item holds at most about `2 * subWindowCount` entries for skew
+  *     within a window.
+  *
   * ==Key invariants==
   *   - `currentSubWindowStart` is always <= nowMs.
   *   - `activeSubWindowStarts` always has exactly `subWindowCount` elements.
-  *   - Counts for sub-windows not in the active list are stale and must be
-  *     pruned before writing to keep the DynamoDB item small.
   */
 object SlidingWindow:
 
@@ -39,16 +54,21 @@ object SlidingWindow:
     val current = currentSubWindowStart(nowMs, subDuration)
     (0 until subWindowCount).map(i => current - i * subDuration).toList
 
-  /** Sum of counts across all active sub-windows. */
+  /** Sum of counts in every live sub-window: the active ones, and any ahead of
+    * the local clock (see Clock skew).
+    */
   def totalCount(counts: Map[Long, Long], activeStarts: List[Long]): Long =
-    activeStarts.foldLeft(0L)(_ + counts.getOrElse(_, 0L))
+    val oldest = activeStarts.last
+    counts.foldLeft(0L) { case (sum, (sw, c)) =>
+      if sw >= oldest then sum + c else sum
+    }
 
   /** Requests remaining in the current window (clamped to >= 0). */
   def remaining(capacity: Int, total: Long): Int = math
     .max(0, capacity - total.toInt)
 
   /** The instant at which the window total will decrease, i.e., when the oldest
-    * sub-window that holds any counts expires Used to populate
+    * live sub-window that holds any counts expires. Used to populate
     * X-RateLimit-Reset and Retry-After.
     */
   def resetAt(
@@ -56,28 +76,29 @@ object SlidingWindow:
       activeStarts: List[Long],
       windowDurationMs: Long,
   ): Instant =
-    // Walk from oldest to newest; oldest counted sub-window expires first.
-    activeStarts.reverseIterator.find(sw => counts.getOrElse(sw, 0L) > 0)
-      .map(oldest => Instant.ofEpochMilli(oldest + windowDurationMs)).getOrElse(
+    val oldest = activeStarts.last
+    // The oldest counted live sub-window expires first.
+    counts.collect { case (sw, c) if sw >= oldest && c > 0 => sw }.minOption
+      .map(sw => Instant.ofEpochMilli(sw + windowDurationMs)).getOrElse(
         // No counts yet -- reset is at end of current sub-window window.
-        activeStarts.headOption
-          .map(current => Instant.ofEpochMilli(current + windowDurationMs))
-          .getOrElse(Instant.ofEpochMilli(windowDurationMs)),
+        Instant.ofEpochMilli(activeStarts.head + windowDurationMs),
       )
 
   /** Retry-After seconds (min 1) from now to the reset instant. */
   def retryAfterSeconds(resetAt: Instant, nowMs: Long): Int = math
     .max(1, ((resetAt.toEpochMilli - nowMs) / 1000).toInt)
 
-  /** Remove counts for sub-windows no longer in `activeStarts`. Keeps the
-    * DynamoDB item bounded to `subWindowCount` entries.
+  /** Remove counts a full window older than the oldest active sub-window. Keeps
+    * the DynamoDB item bounded, and never removes a count that a task up to one
+    * window behind this one still counts (see Clock skew).
     */
   def pruneStale(
       counts: Map[Long, Long],
       activeStarts: List[Long],
+      windowDurationMs: Long,
   ): Map[Long, Long] =
-    val active = activeStarts.toSet
-    counts.filter { case (sw, _) => active.contains(sw) }
+    val keepFrom = activeStarts.last - windowDurationMs
+    counts.filter { case (sw, _) => sw >= keepFrom }
 
 /** Persisted state for one rate-limited key in DynamoDB. */
 case class SlidingWindowState(

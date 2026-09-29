@@ -103,11 +103,15 @@ A check names a `key` and a `cost` (default 1; zero or negative is a 400). The c
 | --- | --- | --- | --- |
 | `token-bucket` (default) | [DynamoDBRateLimitStore](../src/main/scala/storage/DynamoDBRateLimitStore.scala) | `pk = ratelimit#<scoped key>`, `tokens`, `lastRefillMs`, `version`, `ttl` | Refill `elapsed × rate`, up to capacity; admit when `tokens ≥ cost`. A new key starts full. |
 | `leaky-bucket` | [LeakyBucketRateLimitStore](../src/main/scala/storage/LeakyBucketRateLimitStore.scala) | Same `pk` and names: `tokens` holds the level, `lastRefillMs` the last leak | Drain `elapsed × rate`; admit when `level + cost ≤ capacity`. A new key starts empty. |
-| `sliding-window` | [DynamoDBSlidingWindowStore](../src/main/scala/storage/DynamoDBSlidingWindowStore.scala) | `pk = sw#<scoped key>`, `counts` (map of sub-window start ms to count), `version`, `ttl` | The profile's `ttl-seconds` is the window, split into 10 epoch-aligned sub-windows. Admit when the 10 active counts plus `cost` stay within capacity. The refill rate is unused. |
+| `sliding-window` | [DynamoDBSlidingWindowStore](../src/main/scala/storage/DynamoDBSlidingWindowStore.scala) | `pk = sw#<scoped key>`, `counts` (map of sub-window start ms to count), `version`, `ttl` | The profile's `ttl-seconds` is the window, split into 10 epoch-aligned sub-windows. Admit when the live counts plus `cost` stay within capacity. Live means the 10 active sub-windows and any sub-window ahead of this task's clock, which a task with a leading clock wrote. The refill rate is unused. |
 
 Token-bucket and leaky-bucket rows share a prefix and attribute names, so switching between the two on a live table reinterprets existing rows until they expire.
 
-The token bucket uses wall-clock time, because `lastRefillMs` is shared across tasks. Elapsed time is clamped at zero and `lastRefillMs` never moves backward, so a backward clock correction neither deducts tokens nor refunds them later. A forward step mints `rate × step` tokens once.
+All three use wall-clock time, because the state is shared across tasks, so they must survive clock skew between tasks and steps on one task:
+
+- **Token bucket.** Elapsed time is clamped at zero and `lastRefillMs` never moves backward. A backward clock correction neither deducts tokens nor refunds them later. A forward step mints `rate × step` tokens once.
+- **Leaky bucket.** The same rule ([LeakyBucket](../src/main/scala/core/LeakyBucket.scala)): a backward step neither raises the level (denying) nor lets another task drain the gap twice.
+- **Sliding window.** Counts ahead of the local clock are live, and pruning keeps one extra window of history. Skew of up to one window never admits more than capacity in any window ([SlidingWindowSkewPropertySpec](../src/test/scala/core/SlidingWindowSkewPropertySpec.scala)). The item's `ttl` runs from its newest count.
 
 ### The OCC loop
 
@@ -169,7 +173,7 @@ t1:<length of clientId>:<clientId>:<caller's key>
   - Fail sets `Failed`, so the next check claims the key again.
   - Either answers 409 when the record is missing, not pending, or another client's. A `Completed` record is never reopened, because its operation ran.
 - **Size cap.** Complete measures the response as encoded JSON, so escaping and headers count. Above 350 KB (`350 × 1024` bytes) it answers 413, stores nothing, and the key stays `Pending`. A DynamoDB item holds at most 400 KB, and a larger write used to fail and answer 503 as if the store were down.
-- **TTL.** `ttl` is the check time plus the requested TTL, which defaults to `idempotency.default-ttl-seconds` and is capped at `max-ttl-seconds` (both 86,400). Reads do not compare `ttl`, so an expired record keeps answering until DynamoDB's TTL process deletes it.
+- **TTL.** `ttl` is the check time plus the requested TTL, which defaults to `idempotency.default-ttl-seconds` and is capped at `max-ttl-seconds` (both 86,400). DynamoDB's TTL process deletes expired items lazily, so the store checks expiry itself: the claim also succeeds on `ttl < now`, and `get` reads an expired record as absent. A crashed owner's key becomes claimable when its TTL passes.
 - **No lease on `Pending`.** A record stays `Pending` until its owner completes or fails it, or TTL removes it. A crashed owner leaves the key answering `in_progress` until then.
 - **Guard.** Every call goes through the [StoreGuard](../src/main/scala/resilience/StoreGuard.scala) `idempotency`: its own bulkhead (same settings as above) and a `resilience.timeout.idempotency-check` (2 s) bound on the whole call, claim retries included. A timeout is one attempt, because retrying would multiply the worst case. A store failure, timeout, or full bulkhead answers 503 `storage_unavailable`.
 
