@@ -103,7 +103,7 @@ class DynamoDBSlidingWindowStore[F[_]: Async: Logger](
           val curSw = active.head
           val updated = current.counts
             .updated(curSw, current.counts.getOrElse(curSw, 0L) + cost)
-          val pruned = SlidingWindow.pruneStale(updated, active)
+          val pruned = SlidingWindow.pruneStale(updated, active, windowMs)
           val newState = SlidingWindowState(pruned, current.version + 1)
           attemptWrite(key, current.version, newState, profile.ttlSeconds, nowMs)
             .flatMap {
@@ -211,7 +211,10 @@ class DynamoDBSlidingWindowStore[F[_]: Async: Logger](
       "pk" -> attr(s"sw#$key"),
       "counts" -> AttributeValue.builder().m(countsMap).build(),
       "version" -> attrN(state.version),
-      "ttl" -> attrN(nowMs / 1000 + ttlSeconds),
+      // From the newest count, not this task's clock: a trailing task must not
+      // set an expiry that falls before a leading task's counts expire.
+      "ttl" ->
+        attrN(state.counts.keys.foldLeft(nowMs)(_ max _) / 1000 + ttlSeconds),
     )
 
   private def getState(

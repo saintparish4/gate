@@ -103,11 +103,14 @@ A check names a `key` and a `cost` (default 1; zero or negative is a 400). The c
 | --- | --- | --- | --- |
 | `token-bucket` (default) | [DynamoDBRateLimitStore](../src/main/scala/storage/DynamoDBRateLimitStore.scala) | `pk = ratelimit#<scoped key>`, `tokens`, `lastRefillMs`, `version`, `ttl` | Refill `elapsed × rate`, up to capacity; admit when `tokens ≥ cost`. A new key starts full. |
 | `leaky-bucket` | [LeakyBucketRateLimitStore](../src/main/scala/storage/LeakyBucketRateLimitStore.scala) | Same `pk` and names: `tokens` holds the level, `lastRefillMs` the last leak | Drain `elapsed × rate`; admit when `level + cost ≤ capacity`. A new key starts empty. |
-| `sliding-window` | [DynamoDBSlidingWindowStore](../src/main/scala/storage/DynamoDBSlidingWindowStore.scala) | `pk = sw#<scoped key>`, `counts` (map of sub-window start ms to count), `version`, `ttl` | The profile's `ttl-seconds` is the window, split into 10 epoch-aligned sub-windows. Admit when the 10 active counts plus `cost` stay within capacity. The refill rate is unused. |
+| `sliding-window` | [DynamoDBSlidingWindowStore](../src/main/scala/storage/DynamoDBSlidingWindowStore.scala) | `pk = sw#<scoped key>`, `counts` (map of sub-window start ms to count), `version`, `ttl` | The profile's `ttl-seconds` is the window, split into 10 epoch-aligned sub-windows. Admit when the live counts plus `cost` stay within capacity. Live means the 10 active sub-windows and any sub-window ahead of this task's clock, which a task with a leading clock wrote. The refill rate is unused. |
 
 Token-bucket and leaky-bucket rows share a prefix and attribute names, so switching between the two on a live table reinterprets existing rows until they expire.
 
-The token bucket uses wall-clock time, because `lastRefillMs` is shared across tasks. Elapsed time is clamped at zero and `lastRefillMs` never moves backward, so a backward clock correction neither deducts tokens nor refunds them later. A forward step mints `rate × step` tokens once.
+All three use wall-clock time, because the state is shared across tasks, so they must survive clock skew between tasks and steps on one task:
+
+- **Token bucket.** Elapsed time is clamped at zero and `lastRefillMs` never moves backward. A backward clock correction neither deducts tokens nor refunds them later. A forward step mints `rate × step` tokens once.
+- **Sliding window.** Counts ahead of the local clock are live, and pruning keeps one extra window of history. Skew of up to one window never admits more than capacity in any window ([SlidingWindowSkewPropertySpec](../src/test/scala/core/SlidingWindowSkewPropertySpec.scala)). The item's `ttl` runs from its newest count.
 
 ### The OCC loop
 
