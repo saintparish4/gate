@@ -96,6 +96,31 @@ class SecretsManagerSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
         Set(Permission.RateLimitCheck, Permission.AdminMetrics)
     }
 
+    // Both used to be dropped silently: the entry for an unknown tier, the
+    // permission for an unknown name. The typo surfaced later as a 401 or 403.
+    "fails on an unknown tier or permission, naming each entry and value" in
+      apiKeys {
+        secret {
+          """[
+            |  {"apiKey": "k1", "apiKeyId": "key_1", "clientName": "A",
+            |   "tier": "platinum", "permissions": [], "active": true},
+            |  {"apiKey": "k2", "apiKeyId": "key_2", "clientName": "B",
+            |   "tier": "free", "permissions": ["ratelimit_chek"], "active": false},
+            |  {"apiKey": "k3", "apiKeyId": "key_3", "clientName": "C",
+            |   "tier": "free", "permissions": ["ratelimit_check"], "active": true}
+            |]""".stripMargin
+        }
+      }.attempt.asserting { result =>
+        val error = result.left.getOrElse(fail("expected a failure"))
+        error shouldBe an[InvalidApiKeysException]
+        error.getMessage should include("key 'key_1': unknown tier 'platinum'")
+        error.getMessage should
+          include("key 'key_2': unknown permission 'ratelimit_chek'")
+        (error.getMessage should not).include("k1")
+        error.asInstanceOf[InvalidApiKeysException].valid.keySet shouldBe
+          Set("k3")
+      }
+
     "parses every route permission by its secret name" in apiKeys(secret(
       """[{"apiKey": "k", "apiKeyId": "key_1", "clientName": "C",
         |  "tier": "basic", "active": true, "permissions": [
@@ -157,6 +182,30 @@ class SecretsManagerSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
           found <- store.findByKey("key-1")
         yield found,
       ).asserting(_ shouldBe Some(client1))
+
+    "refuses to start when an entry has an unknown tier or permission" in
+      scriptedStore(List(IO.raiseError(
+        InvalidApiKeysException(List("key 'key_1': unknown tier 'gold'"), oneKey),
+      ))).flatMap(SecretsManagerApiKeyStore[IO](_)).attempt.asserting(result =>
+        result.left.getOrElse(fail("started with an invalid entry"))
+          .getMessage should include("unknown tier 'gold'"),
+      )
+
+    "a refresh with an invalid entry still applies the valid ones" in
+      TestControl.executeEmbed(
+        for
+          secrets <- scriptedStore(List(
+            IO.pure(oneKey),
+            IO.raiseError(InvalidApiKeysException(
+              List("key 'key_2': unknown tier 'gold'"),
+              Map.empty,
+            )),
+          ))
+          store <- SecretsManagerApiKeyStore[IO](secrets, 1.minute)
+          _ <- IO.sleep(2.minutes)
+          found <- store.findByKey("key-1")
+        yield found,
+      ).asserting(_ shouldBe None)
 
     "applies a refresh that revokes every key" in TestControl.executeEmbed(
       for

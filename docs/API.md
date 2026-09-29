@@ -107,15 +107,18 @@ The secret is named `<secret-prefix>/<environment>/<api-keys-secret-name>`
 ]
 ```
 
-- `tier` is `free`, `basic`, `premium` or `enterprise`. An entry with any other
-  tier, or with `"active": false`, is skipped.
+- `tier` is `free`, `basic`, `premium` or `enterprise`. An entry with
+  `"active": false` is skipped. An unknown tier or permission name, in any
+  entry, is an error that names the entry's `apiKeyId` and the value.
 - The tenant is the entry's `apiKeyId`. Keep it when you rotate `apiKey` to
   keep the client's state.
-- Startup fails if the secret is missing, is not a list in this shape, or has
-  no active key.
+- Startup fails if the secret is missing, is not a list in this shape, has an
+  unknown tier or permission, or has no active key.
 - The keys are re-read about every 5 minutes (`cache-ttl`), so adding or
   revoking a key takes effect within minutes, not at once. If a re-read fails,
-  the current keys stay.
+  the current keys stay. If it finds an unknown tier or permission, the valid
+  entries take effect (so revocations do), the invalid ones cannot
+  authenticate, and the error is logged.
 
 **Built-in development keys** (`ALLOW_BUILT_IN_KEYS=true`, set only by docker
 compose and `make run`). They are public, so never use them outside local

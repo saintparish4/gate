@@ -32,7 +32,9 @@ trait SecretStore[F[_]]:
   def getSecretAs[A: Decoder](secretName: String): F[Option[A]]
 
   /** Get the active API keys. Fails when the keys secret is missing or is not a
-    * JSON list of keys, so a misnamed secret cannot read as "no keys".
+    * JSON list of keys, so a misnamed secret cannot read as "no keys". Fails
+    * with [[InvalidApiKeysException]] when an entry names an unknown tier or
+    * permission.
     */
   def getApiKeys: F[Map[String, AuthenticatedClient]]
 
@@ -71,6 +73,67 @@ case class ApiKeyConfig(
     permissions: List[String],
     active: Boolean,
 )
+
+/** Entries in the keys secret with an unknown tier or permission, named by
+  * `apiKeyId` (never by the key). `valid` holds the active keys that did parse,
+  * so a refresh can still apply them: a typo in one entry must not also hold
+  * back a revocation made in the same edit.
+  */
+final class InvalidApiKeysException(
+    val errors: List[String],
+    val valid: Map[String, AuthenticatedClient],
+) extends IllegalStateException(
+      s"The API keys secret has invalid entries: ${errors.mkString("; ")}",
+    )
+
+object ApiKeyConfig:
+
+  /** The active keys, or every invalid entry. An unknown tier used to drop the
+    * entry and an unknown permission used to drop the permission, so a typo
+    * surfaced later as a 401 or a 403 with nothing in the log. Inactive entries
+    * are checked too: a typo in one is still a typo.
+    */
+  def toClients(
+      configs: List[ApiKeyConfig],
+  ): Either[InvalidApiKeysException, Map[String, AuthenticatedClient]] =
+    val parsed = configs.map { cfg =>
+      val tier = ClientTier.fromString(cfg.tier)
+        .toRight(s"key '${cfg.apiKeyId}': unknown tier '${cfg.tier}'")
+      val permissions = cfg.permissions.map(p =>
+        parsePermission(p)
+          .toRight(s"key '${cfg.apiKeyId}': unknown permission '$p'"),
+      )
+      val errors = tier.left.toSeq ++ permissions.flatMap(_.left.toSeq)
+      val client = Option.when(errors.isEmpty && cfg.active)(
+        cfg.apiKey -> AuthenticatedClient(
+          apiKeyId = cfg.apiKeyId,
+          clientId = cfg.apiKeyId,
+          clientName = cfg.clientName,
+          tier = tier.toOption.get,
+          permissions = permissions.flatMap(_.toOption).toSet,
+        ),
+      )
+      (errors, client)
+    }
+    val errors = parsed.flatMap(_._1)
+    val valid = parsed.flatMap(_._2).toMap
+    Either.cond(errors.isEmpty, valid, InvalidApiKeysException(errors, valid))
+
+  private def parsePermission(s: String): Option[Permission] =
+    s.toLowerCase match
+      case "ratelimit_check" | "ratelimitcheck" =>
+        Some(Permission.RateLimitCheck)
+      case "ratelimit_status" | "ratelimitstatus" =>
+        Some(Permission.RateLimitStatus)
+      case "idempotency_check" | "idempotencycheck" =>
+        Some(Permission.IdempotencyCheck)
+      case "idempotency_complete" | "idempotencycomplete" =>
+        Some(Permission.IdempotencyComplete)
+      case "quota_check" | "quotacheck" => Some(Permission.QuotaCheck)
+      case "quota_reconcile" | "quotareconcile" =>
+        Some(Permission.QuotaReconcile)
+      case "admin_metrics" | "adminmetrics" => Some(Permission.AdminMetrics)
+      case _ => None
 
 /** AWS Secrets Manager implementation of SecretStore.
   */
@@ -149,23 +212,9 @@ object SecretsManagerStore:
                   s"API keys secret $fullName is not a JSON list of keys: ${error
                       .getMessage}",
                 ))
-              case Right(configs) => Async[F].pure(toClients(configs))
+              case Right(configs) => Async[F]
+                  .fromEither(ApiKeyConfig.toClients(configs))
         }
-
-      private def toClients(
-          configs: List[ApiKeyConfig],
-      ): Map[String, AuthenticatedClient] = configs.filter(_.active).flatMap(
-        cfg =>
-          ClientTier.fromString(cfg.tier).map(tier =>
-            cfg.apiKey -> AuthenticatedClient(
-              apiKeyId = cfg.apiKeyId,
-              clientId = cfg.apiKeyId,
-              clientName = cfg.clientName,
-              tier = tier,
-              permissions = cfg.permissions.flatMap(parsePermission).toSet,
-            ),
-          ),
-      ).toMap
 
       private def fetchAndCache(fullName: String): F[Option[String]] =
         val request = GetSecretValueRequest.builder().secretId(fullName).build()
@@ -190,22 +239,6 @@ object SecretsManagerStore:
                   Async[F].raiseError(e),
           )
 
-      private def parsePermission(s: String): Option[Permission] =
-        s.toLowerCase match
-          case "ratelimit_check" | "ratelimitcheck" =>
-            Some(Permission.RateLimitCheck)
-          case "ratelimit_status" | "ratelimitstatus" =>
-            Some(Permission.RateLimitStatus)
-          case "idempotency_check" | "idempotencycheck" =>
-            Some(Permission.IdempotencyCheck)
-          case "idempotency_complete" | "idempotencycomplete" =>
-            Some(Permission.IdempotencyComplete)
-          case "quota_check" | "quotacheck" => Some(Permission.QuotaCheck)
-          case "quota_reconcile" | "quotareconcile" =>
-            Some(Permission.QuotaReconcile)
-          case "admin_metrics" | "adminmetrics" => Some(Permission.AdminMetrics)
-          case _ => None
-
 /** API key store backed by Secrets Manager.
   */
 object SecretsManagerApiKeyStore:
@@ -213,11 +246,13 @@ object SecretsManagerApiKeyStore:
   /** Create an API key store that loads keys from Secrets Manager.
     *
     * The first load happens here and must yield at least one active key, so a
-    * missing, malformed, or still-placeholder secret stops startup. It used to
-    * load lazily on the first request, so a deploy with no usable keys passed
-    * every health check and then answered 401 to everyone. Later refreshes keep
-    * the current keys when the secret cannot be read, but a readable secret
-    * with every key inactive does take effect, so revoking all keys works.
+    * missing, malformed, or still-placeholder secret stops startup, as does an
+    * entry with an unknown tier or permission. It used to load lazily on the
+    * first request, so a deploy with no usable keys passed every health check
+    * and then answered 401 to everyone. Later refreshes keep the current keys
+    * when the secret cannot be read, but a readable secret with every key
+    * inactive does take effect, so revoking all keys works. A refresh with
+    * invalid entries applies the valid ones and logs the rest.
     */
   def apply[F[_]: Async: Logger](
       secretStore: SecretStore[F],
@@ -258,7 +293,12 @@ object SecretsManagerApiKeyStore:
              logger.warn("The API keys secret has no active keys; every request will answer 401")
            else
              logger.info(s"Refreshed ${keys.size} API keys from Secrets Manager")),
-      ).handleErrorWith(error =>
-        logger.error(error)("Failed to refresh API keys, keeping existing") *>
-          Async[F].unit,
-      )
+      ).handleErrorWith {
+        // The valid entries take effect, so revocations do; the invalid ones
+        // cannot authenticate until they are fixed.
+        case invalid: InvalidApiKeysException => keysRef.set(invalid.valid) *>
+            logger.error(s"${invalid.getMessage}; applied the ${invalid.valid
+                .size} valid active keys")
+        case error => logger
+            .error(error)("Failed to refresh API keys, keeping existing")
+      }

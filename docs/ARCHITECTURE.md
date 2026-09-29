@@ -89,7 +89,7 @@ An unauthenticated request to an unknown path therefore gets 401; an authenticat
 | `GET /metrics` | `AdminMetrics` | 404 when Prometheus is off |
 | `/dashboard`, `/dashboard/api/*`, `GET /v1/ratelimit/dashboard/stats` | none | Only with `dashboard.enabled`: off by default, on in compose, pinned off by Terraform |
 
-The built-in keys are `test-api-key` and `free-api-key` (standard permissions) and `admin-api-key` (adds `AdminMetrics`). Secrets Manager keys are a JSON list in the secret `<secret-prefix>/<environment>/<api-keys-secret-name>`, and each key's `apiKeyId` is also its `clientId`. The key set is reloaded on the request path once `security.secrets.cache-ttl` (5 minutes) has passed. A failed reload keeps the current keys; a readable secret with no active keys takes effect, so revoking every key works.
+The built-in keys are `test-api-key` and `free-api-key` (standard permissions) and `admin-api-key` (adds `AdminMetrics`). Secrets Manager keys are a JSON list in the secret `<secret-prefix>/<environment>/<api-keys-secret-name>`, and each key's `apiKeyId` is also its `clientId`. The key set is reloaded on the request path once `security.secrets.cache-ttl` (5 minutes) has passed. An entry with an unknown tier or permission stops startup, naming it. A failed reload keeps the current keys; a reload that finds invalid entries applies the valid ones, so a revocation in the same edit still takes effect. A readable secret with no active keys takes effect, so revoking every key works.
 
 ## Rate limiting
 

@@ -112,6 +112,10 @@ case class RateLimitProfileConfig(
       Left(s"profile '$name': capacity must be >= 1, got $capacity")
     else if refillRatePerSecond <= 0 then
       Left(s"profile '$name': refillRatePerSecond must be > 0, got $refillRatePerSecond")
+    // RateLimitProfile requires it too, but only when a request builds one, so
+    // ttl-seconds = 0 used to start fine and answer 500 to every request.
+    else if ttlSeconds <= 0 then
+      Left(s"profile '$name': ttlSeconds must be > 0, got $ttlSeconds")
     else Right(())
 
 // Rate limiting defaults
@@ -278,8 +282,22 @@ object AppConfig:
 
   /** Every rule `load` enforces beyond what the types already do. */
   def validate(config: AppConfig): List[String] =
-    val profileErrors = config.rateLimit.profiles.toList
+    val rl = config.rateLimit
+    // The defaults are the profile of any tier without a named one.
+    val defaultProfile = RateLimitProfileConfig(
+      rl.defaultCapacity,
+      rl.defaultRefillRatePerSecond,
+      rl.defaultTtlSeconds,
+    )
+    val profileErrors = (("default" -> defaultProfile) :: rl.profiles.toList)
       .flatMap { case (name, p) => p.validate(name).left.toOption }
+    val idem = config.idempotency
+    val idempotencyErrors = List(
+      "default-ttl-seconds" -> idem.defaultTtlSeconds,
+      "max-ttl-seconds" -> idem.maxTtlSeconds,
+    ).collect {
+      case (key, v) if v <= 0 => s"idempotency.$key must be > 0, got $v"
+    }
     val agentCap = (config.tokenQuota.userLimit * 0.8).toLong
     val quotaErrors =
       if config.tokenQuota.enabled && config.tokenQuota.agentLimit > agentCap
@@ -290,8 +308,8 @@ object AppConfig:
     val degradationErrors =
       validateDegradationMode(config.resilience.degradationMode).toList
     val keySourceErrors = validateKeySource(config.security).toList
-    profileErrors ++ quotaErrors ++ degradationErrors ++ keySourceErrors ++
-      validateChoices(config)
+    profileErrors ++ idempotencyErrors ++ quotaErrors ++ degradationErrors ++
+      keySourceErrors ++ validateChoices(config)
 
   /** Load and validate, failing on any error.
     *
