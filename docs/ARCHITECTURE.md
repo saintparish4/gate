@@ -110,6 +110,7 @@ Token-bucket and leaky-bucket rows share a prefix and attribute names, so switch
 All three use wall-clock time, because the state is shared across tasks, so they must survive clock skew between tasks and steps on one task:
 
 - **Token bucket.** Elapsed time is clamped at zero and `lastRefillMs` never moves backward. A backward clock correction neither deducts tokens nor refunds them later. A forward step mints `rate × step` tokens once.
+- **Leaky bucket.** The same rule ([LeakyBucket](../src/main/scala/core/LeakyBucket.scala)): a backward step neither raises the level (denying) nor lets another task drain the gap twice.
 - **Sliding window.** Counts ahead of the local clock are live, and pruning keeps one extra window of history. Skew of up to one window never admits more than capacity in any window ([SlidingWindowSkewPropertySpec](../src/test/scala/core/SlidingWindowSkewPropertySpec.scala)). The item's `ttl` runs from its newest count.
 
 ### The OCC loop
