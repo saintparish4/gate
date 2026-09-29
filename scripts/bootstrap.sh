@@ -19,6 +19,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/lib-terraform.sh"
 
 require_terraform
+use_cli_credentials
 
 REGION="${AWS_REGION:-us-east-1}"
 REPO="${ECR_REPO_NAME:-gate}"

@@ -13,6 +13,7 @@ TF_DIR="$(cd "$SCRIPT_DIR/.." && pwd)/terraform"
 source "$SCRIPT_DIR/lib-terraform.sh"
 
 require_terraform
+use_cli_credentials
 require_backend
 
 cd "$TF_DIR"
