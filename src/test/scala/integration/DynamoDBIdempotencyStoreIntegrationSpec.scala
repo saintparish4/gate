@@ -204,6 +204,48 @@ class DynamoDBIdempotencyStoreIntegrationSpec
       }
     }
 
+    // DynamoDB deletes expired items lazily, often days late. Until then the
+    // claim condition and get ignored ttl, so an expired record answered
+    // in_progress (a crashed owner's key stayed stuck) or replayed. A negative
+    // ttlSeconds writes a record that is already expired but still present.
+    "an expired record is claimed as new; a live one still answers in_progress" in {
+      val done = StoredResponse(200, "old", Map.empty, Instant.EPOCH)
+      val test = for {
+        _ <- store
+          .check("expired-pending", clientId = "client-1", ttlSeconds = -60)
+        stale <- store.get("expired-pending")
+        reclaimed <- store
+          .check("expired-pending", clientId = "client-1", ttlSeconds = 3600)
+        live <- store
+          .check("expired-pending", clientId = "client-1", ttlSeconds = 3600)
+        _ <- store.check("expired-done", clientId = "client-1", ttlSeconds = -60)
+        _ <- store.storeResponse("expired-done", "client-1", done)
+        rerun <- store
+          .check("expired-done", clientId = "client-1", ttlSeconds = 3600)
+      } yield (stale, reclaimed, live, rerun)
+
+      test.asserting { case (stale, reclaimed, live, rerun) =>
+        stale shouldBe None
+        reclaimed shouldBe a[IdempotencyResult.New]
+        live shouldBe a[IdempotencyResult.InProgress]
+        rerun shouldBe a[IdempotencyResult.New]
+      }
+    }
+
+    "concurrent claims on an expired record yield exactly one New" in {
+      val test = for {
+        _ <- store.check("expired-race", clientId = "client-1", ttlSeconds = -60)
+        results <- (1 to 10).toList.parTraverse(_ =>
+          store.check("expired-race", clientId = "client-1", ttlSeconds = 3600),
+        )
+      } yield results
+
+      test.asserting { results =>
+        results.count(_.isInstanceOf[IdempotencyResult.New]) shouldBe 1
+        results.count(_.isInstanceOf[IdempotencyResult.InProgress]) shouldBe 9
+      }
+    }
+
     // The condition used to be only attribute_exists(pk), so a Completed
     // record could be reopened and its operation run again.
     "markFailed refuses a completed record and another client's record" in {

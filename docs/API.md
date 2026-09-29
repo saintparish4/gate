@@ -288,8 +288,8 @@ The flow:
    with the stored response once it is completed, and `conflict` when the
    `requestBody` differs from the one that claimed it.
 
-A pending key stays `in_progress` until it is completed, failed, or removed by
-its TTL. Only the client that claimed a key can complete or fail it; for any
+A pending key stays `in_progress` until it is completed, failed, or its TTL
+passes. Only the client that claimed a key can complete or fail it; for any
 other client the key does not exist.
 
 Idempotency store calls (check, complete, fail) have a timeout
@@ -312,8 +312,9 @@ answers 503 `storage_unavailable`.
 | `requestBody` | string | no | Any string that identifies the request, usually its body. Only its SHA-256 is stored. The hash is over the exact UTF-8 bytes, so reordered or reformatted JSON hashes differently. |
 
 The record's TTL is a DynamoDB TTL attribute. DynamoDB removes expired items
-some time after they expire, and the service does not check expiry itself, so
-a key can keep answering after its TTL until the item is removed.
+some time after they expire, so the service checks expiry itself: once the TTL
+passes, the key answers `new` to the next check, whether or not the item has
+been removed.
 
 **Answers:**
 
@@ -680,7 +681,7 @@ Each point follows from the behavior above.
   `"error": "Rate limited"` and no `allowed`; it also means back off.
 - **Idempotency:** run the operation only on `new`, and finish every claimed
   key with `complete` or `fail`, or it answers `in_progress` until its TTL
-  removes it. A 503 means the state is unknown: do not run the operation.
+  passes. A 503 means the state is unknown: do not run the operation.
 - **Quota:** keep the check's `reservationId` and reconcile with it. After a
   503 on reconcile, send the same request again after `Retry-After`; a repeat
   with the same usage is safe. A 503 on check means you were not admitted.
