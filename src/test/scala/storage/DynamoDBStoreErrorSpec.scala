@@ -59,16 +59,14 @@ class DynamoDBStoreErrorSpec
     circuitBreaker = CircuitBreakerSettings(
       enabled = false,
       dynamodb = config.CircuitBreakerConfig(),
-      kinesis = config.CircuitBreakerConfig(),
     ),
-    retry = RetrySettings(
-      dynamodb = RetryConfig(
+    retry = RetrySettings(dynamodb =
+      RetryConfig(
         maxRetries = 0,
         baseDelay = 1.millis,
         maxDelay = 1.millis,
         multiplier = 1.0,
       ),
-      kinesis = RetryConfig(),
     ),
     bulkhead = BulkheadSettings(enabled = false),
     timeout = TimeoutSettings(rateLimitCheck = 5.seconds),
@@ -109,7 +107,7 @@ class DynamoDBStoreErrorSpec
     *
     * NOTE: "NaN".toDouble succeeds in Scala/Java (returns Double.NaN). We must
     * use a string that actually throws NumberFormatException so that parseState
-    * returns Left and the store falls back to full-capacity (fails open).
+    * returns Left and the store takes the corrupt-state path.
     */
   private def corruptTokensResponse(key: String): GetItemResponse =
     val item = Map(
@@ -131,7 +129,6 @@ class DynamoDBStoreErrorSpec
         failingStore(ex),
         fastResilienceConfig,
         MetricsPublisher.noop[IO],
-        EventPublisher.noop[IO],
         GracefulDegradation.DegradationMode.AllowAll,
       ).use(resilientStore =>
         resilientStore.checkAndConsume("test-key", cost = 1, testProfile)
@@ -153,7 +150,6 @@ class DynamoDBStoreErrorSpec
         failingStore(ex),
         fastResilienceConfig,
         MetricsPublisher.noop[IO],
-        EventPublisher.noop[IO],
         GracefulDegradation.DegradationMode.AllowAll,
       ).use(resilientStore =>
         resilientStore.checkAndConsume("throttled-key", cost = 1, testProfile)
@@ -172,7 +168,6 @@ class DynamoDBStoreErrorSpec
           failingStore(ex),
           fastResilienceConfig,
           metrics,
-          EventPublisher.noop[IO],
           GracefulDegradation.DegradationMode.AllowAll,
         ).use(resilientStore =>
           resilientStore.checkAndConsume("metric-key", cost = 1, testProfile),
@@ -190,7 +185,6 @@ class DynamoDBStoreErrorSpec
         failingStore(ex),
         fastResilienceConfig,
         MetricsPublisher.noop[IO],
-        EventPublisher.noop[IO],
         GracefulDegradation.DegradationMode.RejectAll,
       ).use(resilientStore =>
         resilientStore.checkAndConsume("reject-key", cost = 1, testProfile)
@@ -203,11 +197,12 @@ class DynamoDBStoreErrorSpec
 
   "DynamoDBRateLimitStore — corrupt stored state" - {
 
-    "fails open (grants full capacity) when stored tokens attribute is malformed" in {
-      // The stub returns a GetItemResponse with tokens = "NaN" which cannot be
-      // parsed as a Double.  DynamoDBRateLimitStore.getOrInitState detects the
-      // Left parse result, logs an ERROR, increments CorruptStateRead, and
-      // falls back to a fresh full-capacity bucket — i.e. allows the request.
+    "fails closed and replaces the item when stored tokens attribute is malformed" in {
+      // The stub returns an item whose tokens cannot be parsed. The store must
+      // never grant on state it cannot read: it replaces the item with an empty
+      // bucket and retries. This stub keeps returning the corrupt item and
+      // ignores write conditions, so the retries run out and the check is
+      // refused; the LocalStack spec shows the real heal.
       val key = "corrupt-state-key"
       val client = stubClient(corruptTokensResponse(key))
 
@@ -224,8 +219,8 @@ class DynamoDBStoreErrorSpec
         recorded <- metricNames.get
       yield (decision, logs, recorded)).asserting {
         case (decision, logs, recorded) =>
-          // 1. Fails open → request is allowed
-          decision shouldBe a[RateLimitDecision.Allowed]
+          // 1. Fails closed
+          decision shouldBe a[RateLimitDecision.Rejected]
 
           // 2. An ERROR is logged mentioning the key and the corrupt-state reason
           logs
@@ -233,7 +228,10 @@ class DynamoDBStoreErrorSpec
               msg.contains(key) && msg.contains("Corrupt"),
             ) shouldBe true
 
-          // 3. CorruptStateRead metric is incremented
+          // 3. The replacement was written
+          recorded should contain("CorruptStateHealed")
+
+          // 4. CorruptStateRead metric is incremented
           recorded should contain("CorruptStateRead")
       }
     }
@@ -260,7 +258,8 @@ class DynamoDBStoreErrorSpec
             clientId: String,
             response: StoredResponse,
         ): IO[Boolean] = IO.pure(false)
-        def markFailed(key: String): IO[Boolean] = IO.pure(false)
+        def markFailed(key: String, clientId: String): IO[Boolean] = IO
+          .pure(false)
         def get(key: String): IO[Option[IdempotencyRecord]] = IO.pure(None)
         def healthCheck: IO[Either[String, Unit]] = IO.pure(Right(()))
 
@@ -331,6 +330,30 @@ class DynamoDBStoreErrorSpec
       )
 
       store.checkAndConsume("k", 1, testProfile).attempt
+        .asserting(_ shouldBe Left(ex))
+    }
+
+    // The leaky and sliding stores kept the one-case lambda the token bucket
+    // lost, so the resilience wrapper saw a MatchError and never retried.
+    "leaky bucket propagates it as itself too" in {
+      val ex = software.amazon.awssdk.core.exception.SdkClientException.builder()
+        .message("connection reset").build()
+      LeakyBucketRateLimitStore[IO](
+        failingGetItemClient(ex),
+        "rate-limits",
+        MetricsPublisher.noop[IO],
+      ).checkAndConsume("k", 1, testProfile).attempt
+        .asserting(_ shouldBe Left(ex))
+    }
+
+    "sliding window propagates it as itself too" in {
+      val ex = software.amazon.awssdk.core.exception.SdkClientException.builder()
+        .message("connection reset").build()
+      DynamoDBSlidingWindowStore[IO](
+        failingGetItemClient(ex),
+        "rate-limits",
+        MetricsPublisher.noop[IO],
+      ).checkAndConsume("k", 1, testProfile).attempt
         .asserting(_ shouldBe Left(ex))
     }
   }

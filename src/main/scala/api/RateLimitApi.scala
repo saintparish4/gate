@@ -123,7 +123,7 @@ class RateLimitApi[F[_]: Async: Tracer](
     */
   def status(key: String, client: AuthenticatedClient): F[Response[F]] =
     val profile = RateLimitApi.tierProfile(config, client.tier)
-    for
+    (for
       maybeStatus <- store.getStatus(TenantKey(client.clientId, key), profile)
       nowMs <- Clock[F].realTime.map(_.toMillis)
       response <- maybeStatus match
@@ -151,7 +151,15 @@ class RateLimitApi[F[_]: Async: Tracer](
               resetAt = Instant.now().plusSeconds(60).toString,
             ).asJson,
           )
-    yield response
+    yield response).handleErrorWith(error =>
+      logger
+        .warn(s"Rate-limit status for $key unavailable: ${error.getMessage}") *>
+        ServiceUnavailable(io.circe.Json.obj(
+          "error" -> io.circe.Json.fromString("storage_unavailable"),
+          "message" ->
+            io.circe.Json.fromString("The rate-limit store could not be read; the status is unknown, not full"),
+        )),
+    )
 
   private def buildCheckResponse(
       decision: RateLimitDecision,

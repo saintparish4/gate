@@ -61,6 +61,7 @@ services:
       # per-check budget; the limits themselves are unchanged.
       - TIMEOUT_RATE_LIMIT_CHECK=10 seconds
       - TIMEOUT_IDEMPOTENCY_CHECK=10 seconds
+      - TIMEOUT_QUOTA_CHECK=10 seconds
       # DEGRADATION_MODE is left at the production default (reject-all) so the
       # CI correctness job measures real behaviour; allow-all would turn a
       # tripped circuit breaker into unlimited admissions.

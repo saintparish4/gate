@@ -6,7 +6,8 @@
 FROM eclipse-temurin:17-jdk-jammy AS builder
 
 # Install SBT
-ARG SBT_VERSION=1.10.3
+# Match project/build.properties, so the launcher needs no second download.
+ARG SBT_VERSION=1.12.0
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     curl \
@@ -39,12 +40,12 @@ RUN sbt universal:stage
 # =============================================================================
 FROM eclipse-temurin:17-jre-jammy AS runtime
 
-# Add metadata labels (2025 standard: OCI labels)
+# OCI image labels. The version must match `version` in build.sbt.
 LABEL org.opencontainers.image.title="Gate" \
       org.opencontainers.image.description="Distributed rate limiting, token quotas, and idempotency for AI gateways" \
-      org.opencontainers.image.version="0.1.0-SNAPSHOT" \
+      org.opencontainers.image.version="0.1.0" \
       org.opencontainers.image.authors="Sharif Parish" \
-      org.opencontainers.image.source="https://github.com/saintparish4/keyra" \
+      org.opencontainers.image.source="https://github.com/saintparish4/gate" \
       maintainer="Sharif Parish"
 
 # Install curl for health checks

@@ -85,7 +85,7 @@ else
   FREE_API_KEY="gate_$(openssl rand -hex 24)"
   ADMIN_API_KEY="gate_$(openssl rand -hex 24)"
   STANDARD='"ratelimit_check","ratelimit_status","idempotency_check","idempotency_complete","quota_check","quota_reconcile"'
-  ADMIN="$STANDARD,\"admin_metrics\",\"admin_config\""
+  ADMIN="$STANDARD,\"admin_metrics\""
   KEYS_JSON="[$(key_json "$API_KEY" key_demo_api "Demo client" premium "$STANDARD"),$(key_json "$FREE_API_KEY" key_demo_free "Demo free client" free "$STANDARD"),$(key_json "$ADMIN_API_KEY" key_demo_admin "Demo admin" enterprise "$ADMIN")]"
   aws secretsmanager put-secret-value --secret-id "$SECRET_ID" \
     --secret-string "$KEYS_JSON" > /dev/null

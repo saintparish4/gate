@@ -76,21 +76,33 @@ class DynamoDBTokenQuotaStore[F[_]: Async](
   // Flips a pending reservation to reconciled; fails if it is not pending.
   private case class ReconciledMark(record: ReservationRecord) extends WriteItem
 
-  override def getQuota(pk: String): F[Option[TokenQuotaState]] =
+  override def getQuota(pk: String): F[Option[TokenQuotaState]] = readItem(pk)
+    .flatMap {
+      case Some(Right(state)) => Async[F].pure(Some(state))
+      case Some(Left(corrupt)) => logger
+          .error(s"Corrupt token quota state for pk=$pk: ${corrupt.detail}") *>
+          metrics.increment("CorruptStateRead").as(None)
+      case None => Async[F].pure(None)
+    }
+
+  private def readItem(
+      pk: String,
+  ): F[Option[Either[CorruptItem, TokenQuotaState]]] =
     val request = GetItemRequest.builder().tableName(tableName)
       .key(Map("pk" -> attr(pk)).asJava).consistentRead(true).build()
-
     Async[F].fromCompletableFuture(
       Async[F].delay(client.getItem(request).toCompletableFuture),
-    ).flatMap(response =>
+    ).map(response =>
       if response.hasItem && !response.item().isEmpty then
-        parseState(response.item().asScala.toMap) match
-          case Right(state) => Async[F].pure(Some(state))
-          case Left(err) => logger
-              .error(s"Corrupt token quota state for pk=$pk: $err") *>
-              metrics.increment("CorruptStateRead") *> Async[F].pure(None)
-      else Async[F].pure(None),
+        val item = response.item().asScala.toMap
+        Some(parseState(item).left.map(CorruptItem.of(item, _)))
+      else None,
     )
+
+  private case class Current(
+      states: Map[String, TokenQuotaState],
+      corrupt: Map[String, CorruptItem],
+  )
 
   override def reserve(
       targets: List[QuotaTarget],
@@ -135,48 +147,118 @@ class DynamoDBTokenQuotaStore[F[_]: Async](
       attempt: Int,
   ): F[ReserveOutcome] =
     for
-      current <- readCurrent(targets)
-      outcome <- QuotaReservation
-        .plan(targets, current, inputDelta, outputDelta, nowMs) match
-        case Left(exceeded) => Async[F].pure(exceeded)
-        case Right(planned) => write(planned.map(conditionalItem(_, nowMs)))
-            .flatMap {
-              case true =>
-                val reserved = ReserveOutcome
-                  .Reserved(planned.map(p => p.target.pk -> p.after).toMap)
-                reservation match
-                  case None => Async[F].pure(reserved)
-                  case Some(r) => recordOrRelease(
-                      r.record(planned, inputDelta, outputDelta),
-                      targets,
-                      nowMs,
-                    ).map(recorded =>
-                      if recorded then reserved
-                      else ReserveOutcome.Contended(attempt),
-                    )
-              case false if attempt < MaxAttempts =>
-                metrics.increment("TokenQuotaOCCRetry") *>
-                  jitteredBackoff(attempt) *> attemptReserve(
-                    targets,
-                    inputDelta,
-                    outputDelta,
-                    nowMs,
-                    reservation,
-                    attempt + 1,
-                  )
-              case false => logger
-                  .warn(s"OCC retries exhausted reserving quota for ${targets
-                      .map(_.pk).mkString(", ")}")
-                  .as(ReserveOutcome.Contended(attempt))
-            }
+      read <- readCurrent(targets)
+      // A corrupt counter with a limit fails closed and self-heals: it becomes
+      // a window exhausted from now, and the attempt runs again against it. A
+      // counter without one (a release) cannot be healed to "exhausted"; it is
+      // left out, and the next check heals it.
+      healable = targets
+        .filter(t => read.corrupt.contains(t.pk) && t.limit.isDefined)
+      usable = targets.filterNot(t => read.corrupt.contains(t.pk))
+      outcome <-
+        if healable.nonEmpty then
+          healable.traverse_(t => heal(t, read.corrupt(t.pk), nowMs)) *>
+            (if attempt < MaxAttempts then
+               attemptReserve(
+                 targets,
+                 inputDelta,
+                 outputDelta,
+                 nowMs,
+                 reservation,
+                 attempt + 1,
+               )
+             else Async[F].pure(ReserveOutcome.Contended(attempt)))
+        else
+          reserveUsable(
+            usable,
+            targets,
+            read.states,
+            inputDelta,
+            outputDelta,
+            nowMs,
+            reservation,
+            attempt,
+          )
     yield outcome
 
-  private def readCurrent(
+  private def reserveUsable(
+      usable: List[QuotaTarget],
       targets: List[QuotaTarget],
-  ): F[Map[String, TokenQuotaState]] = targets
-    .traverse(t => getQuota(t.pk).map(t.pk -> _)).map(_.collect {
-      case (pk, Some(state)) => pk -> state
-    }.toMap)
+      current: Map[String, TokenQuotaState],
+      inputDelta: Long,
+      outputDelta: Long,
+      nowMs: Long,
+      reservation: Option[NewReservation],
+      attempt: Int,
+  ): F[ReserveOutcome] =
+    if usable.isEmpty then Async[F].pure(ReserveOutcome.Reserved(Map.empty))
+    else
+      for outcome <- QuotaReservation
+          .plan(usable, current, inputDelta, outputDelta, nowMs) match
+          case Left(exceeded) => Async[F].pure(exceeded)
+          case Right(planned) => write(planned.map(conditionalItem(_, nowMs)))
+              .flatMap {
+                case true =>
+                  val reserved = ReserveOutcome
+                    .Reserved(planned.map(p => p.target.pk -> p.after).toMap)
+                  reservation match
+                    case None => Async[F].pure(reserved)
+                    case Some(r) => recordOrRelease(
+                        r.record(planned, inputDelta, outputDelta),
+                        usable,
+                        nowMs,
+                      ).map(recorded =>
+                        if recorded then reserved
+                        else ReserveOutcome.Contended(attempt),
+                      )
+                case false if attempt < MaxAttempts =>
+                  metrics.increment("TokenQuotaOCCRetry") *>
+                    jitteredBackoff(attempt) *> attemptReserve(
+                      targets,
+                      inputDelta,
+                      outputDelta,
+                      nowMs,
+                      reservation,
+                      attempt + 1,
+                    )
+                case false => logger
+                    .warn(s"OCC retries exhausted reserving quota for ${targets
+                        .map(_.pk).mkString(", ")}")
+                    .as(ReserveOutcome.Contended(attempt))
+              }
+      yield outcome
+
+  private def readCurrent(targets: List[QuotaTarget]): F[Current] = targets
+    .traverse(t => readItem(t.pk).map(t.pk -> _)).map(reads =>
+      Current(
+        reads.collect { case (pk, Some(Right(state))) => pk -> state }.toMap,
+        reads.collect { case (pk, Some(Left(corrupt))) => pk -> corrupt }.toMap,
+      ),
+    )
+
+  // Corrupt counters fail closed and self-heal: replaced, conditioned on the
+  // raw version read, by a window exhausted from now, so checks are refused
+  // until it ends. They used to read as absent, and the attribute_not_exists
+  // write that followed always failed against the existing item, ending in 503
+  // Contended until TTL.
+  private def heal(
+      target: QuotaTarget,
+      corrupt: CorruptItem,
+      nowMs: Long,
+  ): F[Unit] =
+    val exhausted =
+      TokenQuotaState(target.limit.getOrElse(0L), 0L, nowMs, corrupt.nextVersion)
+    logger.error(s"Corrupt token quota state for pk=${target.pk}: ${corrupt
+        .detail}; replacing it with an exhausted window") *>
+      metrics.increment("CorruptStateRead") *> replaceCorrupt(
+        client,
+        tableName,
+        corrupt,
+        stateItem(target.pk, exhausted, target.windowSeconds, nowMs),
+      ).flatMap(healed =>
+        if healed then metrics.increment("CorruptStateHealed")
+        else Async[F].unit,
+      )
 
   private def attemptReconcile(
       reservationPk: String,
@@ -197,9 +279,22 @@ class DynamoDBTokenQuotaStore[F[_]: Async](
       val done = record
         .copy(reconciled = Some(ReconciledUsage(actualInput, actualOutput)))
       for
-        current <- readCurrent(targets)
+        read <- readCurrent(targets)
+        // A corrupt counter is left out: its charge cannot be known, and the
+        // next check heals it to an exhausted window. The reservation is still
+        // marked reconciled.
+        _ <-
+          if read.corrupt.isEmpty then Async[F].unit
+          else
+            logger
+              .warn(s"Reconciling $reservationPk without corrupt counters ${read
+                  .corrupt.keys.mkString(", ")}") *>
+              metrics.increment("CorruptStateRead")
+        usable = record.copy(targets =
+          record.targets.filterNot(t => read.corrupt.contains(t.pk)),
+        )
         planned = QuotaReconciliation
-          .plan(record, current, actualInput, actualOutput, nowMs)
+          .plan(usable, read.states, actualInput, actualOutput, nowMs)
         written <-
           write(planned.map(conditionalItem(_, nowMs)) :+ markReconciled(done))
         outcome <-
@@ -242,17 +337,23 @@ class DynamoDBTokenQuotaStore[F[_]: Async](
     case (single: ConditionalItem) :: Nil => putOne(single)
     case many => writeAll(many)
 
+  // 60 s of grace past the window so a late reconcile still finds the item
+  private def stateItem(
+      pk: String,
+      state: TokenQuotaState,
+      windowSeconds: Long,
+      nowMs: Long,
+  ): Map[String, AttributeValue] = Map(
+    "pk" -> attr(pk),
+    "input_tokens" -> attrN(state.inputTokens),
+    "output_tokens" -> attrN(state.outputTokens),
+    "window_start" -> attrN(state.windowStart),
+    "version" -> attrN(state.version),
+    "ttl" -> attrN(nowMs / 1000 + windowSeconds + 60),
+  )
+
   private def conditionalItem(p: PlannedWrite, nowMs: Long): ConditionalItem =
-    // 60 s of grace past the window so a late reconcile still finds the item
-    val ttl = nowMs / 1000 + p.target.windowSeconds + 60
-    val item = Map(
-      "pk" -> attr(p.target.pk),
-      "input_tokens" -> attrN(p.after.inputTokens),
-      "output_tokens" -> attrN(p.after.outputTokens),
-      "window_start" -> attrN(p.after.windowStart),
-      "version" -> attrN(p.after.version),
-      "ttl" -> attrN(ttl),
-    )
+    val item = stateItem(p.target.pk, p.after, p.target.windowSeconds, nowMs)
     p.before match
       case Some(s) => ConditionalItem(
           item,
@@ -365,17 +466,17 @@ class DynamoDBTokenQuotaStore[F[_]: Async](
       pk: String,
       item: Map[String, AttributeValue],
   ): Either[String, ReservationRecord] =
-    def num(name: String): Either[String, Long] = item.get(name)
-      .toRight(s"missing '$name'")
-      .flatMap(a => a.n().toLongOption.toRight(s"malformed '$name'"))
+    def num(name: String): Either[String, Long] = longAttr(item, name)
     for
-      targetsJson <- item.get("targets").toRight("missing 'targets'").map(_.s())
+      targetsJson <- item.get("targets").toRight("missing 'targets'")
+        .flatMap(a => Option(a.s()).toRight("'targets' is not a string"))
       targets <- decode[List[ChargedTarget]](targetsJson).left
         .map(e => s"malformed 'targets': ${e.getMessage}")
       estimatedInput <- num("estimated_input")
       estimatedOutput <- num("estimated_output")
       ttl <- num("ttl")
-      status <- item.get("status").toRight("missing 'status'").map(_.s())
+      status <- item.get("status").toRight("missing 'status'")
+        .flatMap(a => Option(a.s()).toRight("'status' is not a string"))
       reconciled <- status match
         case "pending" => Right(None)
         case "reconciled" =>
@@ -401,24 +502,12 @@ class DynamoDBTokenQuotaStore[F[_]: Async](
   private def parseState(
       item: Map[String, AttributeValue],
   ): Either[String, TokenQuotaState] =
-    try
-      val inputTokens = item.get("input_tokens")
-        .toRight("missing 'input_tokens'").map(_.n().toLong)
-      val outputTokens = item.get("output_tokens")
-        .toRight("missing 'output_tokens'").map(_.n().toLong)
-      val windowStart = item.get("window_start")
-        .toRight("missing 'window_start'").map(_.n().toLong)
-      val version = item.get("version").toRight("missing 'version'")
-        .map(_.n().toLong)
-      for
-        i <- inputTokens
-        o <- outputTokens
-        w <- windowStart
-        v <- version
-      yield TokenQuotaState(i, o, w, v)
-    catch
-      case e: NumberFormatException =>
-        Left(s"malformed numeric attribute: ${e.getMessage}")
+    for
+      i <- longAttr(item, "input_tokens")
+      o <- longAttr(item, "output_tokens")
+      w <- longAttr(item, "window_start")
+      v <- longAttr(item, "version")
+    yield TokenQuotaState(i, o, w, v)
 
 object DynamoDBTokenQuotaStore:
   def apply[F[_]: Async](

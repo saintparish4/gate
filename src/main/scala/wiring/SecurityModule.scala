@@ -49,11 +49,10 @@ object SecurityModule:
                 .getOrElse("no API key source"),
             ))
 
-      authRateLimiter <- Resource.eval(AuthRateLimiter.inMemory[F](
-        maxRequestsPerMinute = config.security.authentication.rateLimitPerMinute,
-        maxFailedAttemptsPerMinute =
-          config.security.authentication.maxFailedAttempts,
-      ))
+      authRateLimiter <- Resource
+        .eval(AuthRateLimiter.inMemory[F](maxRequestsPerMinute =
+          config.security.authentication.rateLimitPerMinute,
+        ))
 
       middleware = ApiKeyAuth.middleware[F](apiKeyStore, Some(authRateLimiter))
     yield SecurityModule(apiKeyStore, middleware)

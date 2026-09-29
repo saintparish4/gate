@@ -98,7 +98,6 @@ class AuthMiddlewareSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
         client.permissions should contain(Permission.QuotaCheck)
         client.permissions should contain(Permission.QuotaReconcile)
         client.permissions shouldNot contain(Permission.AdminMetrics)
-        client.permissions shouldNot contain(Permission.AdminConfig)
       }
 
     "admin-api-key resolves to Enterprise tier with full admin permissions" in
@@ -107,7 +106,6 @@ class AuthMiddlewareSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
         val client = maybeClient.get
         client.tier shouldBe ClientTier.Enterprise
         client.permissions should contain(Permission.AdminMetrics)
-        client.permissions should contain(Permission.AdminConfig)
         client.permissions should contain(Permission.RateLimitCheck)
       }
 
@@ -119,7 +117,6 @@ class AuthMiddlewareSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
         client.tier.maxRequestsPerSecond shouldBe 10
         client.tier.maxBurstSize shouldBe 20
         client.permissions shouldNot contain(Permission.AdminMetrics)
-        client.permissions shouldNot contain(Permission.AdminConfig)
         client.permissions should contain(Permission.RateLimitCheck)
         client.permissions should contain(Permission.IdempotencyCheck)
       }

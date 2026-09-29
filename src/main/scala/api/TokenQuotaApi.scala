@@ -40,10 +40,12 @@ class TokenQuotaApi[F[_]: Async: Tracer](
     for
       startTime <- Clock[F].realTime.map(_.toMillis)
       req <- request.as[TokenQuotaCheckRequest]
-      response <- nonNegative(
-        req.estimatedInputTokens,
-        req.estimatedOutputTokens,
-      )("token estimates must be non-negative")(runCheck(req, client, startTime))
+      response <-
+        nonNegative(req.estimatedInputTokens, req.estimatedOutputTokens)(
+          "token estimates must be non-negative",
+        )(runCheck(req, client, startTime).handleErrorWith(
+          storageFailure("check", reconcile = false),
+        ))
     yield response
 
   /** POST /v1/quota/reconcile
@@ -62,7 +64,9 @@ class TokenQuotaApi[F[_]: Async: Tracer](
       req <- request.as[TokenQuotaReconcileRequest]
       response <- nonNegative(req.actualInputTokens, req.actualOutputTokens)(
         "token counts must be non-negative",
-      )(runReconcile(req, client, startTime))
+      )(runReconcile(req, client, startTime).handleErrorWith(
+        storageFailure("reconcile", reconcile = true),
+      ))
     yield response
 
   private def runCheck(
@@ -103,6 +107,26 @@ class TokenQuotaApi[F[_]: Async: Tracer](
         .recordLatency("token_quota_reconcile", latency.toDouble)
       resp <- buildReconcileResponse(result)
     yield resp
+
+  // A store failure (a timeout, a full bulkhead, an SDK error) is a 503 the
+  // caller can act on. It used to escape as a bare 500. A timed-out check may
+  // or may not have reserved; a reconcile is safe to repeat, because a
+  // reservation reconciles once and answers the same usage the same way.
+  private def storageFailure(
+      op: String,
+      reconcile: Boolean,
+  ): Throwable => F[Response[F]] =
+    case e: MessageFailure => Async[F].raiseError(e)
+    case e => logger.error(e)(s"Token quota $op failed") *>
+        ServiceUnavailable(io.circe.Json.obj(
+          "error" -> io.circe.Json.fromString("storage_unavailable"),
+          "message" -> io.circe.Json.fromString(
+            if reconcile then
+              "The quota store did not answer; retry with the same usage"
+            else
+              "The quota store did not answer; the check did not complete, retry it",
+          ),
+        )).map(withRetryAfter(ContendedRetryAfterSeconds))
 
   private def nonNegative(
       values: Long*,

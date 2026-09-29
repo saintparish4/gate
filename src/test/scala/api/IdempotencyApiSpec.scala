@@ -54,8 +54,10 @@ class IdempotencyApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
                 clientId: String,
                 response: StoredResponse,
             ): IO[Boolean] = IO.pure(false)
-            override def markFailed(idempotencyKey: String): IO[Boolean] = IO
-              .pure(false)
+            override def markFailed(
+                idempotencyKey: String,
+                clientId: String,
+            ): IO[Boolean] = IO.pure(false)
             override def get(
                 idempotencyKey: String,
             ): IO[Option[IdempotencyRecord]] = IO.pure(None)
@@ -112,8 +114,10 @@ class IdempotencyApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
                 clientId: String,
                 response: StoredResponse,
             ): IO[Boolean] = IO.pure(false)
-            override def markFailed(idempotencyKey: String): IO[Boolean] = IO
-              .pure(false)
+            override def markFailed(
+                idempotencyKey: String,
+                clientId: String,
+            ): IO[Boolean] = IO.pure(false)
             override def get(
                 idempotencyKey: String,
             ): IO[Option[IdempotencyRecord]] = IO.pure(None)
@@ -161,8 +165,10 @@ class IdempotencyApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
               clientId: String,
               response: StoredResponse,
           ): IO[Boolean] = IO.raiseError(ex)
-          override def markFailed(idempotencyKey: String): IO[Boolean] = IO
-            .raiseError(ex)
+          override def markFailed(
+              idempotencyKey: String,
+              clientId: String,
+          ): IO[Boolean] = IO.raiseError(ex)
           override def get(
               idempotencyKey: String,
           ): IO[Option[IdempotencyRecord]] = IO.pure(None)
@@ -193,6 +199,12 @@ class IdempotencyApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
           json
             .flatMap(_.hcursor.downField("error").as[String].toOption) shouldBe
             Some("storage_unavailable")
+      }
+
+      "maps a store failure on fail the same way" in {
+        val api = apiWith(failingStore(new RuntimeException("pool exhausted")))
+        api.fail("k-1", testClient)
+          .asserting(_.status shouldBe Status.ServiceUnavailable)
       }
 
       "maps a store failure on complete the same way" in {
@@ -242,5 +254,144 @@ class IdempotencyApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
           case other => fail(s"expected a MessageFailure, got $other")
         }
       }
+    }
+  }
+
+  "IdempotencyApi — fail" - {
+
+    val other = testClient.copy(apiKeyId = "other-client", clientId = "other")
+
+    def apiWith(store: IdempotencyStore[IO]): IdempotencyApi[IO] =
+      IdempotencyApi[IO](
+        store,
+        IdempotencyConfig(defaultTtlSeconds = 3600, maxTtlSeconds = 86400),
+        EventPublisher.noop[IO],
+        MetricsPublisher.noop[IO],
+        org.typelevel.log4cats.noop.NoOpLogger[IO],
+        () => IO.pure("test-request-id"),
+      )
+
+    def check(
+        api: IdempotencyApi[IO],
+        client: AuthenticatedClient,
+        key: String,
+    ) = api.check(
+      Request[IO](Method.POST, uri"/v1/idempotency/check")
+        .withEntity(s"""{"idempotencyKey": "$key"}""")
+        .putHeaders(headers.`Content-Type`(MediaType.application.json)),
+      client,
+    ).flatMap(_.as[String])
+      .map(body => parse(body).flatMap(_.hcursor.get[String]("status")).toOption)
+
+    def complete(api: IdempotencyApi[IO], key: String, body: String) = api
+      .complete(
+        key,
+        Request[IO](Method.POST, uri"/v1/idempotency/k/complete").withEntity(
+          io.circe.Json.obj(
+            "statusCode" -> io.circe.Json.fromInt(200),
+            "body" -> io.circe.Json.fromString(body),
+          ).noSpaces,
+        ).putHeaders(headers.`Content-Type`(MediaType.application.json)),
+        testClient,
+      )
+
+    "releases a pending key, and the next check claims it again" in {
+      for
+        api <- IdempotencyStore.inMemory[IO].map(apiWith)
+        first <- check(api, testClient, "fail-1")
+        failed <- api.fail("fail-1", testClient)
+        retried <- check(api, testClient, "fail-1")
+      yield
+        first shouldBe Some("new")
+        failed.status shouldBe Status.Ok
+        retried shouldBe Some("new")
+    }
+
+    "refuses a key another client claimed, which stays in progress" in {
+      for
+        api <- IdempotencyStore.inMemory[IO].map(apiWith)
+        _ <- check(api, testClient, "fail-2")
+        forged <- api.fail("fail-2", other)
+        after <- check(api, testClient, "fail-2")
+      yield
+        forged.status shouldBe Status.Conflict
+        after shouldBe Some("in_progress")
+    }
+
+    "never reopens a completed key" in {
+      for
+        api <- IdempotencyStore.inMemory[IO].map(apiWith)
+        _ <- check(api, testClient, "fail-3")
+        _ <- complete(api, "fail-3", "done")
+        refused <- api.fail("fail-3", testClient)
+        after <- check(api, testClient, "fail-3")
+      yield
+        refused.status shouldBe Status.Conflict
+        after shouldBe Some("duplicate")
+    }
+  }
+
+  "IdempotencyApi — stored response cap" - {
+
+    def apiWith(store: IdempotencyStore[IO]): IdempotencyApi[IO] =
+      IdempotencyApi[IO](
+        store,
+        IdempotencyConfig(defaultTtlSeconds = 3600, maxTtlSeconds = 86400),
+        EventPublisher.noop[IO],
+        MetricsPublisher.noop[IO],
+        org.typelevel.log4cats.noop.NoOpLogger[IO],
+        () => IO.pure("test-request-id"),
+      )
+
+    def completeWith(api: IdempotencyApi[IO], key: String, body: String) = api
+      .complete(
+        key,
+        Request[IO](Method.POST, uri"/v1/idempotency/k/complete").withEntity(
+          io.circe.Json.obj(
+            "statusCode" -> io.circe.Json.fromInt(200),
+            "body" -> io.circe.Json.fromString(body),
+          ).noSpaces,
+        ).putHeaders(headers.`Content-Type`(MediaType.application.json)),
+        testClient,
+      )
+
+    def claim(store: IdempotencyStore[IO], key: String) = store
+      .check(TenantKey(testClient.clientId, key), testClient.clientId, 3600)
+
+    "the size is the encoded JSON, so escaping counts" in IO {
+      val at = Instant.EPOCH
+      val plain = StoredResponse(200, "a" * 1000, Map.empty, at)
+      val quoted = StoredResponse(200, "\"" * 1000, Map.empty, at)
+      IdempotencyApi.storedSize(quoted) - IdempotencyApi.storedSize(
+        plain,
+      ) shouldBe 1000
+    }
+
+    "refuses a response over the cap with 413 and leaves the key pending" in {
+      // 200,000 quotes: under the cap as characters, twice it once escaped.
+      val body = "\"" * 200000
+      for
+        store <- IdempotencyStore.inMemory[IO]
+        _ <- claim(store, "big")
+        resp <- completeWith(apiWith(store), "big", body)
+        error <- resp.as[String]
+          .map(parse(_).flatMap(_.hcursor.get[String]("error")).toOption)
+        record <- store.get(TenantKey(testClient.clientId, "big"))
+      yield
+        resp.status shouldBe Status.PayloadTooLarge
+        error shouldBe Some("response_too_large")
+        record.map(_.status) shouldBe Some(IdempotencyStatus.Pending)
+    }
+
+    "stores a response under the cap" in {
+      val body = "a" * (IdempotencyApi.MaxStoredResponseBytes - 1024)
+      for
+        store <- IdempotencyStore.inMemory[IO]
+        _ <- claim(store, "fits")
+        resp <- completeWith(apiWith(store), "fits", body)
+        record <- store.get(TenantKey(testClient.clientId, "fits"))
+      yield
+        resp.status shouldBe Status.Ok
+        record.flatMap(_.response).map(_.body) shouldBe Some(body)
     }
   }

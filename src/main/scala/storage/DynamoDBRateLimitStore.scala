@@ -120,9 +120,13 @@ class DynamoDBRateLimitStore[F[_]: Async: Logger](
           val resetAt = TokenBucket.resetAt(now, refilled.tokens, profile)
           Async[F]
             .pure(Some(RateLimitDecision.Allowed(refilled.tokensInt, resetAt)))
-        case Some(Left(err)) => logger.error(
-            s"Corrupt rate-limit state for key=$key: $err — returning no status",
-          ) *> metrics.increment("CorruptStateRead").as(None)
+        // What a check would leave behind: an empty bucket refilling from now.
+        case Some(Left(corrupt)) => logger
+            .error(s"Corrupt rate-limit state for key=$key: ${corrupt
+                .detail}; reporting it empty") *>
+            metrics.increment("CorruptStateRead").as(Some(
+              RateLimitDecision.Allowed(0, TokenBucket.resetAt(now, 0, profile)),
+            ))
         case None => Async[F].pure(None)
     yield result
 
@@ -135,20 +139,49 @@ class DynamoDBRateLimitStore[F[_]: Async: Logger](
       now: Long,
   ): F[TokenBucketState] = getState(key).flatMap {
     case Some(Right(state)) => Async[F].pure(state)
-    case Some(Left(err)) =>
-      // Corrupt stored state: fail open (grant full capacity), log, and record metric.
-      // Prefer over-issuing tokens to blocking legitimate traffic on bad data.
-      logger
-        .error(s"Corrupt rate-limit state for key=$key: $err — failing open") *>
-        metrics.increment("CorruptStateRead") *>
-        Async[F].pure(TokenBucketState(profile.capacity.toDouble, now, 0L))
+    case Some(Left(corrupt)) => heal(key, corrupt, profile, now) *>
+        Async[F].raiseError(OCCConflictException(key, 0))
     case None => Async[F]
         .pure(TokenBucketState(profile.capacity.toDouble, now, 0L))
   }
 
+  // Corrupt state fails closed and self-heals: the item is replaced by an
+  // empty bucket refilling from now, conditioned on the raw version read, and
+  // the attempt retries through the normal path. It used to "fail open" with
+  // an attribute_not_exists write that always failed against the existing
+  // item, so the key burned its retries and stayed blocked until TTL.
+  private def heal(
+      key: String,
+      corrupt: CorruptItem,
+      profile: RateLimitProfile,
+      now: Long,
+  ): F[Unit] =
+    val empty = TokenBucketState(0.0, now, corrupt.nextVersion)
+    logger.error(s"Corrupt rate-limit state for key=$key: ${corrupt
+        .detail}; replacing it with an empty bucket") *>
+      metrics.increment("CorruptStateRead") *>
+      replaceCorrupt(client, tableName, corrupt, item(key, empty, profile, now))
+        .flatMap(healed =>
+          if healed then metrics.increment("CorruptStateHealed")
+          else Async[F].unit,
+        )
+
+  private def item(
+      key: String,
+      state: TokenBucketState,
+      profile: RateLimitProfile,
+      now: Long,
+  ): Map[String, AttributeValue] = Map(
+    "pk" -> attr(s"ratelimit#$key"),
+    "tokens" -> attrND(state.tokens),
+    "lastRefillMs" -> attrN(state.lastRefillMs),
+    "version" -> attrN(state.version),
+    "ttl" -> attrN(now / 1000 + profile.ttlSeconds),
+  )
+
   private def getState(
       key: String,
-  ): F[Option[Either[String, TokenBucketState]]] =
+  ): F[Option[Either[CorruptItem, TokenBucketState]]] =
     val request = GetItemRequest.builder().tableName(tableName)
       .key(Map("pk" -> attr(s"ratelimit#$key")).asJava).consistentRead(true)
       .build()
@@ -157,28 +190,19 @@ class DynamoDBRateLimitStore[F[_]: Async: Logger](
       Async[F].delay(client.getItem(request).toCompletableFuture),
     ).map(response =>
       if response.hasItem && !response.item().isEmpty then
-        Some(parseState(response.item().asScala.toMap))
+        val item = response.item().asScala.toMap
+        Some(parseState(item).left.map(CorruptItem.of(item, _)))
       else None,
     )
 
   private def parseState(
       item: Map[String, AttributeValue],
   ): Either[String, TokenBucketState] =
-    try
-      val tokens = item.get("tokens").toRight("missing 'tokens' attribute")
-        .map(_.n().toDouble)
-      val lastRefillMs = item.get("lastRefillMs")
-        .toRight("missing 'lastRefillMs' attribute").map(_.n().toLong)
-      val version = item.get("version").toRight("missing 'version' attribute")
-        .map(_.n().toLong)
-      for
-        t <- tokens
-        l <- lastRefillMs
-        v <- version
-      yield TokenBucketState(t, l, v)
-    catch
-      case e: NumberFormatException =>
-        Left(s"malformed numeric attribute: ${e.getMessage}")
+    for
+      t <- doubleAttr(item, "tokens")
+      l <- longAttr(item, "lastRefillMs")
+      v <- longAttr(item, "version")
+    yield TokenBucketState(t, l, v)
 
   private def attemptUpdate(
       key: String,

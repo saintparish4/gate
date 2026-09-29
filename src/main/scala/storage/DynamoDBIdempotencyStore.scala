@@ -61,6 +61,20 @@ class DynamoDBIdempotencyStore[F[_]: Async](
       requestHash: Option[String],
       retries: Int,
   ): F[IdempotencyResult] =
+    // Retry the full operation instead of returning New without persisting.
+    def reclaim: F[IdempotencyResult] =
+      if retries > 0 then
+        checkWithRetry(
+          idempotencyKey,
+          clientId,
+          ttlSeconds,
+          requestHash,
+          retries - 1,
+        )
+      else
+        Async[F].raiseError(new RuntimeException(
+          s"Idempotency TOCTOU race exhausted retries for key=$idempotencyKey",
+        ))
     for
       now <- Clock[F].realTime.map(d => Instant.ofEpochMilli(d.toMillis))
       result <-
@@ -107,23 +121,13 @@ class DynamoDBIdempotencyStore[F[_]: Async](
                             record.response,
                             record.createdAt,
                           ))
-                    case IdempotencyStatus.Failed => Async[F]
-                        .pure(IdempotencyResult.New(idempotencyKey, now))
-                case None =>
-                  // TTL deleted the record between tryCreatePending and get.
-                  // Retry the full operation instead of returning New without persisting.
-                  if retries > 0 then
-                    checkWithRetry(
-                      idempotencyKey,
-                      clientId,
-                      ttlSeconds,
-                      requestHash,
-                      retries - 1,
-                    )
-                  else
-                    Async[F].raiseError(new RuntimeException(
-                      s"Idempotency TOCTOU race exhausted retries for key=$idempotencyKey",
-                    ))
+                    // Failed after our claim lost to its Pending owner. This
+                    // answered New without claiming, so a caller whose claim
+                    // on the Failed record did win was also told New, and both
+                    // ran the operation. Exposing markFailed made it reachable.
+                    case IdempotencyStatus.Failed => reclaim
+                // TTL deleted the record between tryCreatePending and get.
+                case None => reclaim
               }
           }
     yield result
@@ -163,19 +167,36 @@ class DynamoDBIdempotencyStore[F[_]: Async](
       result <- conditionalUpdate(client, request)
     yield result
 
-  override def markFailed(idempotencyKey: String): F[Boolean] =
+  /** Conditioned like `storeResponse`. It was only `attribute_exists(pk)`, so
+    * anything that reached it could reopen a Completed record, and the next
+    * check would run the operation again.
+    */
+  override def markFailed(
+      idempotencyKey: String,
+      clientId: String,
+  ): F[Boolean] =
     for
       now <- Clock[F].realTime.map(d => Instant.ofEpochMilli(d.toMillis))
 
       request = UpdateItemRequest.builder().tableName(tableName)
         .key(Map("pk" -> attr(s"idempotency#$idempotencyKey")).asJava)
-        .updateExpression("SET #status = :status, #updatedAt = :updatedAt")
-        .conditionExpression("attribute_exists(pk)").expressionAttributeNames(
-          Map("#status" -> "status", "#updatedAt" -> "updatedAt").asJava,
+        .updateExpression(
+          "SET #status = :status, #updatedAt = :updatedAt, #version = #version + :one",
+        ).conditionExpression("#status = :pending AND #clientId = :clientId")
+        .expressionAttributeNames(
+          Map(
+            "#status" -> "status",
+            "#updatedAt" -> "updatedAt",
+            "#version" -> "version",
+            "#clientId" -> "clientId",
+          ).asJava,
         ).expressionAttributeValues(
           Map(
             ":status" -> attr("Failed"),
             ":updatedAt" -> attrN(now.toEpochMilli),
+            ":pending" -> attr("Pending"),
+            ":one" -> attrN(1),
+            ":clientId" -> attr(clientId),
           ).asJava,
         ).build()
 

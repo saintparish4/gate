@@ -239,3 +239,30 @@ class RateLimitApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
         }
       }.asserting(_ shouldBe true)
   }
+
+  "GET /v1/ratelimit/status when the store fails" - {
+    // Finding I: a store failure became "no state", which renders as a full
+    // bucket, so an outage reported every key at full capacity.
+    "answers 503, not a full bucket" in {
+      val failing = new RateLimitStore[IO]:
+        def checkAndConsume(key: String, cost: Int, profile: RateLimitProfile) =
+          IO.raiseError(new RuntimeException("dynamo down"))
+        def getStatus(key: String, profile: RateLimitProfile) = IO
+          .raiseError(new RuntimeException("dynamo down"))
+        def healthCheck = IO.pure(Left("down"))
+      val api = RateLimitApi[IO](
+        failing,
+        EventPublisher.noop[IO],
+        MetricsPublisher.noop[IO],
+        configWithProfiles,
+        Logger[IO],
+        () => IO.pure("test-request-id"),
+      )
+      for
+        resp <- api.status("any", testClient)
+        body <- resp.bodyText.compile.string
+      yield
+        resp.status shouldBe Status.ServiceUnavailable
+        body should include("storage_unavailable")
+    }
+  }

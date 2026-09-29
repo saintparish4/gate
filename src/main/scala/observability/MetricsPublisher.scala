@@ -109,10 +109,6 @@ trait MetricsPublisher[F[_]: Clock: FlatMap]:
       failureCount: Int,
   ): F[Unit]
 
-  def recordCacheMetrics(cacheName: String, hitRate: Double, size: Long): F[Unit]
-
-  def recordDegradedOperation(operation: String): F[Unit]
-
   def flush: F[Unit]
 
 object MetricsPublisher:
@@ -200,13 +196,6 @@ object MetricsPublisher:
         state: String,
         failureCount: Int,
     ): F[Unit] = Async[F].unit
-    override def recordCacheMetrics(
-        cacheName: String,
-        hitRate: Double,
-        size: Long,
-    ): F[Unit] = Async[F].unit
-    override def recordDegradedOperation(operation: String): F[Unit] = Async[F]
-      .unit
     override def flush: F[Unit] = Async[F].unit
 
   private def flushLoop[F[_]: Async: Logger](
@@ -342,18 +331,6 @@ private class CloudWatchMetricsPublisher[F[_]: Async: Logger](
     gauge("CircuitBreakerState", stateToValue(state), dims) *>
       gauge("CircuitBreakerFailures", failureCount.toDouble, dims)
 
-  override def recordCacheMetrics(
-      cacheName: String,
-      hitRate: Double,
-      size: Long,
-  ): F[Unit] =
-    val dims = Map("CacheName" -> cacheName)
-    gauge("CacheHitRate", hitRate * 100, dims) *>
-      gauge("CacheSize", size.toDouble, dims)
-
-  override def recordDegradedOperation(operation: String): F[Unit] =
-    increment("DegradedOperation", Map("Operation" -> operation))
-
   override def flush: F[Unit] = MetricsPublisher
     .doFlush(bufferRef, lastFlushRef, flushingRef, client, config, logger)
 
@@ -425,17 +402,6 @@ object LoggingMetrics:
         ): F[Unit] = logger.info(
           s"METRIC: CircuitBreaker name=$name state=$state failures=$failureCount",
         )
-
-        override def recordCacheMetrics(
-            cacheName: String,
-            hitRate: Double,
-            size: Long,
-        ): F[Unit] = logger
-          .info(s"METRIC: Cache name=$cacheName hitRate=${hitRate *
-              100}% size=$size")
-
-        override def recordDegradedOperation(operation: String): F[Unit] =
-          logger.warn(s"METRIC: DegradedOperation operation=$operation")
 
         override def flush: F[Unit] = Async[F].unit
 

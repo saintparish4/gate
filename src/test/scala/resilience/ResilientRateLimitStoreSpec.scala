@@ -30,16 +30,14 @@ class ResilientRateLimitStoreSpec
         resetTimeout = 1.second,
         halfOpenMaxCalls = 1,
       ),
-      kinesis = config.CircuitBreakerConfig(),
     ),
-    retry = RetrySettings(
-      dynamodb = RetryConfig(
+    retry = RetrySettings(dynamodb =
+      RetryConfig(
         maxRetries = 2,
         baseDelay = 10.millis,
         maxDelay = 100.millis,
         multiplier = 2.0,
       ),
-      kinesis = RetryConfig(),
     ),
     bulkhead =
       BulkheadSettings(enabled = true, maxConcurrent = 2, maxWait = 50.millis),
@@ -56,7 +54,6 @@ class ResilientRateLimitStoreSpec
     underlying = underlying,
     config = config,
     metrics = MetricsPublisher.noop[IO],
-    eventPublisher = EventPublisher.noop[IO],
     degradationMode = GracefulDegradation.DegradationMode.AllowAll,
   )
 
@@ -88,13 +85,12 @@ class ResilientRateLimitStoreSpec
     "transitions from Open to HalfOpen after resetTimeout (deterministic)" in {
       val ex = new RuntimeException("dynamo unavailable")
       val config: ResilienceConfig = testConfig.copy(
-        circuitBreaker = testConfig.circuitBreaker.copy(
-          dynamodb = CircuitBreakerConfig(
+        circuitBreaker = testConfig.circuitBreaker.copy(dynamodb =
+          CircuitBreakerConfig(
             maxFailures = 1,
             resetTimeout = 500.millis,
             halfOpenMaxCalls = 1,
           ),
-          kinesis = testConfig.circuitBreaker.kinesis,
         ),
         retry = testConfig.retry.copy(dynamodb = RetryConfig(maxRetries = 0)),
       )
@@ -119,13 +115,12 @@ class ResilientRateLimitStoreSpec
     "closes circuit breaker after successful calls in HalfOpen" in {
       // Use a store that fails first then succeeds.
       val halfOpenConfig: ResilienceConfig = testConfig.copy(
-        circuitBreaker = testConfig.circuitBreaker.copy(
-          dynamodb = CircuitBreakerConfig(
+        circuitBreaker = testConfig.circuitBreaker.copy(dynamodb =
+          CircuitBreakerConfig(
             maxFailures = 1,
             resetTimeout = 200.millis,
             halfOpenMaxCalls = 1,
           ),
-          kinesis = testConfig.circuitBreaker.kinesis,
         ),
         retry = testConfig.retry.copy(dynamodb = RetryConfig(maxRetries = 0)),
       )
@@ -225,7 +220,6 @@ class ResilientRateLimitStoreSpec
           config = testConfig,
           metrics = observability.PrometheusMetrics
             .dual(MetricsPublisher.noop[IO], prom),
-          eventPublisher = EventPublisher.noop[IO],
           degradationMode = GracefulDegradation.DegradationMode.RejectAll,
         ).use(store =>
           // maxFailures = 3 opens it; the fourth call is refused by the open
@@ -240,5 +234,31 @@ class ResilientRateLimitStoreSpec
           ),
         )
       yield gauge shouldBe Some(1.0)
+    }
+  }
+
+  "a check that times out is not retried" - {
+    // The per-check timeout bounds the whole check. Retrying a timed-out call
+    // would multiply the worst case by the retry count, so a timeout is one
+    // attempt and then the degradation mode (audit row 21, decided one-shot).
+
+    "the underlying store is called once" in TestControl.executeEmbed(
+      for
+        calls <- Ref.of[IO, Int](0)
+        hanging = new RateLimitStore[IO]:
+          def checkAndConsume(
+              key: String,
+              cost: Int,
+              profile: RateLimitProfile,
+          ) = calls.update(_ + 1) *> IO.never
+          def getStatus(key: String, profile: RateLimitProfile) = IO.never
+          def healthCheck = IO.pure(Right(()))
+        decision <- buildStore(hanging)
+          .use(_.checkAndConsume("k", 1, testProfile))
+        n <- calls.get
+      yield (decision, n),
+    ).asserting { case (decision, n) =>
+      n shouldBe 1
+      decision shouldBe a[RateLimitDecision.Allowed] // AllowAll degradation
     }
   }

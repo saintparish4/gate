@@ -79,7 +79,6 @@ object Permission:
   case object QuotaCheck extends Permission
   case object QuotaReconcile extends Permission
   case object AdminMetrics extends Permission
-  case object AdminConfig extends Permission
 
   val standard: Set[Permission] = Set(
     RateLimitCheck,
@@ -90,7 +89,8 @@ object Permission:
     QuotaReconcile,
   )
 
-  val admin: Set[Permission] = standard ++ Set(AdminMetrics, AdminConfig)
+  // AdminConfig used to be granted here too and guarded nothing.
+  val admin: Set[Permission] = standard + AdminMetrics
 
 /** API key store trait for retrieving and validating keys.
   */
@@ -291,7 +291,6 @@ object AuthRateLimiter:
     */
   def inMemory[F[_]: Temporal: Sync](
       maxRequestsPerMinute: Int = 100,
-      maxFailedAttemptsPerMinute: Int = 10,
   ): F[AuthRateLimiter[F]] = Sync[F].delay {
     val window = java.time.Duration.ofMinutes(1)
     // Cache for tracking request counts per client. The window is

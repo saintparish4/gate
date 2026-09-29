@@ -76,6 +76,75 @@ object DynamoDBOps:
       case _: OCCConflictException => onExhaustion
     }
 
+  /** A number attribute, as text. A missing attribute or one stored under
+    * another type is a Left: `.n()` returns null for a string, and
+    * `Double.parseDouble(null)` throws NullPointerException, which the parsers'
+    * NumberFormatException handlers did not catch. A wrongly typed attribute
+    * made the whole check throw instead of reading as corrupt.
+    */
+  def numberText(
+      item: Map[String, AttributeValue],
+      name: String,
+  ): Either[String, String] = item.get(name)
+    .toRight(s"missing '$name' attribute")
+    .flatMap(av => Option(av.n()).toRight(s"'$name' is not a number attribute"))
+
+  def longAttr(
+      item: Map[String, AttributeValue],
+      name: String,
+  ): Either[String, Long] = numberText(item, name)
+    .flatMap(v => v.toLongOption.toRight(s"'$name' is not a whole number: $v"))
+
+  def doubleAttr(
+      item: Map[String, AttributeValue],
+      name: String,
+  ): Either[String, Double] = numberText(item, name)
+    .flatMap(v => v.toDoubleOption.toRight(s"'$name' is not a number: $v"))
+
+  /** An item that failed to parse, kept with its raw `version` attribute so a
+    * repair can be conditioned on exactly the item that was read.
+    */
+  final case class CorruptItem(
+      rawVersion: Option[AttributeValue],
+      detail: String,
+  ):
+    /** Version for the replacement: one past the stored one when that parses,
+      * else 1. The replacement is conditioned on the raw value, so it cannot
+      * overwrite a concurrent writer either way.
+      */
+    def nextVersion: Long = rawVersion.flatMap(v => Option(v.n()))
+      .flatMap(_.toLongOption).map(_ + 1).getOrElse(1L)
+
+  object CorruptItem:
+    def of(item: Map[String, AttributeValue], detail: String): CorruptItem =
+      CorruptItem(item.get("version"), detail)
+
+  /** Replace a corrupt item with `replacement`, but only while the stored
+    * `version` is still the raw value read (or still absent). Corrupt state
+    * fails closed and self-heals (owner decision, PR 5): each store writes the
+    * most conservative valid state here, then reads it back through the normal
+    * path. The old fallback wrote with attribute_not_exists, which always fails
+    * against the existing item, so a corrupt key burned its OCC retries and
+    * stayed blocked until TTL.
+    */
+  def replaceCorrupt[F[_]: Async](
+      client: DynamoDbAsyncClient,
+      tableName: String,
+      corrupt: CorruptItem,
+      replacement: Map[String, AttributeValue],
+  ): F[Boolean] =
+    import scala.jdk.CollectionConverters.*
+    val base = PutItemRequest.builder().tableName(tableName)
+      .item(replacement.asJava)
+      .expressionAttributeNames(Map("#version" -> "version").asJava)
+    val request = corrupt.rawVersion match
+      case Some(raw) => base.conditionExpression("#version = :raw")
+          .expressionAttributeValues(Map(":raw" -> raw).asJava).build()
+      case None => base.conditionExpression(
+          "attribute_exists(pk) AND attribute_not_exists(#version)",
+        ).build()
+    conditionalPut(client, request)
+
   /** Standard DynamoDB table health check via describeTable. */
   def dynamoHealthCheck[F[_]: Async](
       client: DynamoDbAsyncClient,

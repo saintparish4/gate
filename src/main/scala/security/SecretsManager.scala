@@ -204,7 +204,6 @@ object SecretsManagerStore:
           case "quota_reconcile" | "quotareconcile" =>
             Some(Permission.QuotaReconcile)
           case "admin_metrics" | "adminmetrics" => Some(Permission.AdminMetrics)
-          case "admin_config" | "adminconfig" => Some(Permission.AdminConfig)
           case _ => None
 
 /** API key store backed by Secrets Manager.

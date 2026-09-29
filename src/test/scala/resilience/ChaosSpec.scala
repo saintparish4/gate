@@ -106,16 +106,14 @@ class ChaosSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
         resetTimeout = 10.seconds,
         halfOpenMaxCalls = 2,
       ),
-      kinesis = config.CircuitBreakerConfig(),
     ),
-    retry = RetrySettings(
-      dynamodb = RetryConfig(
+    retry = RetrySettings(dynamodb =
+      RetryConfig(
         maxRetries = 3,
         baseDelay = 10.millis,
         maxDelay = 200.millis,
         multiplier = 2.0,
       ),
-      kinesis = RetryConfig(),
     ),
     bulkhead = BulkheadSettings(enabled = false),
     timeout = TimeoutSettings(rateLimitCheck = 2.seconds),
@@ -128,7 +126,6 @@ class ChaosSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
     underlying = chaos,
     config = config,
     metrics = MetricsPublisher.noop[IO],
-    eventPublisher = EventPublisher.noop[IO],
     degradationMode = GracefulDegradation.DegradationMode.AllowAll,
   )
 
@@ -159,13 +156,12 @@ class ChaosSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
     "slow DynamoDB responses: timeout fires before retry, degradation kicks in" in {
       val tightTimeoutConfig = baseConfig.copy(
         timeout = TimeoutSettings(rateLimitCheck = 50.millis),
-        retry = RetrySettings(
-          dynamodb = RetryConfig(
+        retry = RetrySettings(dynamodb =
+          RetryConfig(
             maxRetries = 1,
             baseDelay = 10.millis,
             maxDelay = 20.millis,
           ),
-          kinesis = RetryConfig(),
         ),
       )
 
@@ -206,11 +202,9 @@ class ChaosSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
             resetTimeout = 1.hour, // will never reset during this test
             halfOpenMaxCalls = 1,
           ),
-          kinesis = config.CircuitBreakerConfig(),
         ),
-        retry = RetrySettings(
-          dynamodb = RetryConfig(maxRetries = 0), // no retries
-          kinesis = RetryConfig(),
+        retry = RetrySettings(dynamodb =
+          RetryConfig(maxRetries = 0), // no retries
         ),
         bulkhead = BulkheadSettings(
           enabled = true,

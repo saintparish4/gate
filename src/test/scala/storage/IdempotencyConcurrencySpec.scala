@@ -57,7 +57,7 @@ class IdempotencyConcurrencySpec
         for
           store <- InMemoryIdempotencyStore.create[IO]
           _ <- store.check("fail-retry-key", clientId, ttlSeconds)
-          _ <- store.markFailed("fail-retry-key")
+          _ <- store.markFailed("fail-retry-key", clientId)
           results <- IO.parSequenceN(concurrency)(List.fill(concurrency)(
             store.check("fail-retry-key", clientId, ttlSeconds),
           ))

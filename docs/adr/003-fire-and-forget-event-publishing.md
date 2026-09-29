@@ -8,21 +8,21 @@ Kinesis event publishing is fire-and-forget: events are enqueued to a bounded in
 
 ## Why Fire-and-Forget
 
-- **Latency isolation.** A rate-limit check should complete in 5–20 ms (two DynamoDB round-trips). Kinesis `PutRecord` adds 10–50 ms. Making the response wait for Kinesis would double p50 latency for every request, which is unacceptable for a service whose entire purpose is to be fast and transparent.
+- **Latency isolation.** A rate-limit check costs two DynamoDB round-trips. Making the response also wait for a Kinesis `PutRecord` would add a third network call, and its tail latency, to every request, for data the caller never sees.
 - **Failure isolation.** Kinesis throttling, network blips, or shard-level errors should not cause rate-limit checks to fail or return errors to the caller. The rate-limit decision is the primary value; events are secondary.
 - **Simplicity.** A bounded queue with a background drain is straightforward to implement and reason about. No distributed transaction coordination between DynamoDB and Kinesis.
 
 ## What's Sacrificed
 
-- **At-most-once delivery.** If the process crashes between enqueuing an event and Kinesis acknowledging it, the event is lost. If the bounded queue is full when an event arrives, the event is dropped (with a `DroppedKinesisEvent` metric). There is no persistent outbox or retry-to-disk.
+- **At-most-once delivery.** If the process crashes between enqueuing an event and Kinesis acknowledging it, the event is lost. If the bounded queue is full when an event arrives, the oldest queued event is evicted to make room, counted as `DroppedKinesisEvent{reason=queue_full}`. A publish that fails is retried once, then dropped and counted as `DroppedKinesisEvent{reason=publish_failed}`. There is no persistent outbox or retry-to-disk.
 - **No ordering guarantee.** Events are published as fast as the drain fiber can send them. Under burst, ordering relative to the rate-limit decision timestamp may skew by milliseconds.
-- **Compliance gap for audit events.** PCI DSS 4.0.1 Requirement 10.7 expects audit records to be reliably retained. Fire-and-forget means audit events *can* be lost. This is partially mitigated by structured logging (audit events are also logged to stdout/CloudWatch Logs), but logs are not a substitute for a durable event store.
+- **Compliance gap for audit events.** PCI DSS 4.0.1 Requirement 10.7 expects audit records to be reliably retained. Fire-and-forget means audit events *can* be lost. This is partially mitigated by logging (each audit decision is also written to stdout, and so to CloudWatch Logs when deployed), but logs are not a substitute for a durable event store.
 
 ## Mitigations
 
-- **Structured log as secondary record.** Every audit event (`AuditEvent`) is logged as a structured INFO line before being enqueued to Kinesis. CloudWatch Logs provides searchability and short-term retention as a fallback.
-- **Observable drops.** The `DroppedKinesisEvent` metric (CloudWatch) and `gate_events_dropped_total` (Prometheus) make event loss visible. Alerting on this metric is recommended.
-- **Bounded queue with backpressure signal.** The queue size is configurable (`kinesis.queue-size`, default 10,000). When full, new events are dropped rather than causing unbounded memory growth.
+- **Log line as secondary record.** Each place that builds an `AuditEvent` (a rejected rate-limit check, a refused profile, an exceeded quota, an idempotency conflict) also logs a plain-text line, `AUDIT decision=<decision> ...` with key=value fields. The log format is a text pattern, not JSON, so a query has to parse the message. CloudWatch Logs provides searchability and retention as a fallback (7 days by default in Terraform, 30 in `prod`).
+- **Observable drops.** The `DroppedKinesisEvent{reason}` metric (CloudWatch) and `gate_events_dropped_total` (Prometheus) make event loss visible. The monitoring module has no alarm on it; add one if events matter to you.
+- **Bounded queue.** The queue size is configurable (`kinesis.queue-size`, default 10,000). When full, the oldest events are evicted, so memory stays bounded and the queue holds the newest events.
 
 ## When to Reconsider
 
@@ -32,5 +32,10 @@ Kinesis event publishing is fire-and-forget: events are enqueued to a bounded in
 ## References
 
 - `src/main/scala/events/Events.scala` — event types including `AuditEvent`
-- `src/main/scala/events/EventPublisher.scala` — bounded queue + background drain
+- `src/main/scala/events/KinesisPublisher.scala` — bounded queue, background drain, one retry, drop metering
+- `src/main/scala/events/EventPublisher.scala` — the publisher interface
 - `docs/COMPLIANCE.md` — audit trail claims (see ADR context for caveats)
+
+## Corrections
+
+- 27 September 2026: this ADR said a full queue drops the new event and that audit events are logged as structured lines. The queue evicts the oldest event, and before that change evictions were not counted at all. Audit lines are plain text.

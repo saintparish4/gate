@@ -55,7 +55,7 @@ class LeakyBucketStoreErrorSpec
 
   "LeakyBucketRateLimitStore — corrupt stored state" - {
 
-    "fails open (grants full capacity) when stored tokens attribute is malformed" in {
+    "fails closed and replaces the item when stored tokens attribute is malformed" in {
       val key = "corrupt-leaky-key"
       val client = stubClient(corruptTokensResponse(key))
 
@@ -71,7 +71,8 @@ class LeakyBucketStoreErrorSpec
         recorded <- metricNames.get
       yield (decision, logs, recorded)).asserting {
         case (decision, logs, recorded) =>
-          decision shouldBe a[RateLimitDecision.Allowed]
+          decision shouldBe a[RateLimitDecision.Rejected]
+          recorded should contain("CorruptStateHealed")
 
           logs
             .exists(msg =>

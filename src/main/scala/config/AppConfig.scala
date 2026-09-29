@@ -41,7 +41,6 @@ case class AwsConfig(
 case class DynamoDBConfig(
     rateLimitTable: String,
     idempotencyTable: String,
-    maxRetries: Int = 3,
     connectionTimeout: FiniteDuration = scala.concurrent.duration
       .Duration(5, "seconds"),
     requestTimeout: FiniteDuration = scala.concurrent.duration
@@ -52,10 +51,6 @@ case class DynamoDBConfig(
 case class KinesisConfig(
     streamName: String,
     enabled: Boolean,
-    batchSize: Int = 100,
-    flushInterval: FiniteDuration = scala.concurrent.duration
-      .Duration(1, "second"),
-    maxRetries: Int = 3,
     queueSize: Int = 10000,
 ) derives ConfigReader
 
@@ -78,19 +73,15 @@ case class PrometheusConfig(enabled: Boolean = true) derives ConfigReader
 // client's key ID. Compose turns it on; Terraform pins it off.
 case class DashboardConfig(enabled: Boolean = false) derives ConfigReader
 
-case class TracingConfig(
-    enabled: Boolean = false,
-    serviceName: String = "gate",
-    exporterEndpoint: String = "http://localhost:4317",
-) derives ConfigReader
+// The service name and exporter endpoint come from OTEL_* variables, which the
+// OpenTelemetry SDK reads itself.
+case class TracingConfig(enabled: Boolean = false) derives ConfigReader
 
 // Security configuration. `enabled`, `header-name` and `api-key-prefix` used to
 // sit here too: nothing read them, auth was always on, and the headers were
 // hard-coded, so each one was a switch that did nothing.
-case class AuthenticationConfig(
-    rateLimitPerMinute: Int = 1000,
-    maxFailedAttempts: Int = 10,
-) derives ConfigReader
+case class AuthenticationConfig(rateLimitPerMinute: Int = 1000)
+    derives ConfigReader
 
 case class SecretsConfig(
     enabled: Boolean = false,
@@ -158,10 +149,11 @@ case class CircuitBreakerConfig(
     halfOpenMaxCalls: Int = 3,
 ) derives ConfigReader
 
+// One breaker, on the rate-limit store. Kinesis settings sat here unread: the
+// publisher has no breaker, by design (ADR-003).
 case class CircuitBreakerSettings(
     enabled: Boolean = true,
     dynamodb: CircuitBreakerConfig = CircuitBreakerConfig(),
-    kinesis: CircuitBreakerConfig = CircuitBreakerConfig(),
 ) derives ConfigReader
 
 case class RetryConfig(
@@ -171,10 +163,8 @@ case class RetryConfig(
     multiplier: Double = 2.0,
 ) derives ConfigReader
 
-case class RetrySettings(
-    dynamodb: RetryConfig = RetryConfig(),
-    kinesis: RetryConfig = RetryConfig(),
-) derives ConfigReader
+case class RetrySettings(dynamodb: RetryConfig = RetryConfig())
+    derives ConfigReader
 
 case class BulkheadSettings(
     enabled: Boolean = true,
@@ -187,6 +177,10 @@ case class TimeoutSettings(
       .Duration(500, "millis"),
     idempotencyCheck: FiniteDuration = scala.concurrent.duration
       .Duration(2, "seconds"),
+    // Longer than the others: a quota check runs its own OCC loop (up to 25
+    // attempts) inside this bound, and it guards an LLM call that takes
+    // seconds anyway.
+    quotaCheck: FiniteDuration = scala.concurrent.duration.Duration(5, "seconds"),
     healthCheck: FiniteDuration = scala.concurrent.duration
       .Duration(5, "seconds"),
 ) derives ConfigReader
@@ -207,49 +201,6 @@ case class StorageConfig(
     backend: String = "dynamodb", // "in-memory" | "dynamodb"
 ) derives ConfigReader
 
-case class CacheConfig(
-    enabled: Boolean = true,
-    maxSize: Int = 10000,
-    ttl: FiniteDuration = scala.concurrent.duration.Duration(1, "second"),
-    recordStats: Boolean = true,
-) derives ConfigReader
-
-/** Audit trail configuration for PCI DSS 4.0.1 compliance.
-  *
-  * NOTE: PureConfig's Scala 3 derivation uses a fixed camelCase→kebab-case
-  * field mapping and converts `s3Prefix` into `s-3-prefix` (digits start a new
-  * "word"), which doesn't match the `s3-prefix` key in application.conf.
-  * Without the explicit reader below, `ConfigSource.default.loadOrThrow` fails.
-  * That failure used to fall back silently to a hard-coded config, discarding
-  * every `${?ENV}` override in the HOCON file — a very expensive silent failure
-  * (it made `AUTH_RATE_LIMIT_PER_MINUTE` look broken during load tests). It now
-  * stops startup.
-  */
-case class AuditConfig(
-    enabled: Boolean = true,
-    retentionYears: Int = 7,
-    s3Prefix: String = "audit/",
-)
-
-object AuditConfig:
-  private def readOpt[A: ConfigReader](
-      obj: ConfigObjectCursor,
-      key: String,
-      default: A,
-  ): ConfigReader.Result[A] =
-    val c = obj.atKeyOrUndefined(key)
-    if c.isUndefined then Right(default) else ConfigReader[A].from(c)
-
-  given ConfigReader[AuditConfig] = ConfigReader.fromCursor(cur =>
-    cur.asObjectCursor.flatMap(obj =>
-      for
-        enabled <- readOpt[Boolean](obj, "enabled", true)
-        retention <- readOpt[Int](obj, "retention-years", 7)
-        prefix <- readOpt[String](obj, "s3-prefix", "audit/")
-      yield AuditConfig(enabled, retention, prefix),
-    ),
-  )
-
 // Root application configuration
 case class AppConfig(
     server: ServerConfig,
@@ -268,9 +219,7 @@ case class AppConfig(
       secrets = SecretsConfig(),
     ),
     resilience: ResilienceConfig = ResilienceConfig(),
-    cache: CacheConfig = CacheConfig(),
     storage: StorageConfig = StorageConfig(),
-    audit: AuditConfig = AuditConfig(),
 ) derives ConfigReader
 
 object AppConfig:
@@ -311,6 +260,22 @@ object AppConfig:
     else
       Some("no API key source: set SECRETS_MANAGER_ENABLED=true to load keys from Secrets Manager, or ALLOW_BUILT_IN_KEYS=true for local development only (the built-in keys are public and include an admin key)")
 
+  val validAlgorithms: Set[String] =
+    Set("token-bucket", "leaky-bucket", "sliding-window")
+  val validStorageBackends: Set[String] = Set("dynamodb", "in-memory")
+
+  /** An unknown RATE_LIMIT_ALGORITHM used to become the token bucket and an
+    * unknown STORAGE_BACKEND became DynamoDB, so a typo quietly ran something
+    * nobody chose.
+    */
+  def validateChoices(config: AppConfig): List[String] =
+    def one(name: String, value: String, valid: Set[String]) = Option
+      .when(!valid.contains(value))(s"$name '$value' is not one of ${valid
+          .toList.sorted.mkString(", ")}")
+    one("rate-limit.algorithm", config.rateLimit.algorithm, validAlgorithms)
+      .toList ++
+      one("storage.backend", config.storage.backend, validStorageBackends)
+
   /** Every rule `load` enforces beyond what the types already do. */
   def validate(config: AppConfig): List[String] =
     val profileErrors = config.rateLimit.profiles.toList
@@ -325,7 +290,8 @@ object AppConfig:
     val degradationErrors =
       validateDegradationMode(config.resilience.degradationMode).toList
     val keySourceErrors = validateKeySource(config.security).toList
-    profileErrors ++ quotaErrors ++ degradationErrors ++ keySourceErrors
+    profileErrors ++ quotaErrors ++ degradationErrors ++ keySourceErrors ++
+      validateChoices(config)
 
   /** Load and validate, failing on any error.
     *

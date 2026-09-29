@@ -5,7 +5,7 @@ import java.time.Instant
 import org.scalatest.freespec.AsyncFreeSpec
 import org.scalatest.matchers.should.Matchers
 
-import core.{IdempotencyResult, StoredResponse}
+import core.{IdempotencyResult, IdempotencyStatus, StoredResponse}
 import cats.effect.IO
 import cats.effect.testing.scalatest.AsyncIOSpec
 import cats.syntax.all.*
@@ -115,7 +115,7 @@ class InMemoryIdempotencyStoreSpec
         store <- InMemoryIdempotencyStore.create[IO]
         first <- store
           .check("retry-key", clientId = "client-1", ttlSeconds = 3600)
-        marked <- store.markFailed("retry-key")
+        marked <- store.markFailed("retry-key", "client-1")
         retry <- store
           .check("retry-key", clientId = "client-1", ttlSeconds = 3600)
       } yield (first, marked, retry)
@@ -124,6 +124,27 @@ class InMemoryIdempotencyStoreSpec
         first shouldBe a[IdempotencyResult.New]
         marked shouldBe true
         retry shouldBe a[IdempotencyResult.New] // Can retry after failure
+      }
+    }
+
+    "markFailed applies only to its owner's pending record" in {
+      val test = for {
+        store <- InMemoryIdempotencyStore.create[IO]
+        _ <- store.check("owned", clientId = "client-1", ttlSeconds = 3600)
+        forged <- store.markFailed("owned", "client-2")
+        _ <- store.storeResponse(
+          "owned",
+          "client-1",
+          StoredResponse(200, "ok", Map.empty, Instant.EPOCH),
+        )
+        reopened <- store.markFailed("owned", "client-1")
+        record <- store.get("owned")
+      } yield (forged, reopened, record)
+
+      test.asserting { case (forged, reopened, record) =>
+        forged shouldBe false
+        reopened shouldBe false
+        record.map(_.status) shouldBe Some(IdempotencyStatus.Completed)
       }
     }
 

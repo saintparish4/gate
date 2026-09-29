@@ -45,12 +45,17 @@ class LeakyBucketRateLimitStore[F[_]: Async: Logger](
   ): F[RateLimitDecision] = Retry
     .retryWithTracking(retryPolicy, s"OCC-leaky($key)")(
       singleAttempt(key, cost, profile),
-    ).map(_.result).handleErrorWith { case _: OCCConflictException =>
-      Clock[F].realTime.map(_.toMillis).map { now =>
-        val secToAllow = cost.toDouble / profile.refillRatePerSecond
-        val resetAt = Instant.ofEpochMilli(now + (secToAllow * 1000).toLong)
-        RateLimitDecision.Rejected(secToAllow.ceil.toInt.max(1), resetAt)
-      }
+    ).map(_.result).handleErrorWith {
+      case _: OCCConflictException => Clock[F].realTime.map(_.toMillis)
+          .map { now =>
+            val secToAllow = cost.toDouble / profile.refillRatePerSecond
+            val resetAt = Instant.ofEpochMilli(now + (secToAllow * 1000).toLong)
+            RateLimitDecision.Rejected(secToAllow.ceil.toInt.max(1), resetAt)
+          }
+      // A lambda of one case is total: any other error became a MatchError,
+      // which the resilience wrapper does not retry. The token bucket had the
+      // same bug.
+      case other => Async[F].raiseError(other)
     }
 
   /** Single attempt: one read-compute-write cycle. On OCC conflict
@@ -116,9 +121,18 @@ class LeakyBucketRateLimitStore[F[_]: Async: Logger](
             now + (newLevel / profile.refillRatePerSecond * 1000).toLong,
           )
           Async[F].pure(Some(RateLimitDecision.Allowed(remaining, resetAt)))
-        case Some(Left(err)) => logger.error(
-            s"Corrupt rate-limit state for key=$key: $err — returning no status",
-          ) *> metrics.increment("CorruptStateRead").as(None)
+        // What a check would leave behind: a full bucket draining from now.
+        case Some(Left(corrupt)) => logger
+            .error(s"Corrupt rate-limit state for key=$key: ${corrupt
+                .detail}; reporting it full") *>
+            metrics.increment("CorruptStateRead")
+              .as(Some(RateLimitDecision.Allowed(
+                0,
+                Instant.ofEpochMilli(
+                  now + (profile.capacity / profile.refillRatePerSecond * 1000)
+                    .toLong,
+                ),
+              )))
         case None => Async[F].pure(None)
     yield result
 
@@ -131,16 +145,52 @@ class LeakyBucketRateLimitStore[F[_]: Async: Logger](
       now: Long,
   ): F[LeakyBucketState] = getState(key).flatMap {
     case Some(Right(state)) => Async[F].pure(state)
-    case Some(Left(err)) => logger
-        .error(s"Corrupt rate-limit state for key $key: $err — failing open") *>
-        metrics.increment("CorruptStateRead") *>
-        Async[F].pure(LeakyBucketState(0.0, now, 0L))
+    case Some(Left(corrupt)) => heal(key, corrupt, profile, now) *>
+        Async[F].raiseError(OCCConflictException(key, 0))
     case None => Async[F].pure(LeakyBucketState(0.0, now, 0L))
   }
 
+  // Corrupt state fails closed and self-heals: the item is replaced by a full
+  // bucket draining from now, conditioned on the raw version read, and the
+  // attempt retries through the normal path. It used to "fail open" with an
+  // attribute_not_exists write that always failed against the existing item,
+  // so the key burned its retries and stayed blocked until TTL.
+  private def heal(
+      key: String,
+      corrupt: CorruptItem,
+      profile: RateLimitProfile,
+      now: Long,
+  ): F[Unit] =
+    val full =
+      LeakyBucketState(profile.capacity.toDouble, now, corrupt.nextVersion)
+    logger.error(s"Corrupt rate-limit state for key=$key: ${corrupt
+        .detail}; replacing it with a full bucket") *>
+      metrics.increment("CorruptStateRead") *> replaceCorrupt(
+        client,
+        tableName,
+        corrupt,
+        item(key, full, profile.ttlSeconds, now),
+      ).flatMap(healed =>
+        if healed then metrics.increment("CorruptStateHealed")
+        else Async[F].unit,
+      )
+
+  private def item(
+      key: String,
+      state: LeakyBucketState,
+      ttlSeconds: Long,
+      now: Long,
+  ): Map[String, AttributeValue] = Map(
+    "pk" -> attr(s"ratelimit#$key"),
+    "tokens" -> attrND(state.level),
+    "lastRefillMs" -> attrN(state.lastLeakMs),
+    "version" -> attrN(state.version),
+    "ttl" -> attrN(now / 1000 + ttlSeconds),
+  )
+
   private def getState(
       key: String,
-  ): F[Option[Either[String, LeakyBucketState]]] =
+  ): F[Option[Either[CorruptItem, LeakyBucketState]]] =
     val request = GetItemRequest.builder().tableName(tableName)
       .key(Map("pk" -> attr(s"ratelimit#$key")).asJava).consistentRead(true)
       .build()
@@ -148,28 +198,19 @@ class LeakyBucketRateLimitStore[F[_]: Async: Logger](
       Async[F].delay(client.getItem(request).toCompletableFuture),
     ).map(response =>
       if response.hasItem && !response.item().isEmpty then
-        Some(parseState(response.item().asScala.toMap))
+        val item = response.item().asScala.toMap
+        Some(parseState(item).left.map(CorruptItem.of(item, _)))
       else None,
     )
 
   private def parseState(
       item: Map[String, AttributeValue],
   ): Either[String, LeakyBucketState] =
-    try
-      val level = item.get("tokens").toRight("missing 'tokens' attribute")
-        .map(_.n().toDouble)
-      val lastLeakMs = item.get("lastRefillMs")
-        .toRight("missing 'lastRefillMs' attribute").map(_.n().toLong)
-      val version = item.get("version").toRight("missing 'version' attribute")
-        .map(_.n().toLong)
-      for
-        l <- level
-        lm <- lastLeakMs
-        v <- version
-      yield LeakyBucketState(l, lm, v)
-    catch
-      case e: NumberFormatException =>
-        Left(s"malformed numeric attribute: ${e.getMessage}")
+    for
+      l <- doubleAttr(item, "tokens")
+      lm <- longAttr(item, "lastRefillMs")
+      v <- longAttr(item, "version")
+    yield LeakyBucketState(l, lm, v)
 
   private def attemptUpdate(
       key: String,
@@ -178,18 +219,8 @@ class LeakyBucketRateLimitStore[F[_]: Async: Logger](
       ttlSeconds: Long,
       now: Long,
   ): F[Boolean] =
-    val ttl = now / 1000 + ttlSeconds
-
-    val item = Map(
-      "pk" -> attr(s"ratelimit#$key"),
-      "tokens" -> attrND(newState.level),
-      "lastRefillMs" -> attrN(newState.lastLeakMs),
-      "version" -> attrN(newState.version),
-      "ttl" -> attrN(ttl),
-    )
-
     val requestBuilder = PutItemRequest.builder().tableName(tableName)
-      .item(item.asJava)
+      .item(item(key, newState, ttlSeconds, now).asJava)
     val request =
       if expectedVersion == 0L then
         requestBuilder.conditionExpression("attribute_not_exists(pk)").build()

@@ -16,8 +16,8 @@ DynamoDB, zero errors. See [Correctness](#correctness).
 
 ### Why Gate
 
-- **Public or partner APIs** — per-tenant RPS and burst limits across many
-  stateless containers, with one source of truth in DynamoDB
+- **Public or partner APIs** — per-key RPS and burst limits, sized by the
+  client's tier, across many stateless containers, with one source of truth in DynamoDB
   ([token bucket + OCC](#optimistic-concurrency-control-flow)).
 - **AI / LLM gateways** — stack request limits with user / agent / org token
   quotas so spend and abuse stay bounded ([token quotas](#token-quotas)).
@@ -31,23 +31,43 @@ DynamoDB, zero errors. See [Correctness](#correctness).
 | **At most X requests per client and key, across every instance** | One token-bucket item per client and key in DynamoDB. Every consume is a strongly consistent `GetItem` followed by a `PutItem` conditioned on the item's `version`, so only one instance wins each state change. Up to 10 conflicting writes are retried with jittered backoff; after that the request is **rejected** (429, `Retry-After: 1`). The service under-issues at the tail rather than over-issuing past the limit. |
 | **Idempotent operations within a TTL** | First writer wins via a conditional `PutItem` (`attribute_not_exists(pk)`). Replays within the TTL get the stored response. A SHA-256 fingerprint of the request body turns a same-key different-body replay into `409 Conflict`. DynamoDB TTL expires the items. |
 | **Multi-level token quotas** | User, agent, and org quotas are enforced together on every check. The agent quota is clamped to 80% of the user quota. A check reserves an estimate and returns a `reservationId`; reconcile replaces the stored estimate with actual usage, once, and never takes an estimate from the caller. |
-| **Tenants never share state** | Every storage key is scoped to the authenticated client ([ADR-005](docs/adr/005-tenant-namespaced-storage-keys.md)). Two clients sending the same rate-limit key, idempotency key, or quota user get separate buckets, records, and counters. Completing an idempotency record also requires the client that created it. `HttpApiIntegrationSpec` drives all six routes with two clients on the same keys. |
+| **Tenants never share state** | Every storage key is scoped to the authenticated client ([ADR-005](docs/adr/005-tenant-namespaced-storage-keys.md)). Two clients sending the same rate-limit key, idempotency key, or quota user get separate buckets, records, and counters. Completing or failing an idempotency record also requires the client that created it. `HttpApiIntegrationSpec` drives all seven routes with two clients on the same keys. |
 | **Stateless instances** | All rate-limit, idempotency, and quota state lives in DynamoDB. Any instance can serve any request; a crash loses nothing. |
 
 ### What this system is designed to survive
 
 | Failure mode | Behaviour |
 |-------------|-----------|
-| **DynamoDB slow or partially down** | The rate-limit store is wrapped in a bulkhead (100 concurrent calls, 500 ms max wait), a process-wide circuit breaker (20 failures to open, 30 s reset, 3 half-open calls), a retry policy (3 retries, 100 ms base, 2x backoff, 10 s cap), and a 2 s timeout per check. When the breaker is open, `DEGRADATION_MODE` decides: `reject-all` (default, safe for payments) or `allow-all` (for AI infrastructure where availability wins). Every degraded decision increments `gate_degraded_total`. |
+| **DynamoDB slow or partially down** | The rate-limit store is wrapped in a bulkhead (100 concurrent calls, 500 ms max wait), a process-wide circuit breaker (20 failures to open, 30 s reset, 3 half-open calls), a retry policy for SDK and I/O errors (3 retries, 100 ms base, 2x backoff, 10 s cap), and a 2 s timeout per check. A timed-out check is not retried: the bound covers the whole check. When a check reaches no decision (the breaker is open, the bulkhead is full, or the store times out or fails after retries), `DEGRADATION_MODE` decides: `reject-all` (default, safe for payments) or `allow-all` (for AI infrastructure where availability wins). Every degraded decision increments `gate_degraded_total`. `GET /v1/ratelimit/status` answers `503` when the store cannot be read, rather than reporting a full bucket. |
+| **A corrupt limiter or quota item** | It fails closed and self-heals. The store replaces the item, conditioned on its raw stored version, with the most conservative valid state: an empty token bucket, a full leaky bucket or sliding window, an exhausted quota window starting now. The key refuses until it refills, drains, or the window ends. Each read counts `CorruptStateRead`, which has an alarm. A corrupt idempotency record answers `503`, since whether its operation ran is unknowable. |
 | **Instance crash** | No in-process state. The next instance reads current DynamoDB state and continues correctly. |
-| **Kinesis failure** | Events go into a bounded in-memory queue (10,000, drop-oldest) that a background fiber drains to Kinesis. A failed publish is retried once, then dropped and counted (`gate_events_dropped_total`, CloudWatch `DroppedKinesisEvent`). The request path never waits on Kinesis. |
+| **Kinesis failure** | Events go into a bounded in-memory queue (10,000, drop-oldest) that a background fiber drains to Kinesis. A failed publish is retried once, then dropped. Both an eviction from a full queue and a failed publish are counted, as `gate_events_dropped_total` and CloudWatch `DroppedKinesisEvent{reason=queue_full\|publish_failed}`. The request path never waits on Kinesis, and `/ready` reports a Kinesis fault as `degraded` without taking the task out of service. |
 | **OCC exhaustion on a hot key** | After 10 failed conditional writes the request is rejected with 429 instead of over-issuing. |
-| **Idempotency TOCTOU race** | If the conditional create fails and the follow-up read finds nothing (TTL deleted the item in between), the check retries up to 3 times instead of returning a false `new`. |
+| **Idempotency TOCTOU race** | If the conditional create fails and the follow-up read finds nothing (TTL deleted the item in between) or a `Failed` record (released in between), the check claims again, up to 3 times, instead of returning a `new` it does not own. |
 
-The breaker, bulkhead, retry, and timeout wrap the rate-limit store only. The
-idempotency store answers `503` if DynamoDB fails; the quota store has its own
-conditional-write retry loop and answers `503` with `Retry-After: 1` under
-contention.
+The breaker and retry wrap the rate-limit store only. The idempotency and quota
+stores each have their own bulkhead and timeout (2 s and 5 s; the quota bound
+covers its own conditional-write retry loop). A store failure on either
+answers `503` with `storage_unavailable`, and quota contention answers `503`
+with `Retry-After: 1`.
+
+### Scope
+
+What the code does today, what exists only in part or on paper, and what is
+deliberately out of scope for now.
+
+| Area | Implemented | Planned | Excluded |
+| --- | --- | --- | --- |
+| Rate limiting | Token bucket, leaky bucket, and sliding window on DynamoDB with OCC; profiles by client tier; `/status` | | A fourth algorithm |
+| Idempotency | Conditional claim, replay, request-hash conflicts, `/complete`, `/fail`, a 350 KB stored-response cap | | Streaming replay (SSE capture, partial replay, body offload) |
+| Token quotas | User, agent, and org fixed windows; reserve, then reconcile against the stored reservation | | |
+| Tenancy | Every storage key scoped to the authenticated client ([ADR-005](docs/adr/005-tenant-namespaced-storage-keys.md)), with cross-tenant tests and invariant D | | Hosted multi-tenant service: accounts, billing, a managed control plane |
+| Access | API keys from Secrets Manager, a permission per route, a per-task auth throttle | Audit records for failed authentication and permission refusals | SSO and role management |
+| Failure behavior | Resilience stack on the rate-limit path; timeout and bulkhead on idempotency and quota; corrupt state fails closed and self-heals | | Serving decisions from a local cache during an outage |
+| Events and audit | Kinesis events at most once; `AUDIT` log lines | Firehose to S3 (Parquet), Glue, Athena, and 7-year retention: in Terraform, never deployed ([COMPLIANCE.md](docs/COMPLIANCE.md)) | |
+| Consistency | One AWS Region is the consistency boundary | A written statement of the single-region semantics | Exact limits across Regions (global tables) |
+| Evidence | Invariants A-D in CI and against a Terraform deploy on AWS; LocalStack latency figures | A benchmark report on real AWS | |
+| Interfaces | HTTP API; a local demo dashboard (Terraform pins it off) | | A product web UI or admin console |
 
 ## Architecture
 
@@ -132,7 +152,7 @@ of HTTP 500s.
 curl -s http://localhost:8080/health
 # {"status":"healthy","version":"0.1.0"}
 curl -s http://localhost:8080/ready
-# {"status":"ok","components":[{"name":"dynamodb_ratelimit","status":"ok","details":null}, ...]}
+# {"status":"ok","components":[{"name":"dynamodb_ratelimit","status":"ok","required":true,"details":null}, ...]}
 ```
 
 `/health` is liveness only and answers 200 whenever the process is up.
@@ -172,7 +192,7 @@ curl -s -X POST http://localhost:8080/v1/ratelimit/check \
 ```
 
 Allowed responses carry `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and
-`X-RateLimit-Reset` (epoch seconds). Every response echoes `X-Request-Id`.
+`X-RateLimit-Reset` (epoch seconds). Every response from a route, including authentication's 401, 403 and 429, echoes `X-Request-Id`; the 400/422 body-decoding answers and a 404 for an unknown path do not.
 
 **3. Exhaust a bucket**
 
@@ -217,7 +237,9 @@ the first operation has not completed, so the client must not run the payment
 twice. Store the result with `POST /v1/idempotency/payment:demo-001/complete`
 and a body of `{"statusCode": 200, "body": "..."}`; from then on replays answer
 `{"status":"duplicate", ...}` with the stored response. A replay whose
-`requestBody` hashes differently answers `409` with `"status":"conflict"`.
+`requestBody` hashes differently answers `409` with `"status":"conflict"`. If
+the operation fails without effect, `POST /v1/idempotency/payment:demo-001/fail`
+releases the key, and the next check answers `new` again.
 
 **5. Token quota**
 
@@ -266,7 +288,8 @@ curl -s -H "Authorization: Bearer admin-api-key" http://localhost:8080/metrics |
 | `POST` | `/v1/ratelimit/check` | `RateLimitCheck` | Consume `cost` tokens (default 1) for `key`; optional `profile` and `endpoint` |
 | `GET` | `/v1/ratelimit/status/:key` | `RateLimitStatus` | Current bucket state for a key, without consuming |
 | `POST` | `/v1/idempotency/check` | `IdempotencyCheck` | `new` (200), `in_progress` (202), `duplicate` (200) or `conflict` (409) |
-| `POST` | `/v1/idempotency/:key/complete` | `IdempotencyComplete` | Store the response for a key; 409 if it is not pending |
+| `POST` | `/v1/idempotency/:key/complete` | `IdempotencyComplete` | Store the response for a key; 409 if it is not pending; 413 if the response, encoded, is over 350 KB |
+| `POST` | `/v1/idempotency/:key/fail` | `IdempotencyComplete` | Release a pending key so a retry is `new`; 409 if it is not pending |
 | `POST` | `/v1/quota/check` | `QuotaCheck` | Pre-request user / agent / org quota check; 429 with `Retry-After` when exceeded |
 | `POST` | `/v1/quota/reconcile` | `QuotaReconcile` | Post-response reconciliation of estimated versus actual tokens |
 | `GET` | `/health` | none, unauthenticated | Liveness |
@@ -280,7 +303,7 @@ Authentication accepts `Authorization: Bearer <key>`, `Authorization: ApiKey
 empty body. A valid key without the route's permission answers 403 naming the
 permission, before the route touches any state. The built-in `test-api-key`
 and `free-api-key` hold the six standard permissions; `admin-api-key` also
-holds `AdminMetrics` and `AdminConfig`. Each key is also throttled to
+holds `AdminMetrics`. Each key is also throttled to
 `AUTH_RATE_LIMIT_PER_MINUTE` authentications (default 1,000); past that the
 answer is **429** with `Retry-After`, distinct from a bucket rejection.
 Malformed JSON answers 400 and JSON that does not match the schema answers
@@ -299,7 +322,8 @@ Full request and response schemas: [API.md](docs/API.md).
 Everything is in [`application.conf`](src/main/resources/application.conf);
 each setting has an environment-variable override. A value Gate cannot honour
 (an unknown degradation mode, an invalid profile, an agent quota above 80% of
-the user quota, no API key source, a value of the wrong type) stops startup with `Refusing to
+the user quota, no API key source, an unknown algorithm or storage backend, a
+value of the wrong type) stops startup with `Refusing to
 start: ...` rather than running on defaults. The ones that matter most:
 
 | Env var | Default | Notes |
@@ -308,7 +332,7 @@ start: ...` rather than running on defaults. The ones that matter most:
 | `USE_LOCALSTACK` / `AWS_ENDPOINT` | `false` / unset | Compose points both at `http://localstack:4566` |
 | `RATE_LIMIT_TABLE` / `IDEMPOTENCY_TABLE` / `TOKEN_QUOTA_TABLE` | `rate-limits` / `idempotency` / `gate-token-quotas` | LocalStack names; Terraform passes its own (see [Deploying](#deploying-to-aws)) |
 | `KINESIS_STREAM` | `rate-limit-events` | Same split as the tables |
-| `RATE_LIMIT_ALGORITHM` | `token-bucket` | `leaky-bucket` and `sliding-window` are also implemented |
+| `RATE_LIMIT_ALGORITHM` | `token-bucket` | Or `leaky-bucket` or `sliding-window`; anything else stops startup |
 | `RATELIMIT_DEFAULT_CAPACITY` / `RATELIMIT_DEFAULT_REFILL_RATE` | `100` / `10.0` | Used when no profile applies |
 | `IDEMPOTENCY_DEFAULT_TTL` / `IDEMPOTENCY_MAX_TTL_SECONDS` | `86400` / `86400` | Client TTLs above the max are capped |
 | `TOKEN_QUOTA_ENABLED` | `false` | Compose and the demo deploy set `true` |
@@ -316,7 +340,7 @@ start: ...` rather than running on defaults. The ones that matter most:
 | `KINESIS_ENABLED` / `KINESIS_QUEUE_SIZE` | `true` / `10000` | |
 | `CIRCUIT_BREAKER_MAX_FAILURES` / `CIRCUIT_BREAKER_RESET_TIMEOUT` | `20` / `30 seconds` | One breaker for the whole rate-limit store |
 | `BULKHEAD_MAX_CONCURRENT` | `100` | |
-| `TIMEOUT_RATE_LIMIT_CHECK` / `TIMEOUT_IDEMPOTENCY_CHECK` | `2s` / `2s` | Compose raises both to 10 s for LocalStack |
+| `TIMEOUT_RATE_LIMIT_CHECK` / `TIMEOUT_IDEMPOTENCY_CHECK` / `TIMEOUT_QUOTA_CHECK` | `2s` / `2s` / `5s` | Compose raises all three to 10 s for LocalStack |
 | `DEGRADATION_MODE` | `reject-all` | Or `allow-all`. Anything else, including the former `use-cached`, stops startup |
 | `DASHBOARD_ENABLED` | `false` | Compose sets `true`; Terraform pins `false` |
 | `AUTH_RATE_LIMIT_PER_MINUTE` | `1000` | Compose and the demo raise it to 10,000,000 for load runs |
@@ -325,7 +349,7 @@ start: ...` rather than running on defaults. The ones that matter most:
 | `METRICS_ENABLED` / `METRICS_NAMESPACE` / `METRICS_ENVIRONMENT` | `true` / `RateLimiter` / `dev` | CloudWatch publishing is off whenever `USE_LOCALSTACK=true` |
 | `PROMETHEUS_ENABLED` | `true` | `/metrics` answers 404 to an admin key when off |
 | `TRACING_ENABLED` | `true` | The OpenTelemetry SDK reads `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_SERVICE_NAME` itself |
-| `STORAGE_BACKEND` | `dynamodb` | `in-memory` for single-process tests; not correct across instances |
+| `STORAGE_BACKEND` | `dynamodb` | `in-memory` for single-process tests, not correct across instances; anything else stops startup |
 
 ### Rate-limit profiles
 
@@ -359,6 +383,16 @@ creation. The first successful create answers `new`; while it is pending,
 replays answer `in_progress`; after `/complete`, replays answer `duplicate`
 with the stored response. A replay whose `requestBody` hashes differently
 answers `conflict` (409).
+
+`/fail` releases a pending key after its operation failed without effect, so
+the next check claims it again. Without it a failed key stayed pending until
+its TTL. `/complete` and `/fail` apply only to a pending record created by the
+same client, so a completed operation is never reopened.
+
+The stored response is inline in the DynamoDB item, and a replay returns it
+whole: nothing is streamed. `/complete` refuses a response over 350 KB, as
+encoded JSON, with `413 response_too_large`, because a DynamoDB item holds at
+most 400 KB. The key stays pending; store a reference to the result instead.
 
 ## Observability
 
@@ -544,7 +578,7 @@ experimental.
 | Kinesis `-events` | Decision event stream, KMS-encrypted |
 | ECS Fargate service + ALB | Target group health check on `/ready`, container health check on `/health`; CPU target-tracking autoscaling when enabled. HTTPS (TLS 1.2+) with an HTTP redirect when `certificate_arn` is set; otherwise HTTP only to `alb_ingress_cidrs` (see [TLS](#tls)) |
 | VPC | Two AZs, private subnets for tasks, two NAT gateways, interface endpoints for ECR, CloudWatch Logs, Secrets Manager and Kinesis, a gateway endpoint for DynamoDB |
-| CloudWatch | Log group `/ecs/<project>-<environment>` (7 days, 30 in `prod`), a dashboard, and four alarms (error rate, p99 latency, healthy tasks, circuit breaker open); they notify only when `alarm_sns_topic_arn` is set |
+| CloudWatch | Log group `/ecs/<project>-<environment>` (7 days, 30 in `prod`), a dashboard, and five alarms (error rate, p99 latency, healthy tasks, circuit breaker open, corrupt state read); they notify only when `alarm_sns_topic_arn` is set |
 | Secrets Manager | `<project>/<environment>/api-keys`, seeded with an inactive placeholder; the service refuses to start until it holds an active key |
 
 Local and AWS resource names differ. The app reads them from the environment,
@@ -636,8 +670,8 @@ aws secretsmanager put-secret-value \
 
 Every field is required, `active` included. Permission names are
 `ratelimit_check`, `ratelimit_status`, `idempotency_check`,
-`idempotency_complete`, `quota_check`, `quota_reconcile`, `admin_metrics`, and
-`admin_config`; tiers are `free`, `basic`, `premium`, and `enterprise`. An
+`idempotency_complete`, `quota_check`, `quota_reconcile`, and `admin_metrics`;
+tiers are `free`, `basic`, `premium`, and `enterprise`. An
 entry with an unknown tier is skipped, and an unknown permission name is
 dropped. The app composes the secret name from `SECRETS_PREFIX`,
 `SECRETS_ENVIRONMENT`, and `API_KEYS_SECRET_NAME`, which Terraform sets to
@@ -679,13 +713,14 @@ terraform output api_endpoint
 ## Documentation
 
 - [API reference](docs/API.md) — request and response schemas for every route
-- [Architecture](docs/ARCHITECTURE.md) — design rationale and trade-offs
+- [Architecture](docs/ARCHITECTURE.md) — what the code does on each path, and why
 - [Performance](docs/PERFORMANCE.md) — fixed-RPS latency and DynamoDB cost per decision
-- [Compliance notes](docs/COMPLIANCE.md) — audit trail design against PCI DSS 4.0.1
+- [Compliance notes](docs/COMPLIANCE.md) — what the audit trail records today, and what is planned
 - ADRs: [DynamoDB over Redis](docs/adr/001-dynamodb-over-redis.md),
   [hand-rolled circuit breaker](docs/adr/002-hand-rolled-circuit-breaker.md),
   [fire-and-forget event publishing](docs/adr/003-fire-and-forget-event-publishing.md),
-  [OCC over pessimistic locking](docs/adr/004-occ-over-pessimistic-locking.md)
+  [OCC over pessimistic locking](docs/adr/004-occ-over-pessimistic-locking.md),
+  [tenant-namespaced storage keys](docs/adr/005-tenant-namespaced-storage-keys.md)
 
 ## Technology stack
 

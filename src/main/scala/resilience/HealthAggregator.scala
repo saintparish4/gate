@@ -67,37 +67,6 @@ object HealthAggregator:
             ComponentHealth(sourceName, "error", Some(Json.fromString(err)))
         }
 
-  def circuitBreakerSource[F[_]: Temporal](
-      cb: Option[CircuitBreaker[F]],
-  ): HealthSource[F] = new HealthSource[F]:
-    val name = "circuitBreaker"
-    def check: F[ComponentHealth] = cb match
-      case Some(breaker) => breaker.state.map(s =>
-          ComponentHealth(
-            name,
-            s.toString.toLowerCase,
-            Some(Json.fromString(s.toString)),
-          ),
-        )
-      case None => Temporal[F].pure(ComponentHealth(name, "disabled"))
-
-  def cacheSource[F[_]: Temporal](
-      cache: Option[LocalCache[F, ?, ?]],
-  ): HealthSource[F] = new HealthSource[F]:
-    val name = "cache"
-    def check: F[ComponentHealth] = cache match
-      case Some(c) => c.stats.map(s =>
-          ComponentHealth(
-            name,
-            "ok",
-            Some(Json.obj(
-              "hitRate" -> Json.fromDoubleOrNull(s.hitRate),
-              "size" -> Json.fromLong(s.estimatedSize),
-            )),
-          ),
-        )
-      case None => Temporal[F].pure(ComponentHealth(name, "disabled"))
-
   def kinesisSource[F[_]: Temporal](
       healthCheck: F[Either[String, Unit]],
   ): HealthSource[F] = new HealthSource[F]:
