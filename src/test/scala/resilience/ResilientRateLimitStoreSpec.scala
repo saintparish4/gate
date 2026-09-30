@@ -262,3 +262,62 @@ class ResilientRateLimitStoreSpec
       decision shouldBe a[RateLimitDecision.Allowed] // AllowAll degradation
     }
   }
+
+  "retries only transient faults" - {
+    import software.amazon.awssdk.awscore.exception.AwsErrorDetails
+    import software.amazon.awssdk.core.exception.{
+      SdkClientException, SdkServiceException,
+    }
+    import software.amazon.awssdk.services.dynamodb.model.{
+      DynamoDbException, ProvisionedThroughputExceededException,
+    }
+
+    val validation = DynamoDbException.builder().statusCode(400).awsErrorDetails(
+      AwsErrorDetails.builder().errorCode("ValidationException").build(),
+    ).message("One or more parameter values were invalid").build()
+    val reset = SdkClientException.builder().message("Connection reset")
+      .cause(new java.net.SocketException("Connection reset")).build()
+
+    def callsFor(error: Throwable): IO[Int] =
+      for
+        calls <- Ref.of[IO, Int](0)
+        failing = new RateLimitStore[IO]:
+          def checkAndConsume(
+              key: String,
+              cost: Int,
+              profile: RateLimitProfile,
+          ) = calls.update(_ + 1) *> IO.raiseError(error)
+          def getStatus(key: String, profile: RateLimitProfile) = IO.none
+          def healthCheck = IO.pure(Right(()))
+        _ <- buildStore(failing).use(_.checkAndConsume("k", 1, testProfile))
+        n <- calls.get
+      yield n
+
+    // It fails the same way every time; this used to retry it.
+    "a 400-class service error is tried once" in callsFor(validation)
+      .asserting(_ shouldBe 1)
+
+    // How the SDK reports a dropped connection; this used not to retry it.
+    "a client transport error is retried up to maxRetries" in callsFor(reset)
+      .asserting(_ shouldBe 3)
+
+    "the classification" in IO {
+      val throttled = ProvisionedThroughputExceededException.builder()
+        .statusCode(400).awsErrorDetails(
+          AwsErrorDetails.builder()
+            .errorCode("ProvisionedThroughputExceededException").build(),
+        ).build()
+      val serverError = SdkServiceException.builder().statusCode(500).build()
+      val noTransport = SdkClientException.builder()
+        .message("Unable to load region").build()
+
+      ResilientRateLimitStore.isRetryable(validation) shouldBe false
+      ResilientRateLimitStore.isRetryable(throttled) shouldBe true
+      ResilientRateLimitStore.isRetryable(serverError) shouldBe true
+      ResilientRateLimitStore.isRetryable(reset) shouldBe true
+      ResilientRateLimitStore.isRetryable(noTransport) shouldBe false
+      ResilientRateLimitStore.isRetryable(
+        new java.util.concurrent.CompletionException(reset),
+      ) shouldBe true
+    }.asserting(_ => succeed)
+  }

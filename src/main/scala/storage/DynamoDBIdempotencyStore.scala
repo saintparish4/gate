@@ -300,23 +300,33 @@ class DynamoDBIdempotencyStore[F[_]: Async](
               ))
 
     val requestHash = item.get("requestHash").map(_.s())
+    // Absent numbers keep their defaults, but a present one must be a number.
+    // They were read with `.n().toLong`, so a wrongly typed attribute threw a
+    // NullPointerException and answered 503 storage_unavailable, which says
+    // retry, instead of storage_corruption, which says do not proceed.
+    def number(name: String): Either[StoreError, Option[Long]] =
+      if item.contains(name) then
+        longAttr(item, name).map(Some(_)).left
+          .map(StoreError.CorruptRecord(idempotencyKey, _))
+      else Right(None)
     for
       status <- statusResult
       response <- responseResult
-      createdAt = item.get("createdAt")
-        .map(a => Instant.ofEpochMilli(a.n().toLong)).getOrElse(Instant.now())
-      updatedAt = item.get("updatedAt")
-        .map(a => Instant.ofEpochMilli(a.n().toLong)).getOrElse(createdAt)
+      createdMs <- number("createdAt")
+      updatedMs <- number("updatedAt")
+      ttl <- number("ttl")
+      version <- number("version")
+      createdAt = createdMs.map(Instant.ofEpochMilli).getOrElse(Instant.now())
     yield IdempotencyRecord(
       idempotencyKey = idempotencyKey,
       clientId = item.get("clientId").map(_.s()).getOrElse("unknown"),
       status = status,
       response = response,
       createdAt = createdAt,
-      updatedAt = updatedAt,
+      updatedAt = updatedMs.map(Instant.ofEpochMilli).getOrElse(createdAt),
       // No ttl never expires, matching the claim condition.
-      ttl = item.get("ttl").map(_.n().toLong).getOrElse(Long.MaxValue),
-      version = item.get("version").map(_.n().toLong).getOrElse(0L),
+      ttl = ttl.getOrElse(Long.MaxValue),
+      version = version.getOrElse(0L),
       requestHash = requestHash,
     )
 
