@@ -80,9 +80,6 @@ object ResilientRateLimitStore:
           ).map(Some(_))
         else Temporal[F].pure(None),
       )
-
-      // Create health tracker
-      healthTracker <- Resource.eval(HealthAwareService.tracker[F]())
     yield new RateLimitStore[F]:
       private val logger = Logger[F]
 
@@ -108,10 +105,7 @@ object ResilientRateLimitStore:
         val wrappedOp = applyPatterns(operation, "checkAndConsume")
 
         // Handle failures with graceful degradation
-        wrappedOp.flatTap(_ => healthTracker.recordSuccess).handleErrorWith(
-          error =>
-            healthTracker.recordFailure(error) *> handleDegradation(key, error),
-        )
+        wrappedOp.handleErrorWith(handleDegradation(key, _))
 
       override def getStatus(
           key: String,
@@ -124,20 +118,13 @@ object ResilientRateLimitStore:
 
         // A failure propagates. It used to become None, which the API renders
         // as a key never seen, so a store outage reported every bucket full.
-        applyPatterns(operation, "getStatus")
-          .flatTap(_ => healthTracker.recordSuccess).onError(error =>
-            healthTracker.recordFailure(error) *>
-              logger.warn(s"Failed to get status for $key: ${error.getMessage}"),
-          )
-
-      override def healthCheck: F[Either[String, Unit]] = healthTracker
-        .isHealthy.flatMap(healthy =>
-          if healthy then
-            Temporal[F]
-              .timeout(underlying.healthCheck, config.timeout.healthCheck)
-              .handleError(e => Left(e.getMessage))
-          else Temporal[F].pure(Left("circuit breaker open")),
+        applyPatterns(operation, "getStatus").onError(error =>
+          logger.warn(s"Failed to get status for $key: ${error.getMessage}"),
         )
+
+      // /ready probes the raw store (Main), never this. A health tracker used
+      // to answer here from the outcome of recent checks; nothing read it.
+      override def healthCheck: F[Either[String, Unit]] = underlying.healthCheck
 
       private def applyPatterns[A](operation: F[A], name: String): F[A] =
         val withTimeout = Temporal[F]

@@ -116,7 +116,8 @@ object Main extends IOApp:
       ) ++ stores.tokenQuotaStore.map(tqs =>
         HealthAggregator.dynamoDbSource("dynamodb_quota", tqs.healthCheck),
       ) :+ HealthAggregator.kinesisSource(eventPublisher.healthCheck)
-      healthCheck = HealthAggregator.aggregate(healthSources)
+      healthCheck = HealthAggregator
+        .aggregate(healthSources, config.resilience.timeout.healthCheck)
 
       getRequestId = () =>
         correlationLocal.get

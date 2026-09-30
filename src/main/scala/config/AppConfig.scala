@@ -185,8 +185,9 @@ case class TimeoutSettings(
     // attempts) inside this bound, and it guards an LLM call that takes
     // seconds anyway.
     quotaCheck: FiniteDuration = scala.concurrent.duration.Duration(5, "seconds"),
+    // Each /ready probe; under the ALB's 5 s health check timeout.
     healthCheck: FiniteDuration = scala.concurrent.duration
-      .Duration(5, "seconds"),
+      .Duration(3, "seconds"),
 ) derives ConfigReader
 
 case class ResilienceConfig(

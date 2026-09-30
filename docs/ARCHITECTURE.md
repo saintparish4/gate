@@ -258,7 +258,7 @@ A rate-limit check emits `rate_limit_allowed` or `rate_limit_rejected`, an idemp
 | `dynamodb_quota` | `DescribeTable` on the quota table; present only when quotas are on | yes |
 | `kinesis` | `DescribeStreamSummary`; always `ok` when Kinesis is off | no |
 
-The overall status is `ok` when every check passes, `degraded` (still 200) when only Kinesis fails, and `unavailable` (503) when a required component fails. The ALB routes on `/ready`. Kinesis is optional because no request waits on it; when it counted, one Kinesis fault took every task out of service. The checks call the stores directly, so neither `resilience.timeout.health-check` nor the circuit breaker applies; each call is bounded only by the SDK's `dynamodb.request-timeout` (10 s).
+The overall status is `ok` when every check passes, `degraded` (still 200) when only Kinesis fails, and `unavailable` (503) when a required component fails. The ALB routes on `/ready`. Kinesis is optional because no request waits on it; when it counted, one Kinesis fault took every task out of service. The checks call the stores directly, so the circuit breaker does not apply. They run at once, each bounded by `resilience.timeout.health-check` (3 s, under the ALB's 5 s check timeout); a check that does not answer in time is an error, so a slow table answers 503 naming it rather than nothing.
 
 ## Observability
 
