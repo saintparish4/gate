@@ -87,6 +87,44 @@ class IdempotencyApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
     }
   }
 
+  "IdempotencyApi TTL validation" - {
+
+    // A ttl of zero or less was accepted and wrote an already-expired record.
+    "a ttl of zero or less is 400, and claims nothing" in {
+      def check(api: IdempotencyApi[IO], ttl: Long) = api.check(
+        Request[IO](Method.POST, uri"/v1/idempotency/check")
+          .withEntity(s"""{"idempotencyKey": "ttl-test", "ttl": $ttl}""")
+          .putHeaders(headers.`Content-Type`(MediaType.application.json)),
+        testClient,
+      )
+      val test =
+        for
+          store <- IdempotencyStore.inMemory[IO]
+          logger <- Ref[IO].of(List.empty[String]).map(capturingLogger)
+          api = IdempotencyApi[IO](
+            store,
+            IdempotencyConfig(),
+            EventPublisher.noop[IO],
+            MetricsPublisher.noop[IO],
+            logger,
+            () => IO.pure("test-request-id"),
+          )
+          zero <- check(api, 0)
+          negative <- check(api, -60)
+          message <- negative.bodyText.compile.string
+          valid <- check(api, 60)
+        yield (zero.status, negative.status, message, valid.status)
+
+      test.asserting { case (zero, negative, message, valid) =>
+        zero shouldBe Status.BadRequest
+        negative shouldBe Status.BadRequest
+        message should include("ttl must be positive, got -60")
+        // Still unclaimed: the first valid check is new.
+        valid shouldBe Status.Ok
+      }
+    }
+  }
+
   "IdempotencyApi TTL warning" - {
 
     "should log a warning when client TTL exceeds max" in {

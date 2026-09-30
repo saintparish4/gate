@@ -107,15 +107,18 @@ The secret is named `<secret-prefix>/<environment>/<api-keys-secret-name>`
 ]
 ```
 
-- `tier` is `free`, `basic`, `premium` or `enterprise`. An entry with any other
-  tier, or with `"active": false`, is skipped.
+- `tier` is `free`, `basic`, `premium` or `enterprise`. An entry with
+  `"active": false` is skipped. An unknown tier or permission name, in any
+  entry, is an error that names the entry's `apiKeyId` and the value.
 - The tenant is the entry's `apiKeyId`. Keep it when you rotate `apiKey` to
   keep the client's state.
-- Startup fails if the secret is missing, is not a list in this shape, or has
-  no active key.
+- Startup fails if the secret is missing, is not a list in this shape, has an
+  unknown tier or permission, or has no active key.
 - The keys are re-read about every 5 minutes (`cache-ttl`), so adding or
   revoking a key takes effect within minutes, not at once. If a re-read fails,
-  the current keys stay.
+  the current keys stay. If it finds an unknown tier or permission, the valid
+  entries take effect (so revocations do), the invalid ones cannot
+  authenticate, and the error is logged.
 
 **Built-in development keys** (`ALLOW_BUILT_IN_KEYS=true`, set only by docker
 compose and `make run`). They are public, so never use them outside local
@@ -180,13 +183,12 @@ as `retryAfter`). No `X-RateLimit-*` headers.
 |--------|------|-------|
 | `400` | `{"error": "validation_error", "message": "cost must be positive"}` | `cost` below 1 |
 | `400` | `{"error": "validation_error", "message": "unknown profile 'gold'"}` | `profile` is not configured |
+| `400` | `{"error": "validation_error", "message": "cost 6 exceeds the profile's capacity 5, so it can never be admitted"}` | `cost` above the profile's capacity; nothing consumed |
 | `403` | `{"error": "profile_not_permitted", "message": "profile 'enterprise' exceeds the free tier's limits"}` | `profile` is above your tier; nothing consumed |
 | `400` / `422` | text | Body not JSON / `key` missing ([Errors](#errors)) |
 
 This route does not answer 503. When the store cannot answer, the result
-follows the degradation mode ([below](#when-the-store-cannot-answer)). A
-`cost` larger than the profile's capacity is always refused, with a
-`retryAfter` that cannot come true.
+follows the degradation mode ([below](#when-the-store-cannot-answer)).
 
 ```bash
 curl -s -X POST http://localhost:8080/v1/ratelimit/check \
@@ -243,7 +245,9 @@ after the tier, or `rate-limit.default-capacity` / `default-refill-rate-per-seco
 | `enterprise` | 10,000 | 1,000 |
 
 A request's `profile` may only narrow your limits: it is accepted when its
-capacity and its refill rate are both at most your tier's. A premium key may
+capacity and its refill rate are both at most your tier's, and its
+`ttlSeconds` at least your tier's (under `sliding-window` that is the window,
+and a shorter window is a wider limit). A premium key may
 name `free` or `basic`; a free key only `free`. The bucket itself is identified
 by client and `key` alone, so naming a profile applies different limits to the
 same bucket, not a new one.
@@ -308,7 +312,7 @@ answers 503 `storage_unavailable`.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `idempotencyKey` | string | yes | The operation's key, scoped to your client |
-| `ttl` | integer | no | Seconds the record should live. Default `IDEMPOTENCY_DEFAULT_TTL` (86400); capped at `IDEMPOTENCY_MAX_TTL_SECONDS` (86400). Zero or negative values are not rejected. |
+| `ttl` | integer | no | Seconds the record should live. Default `IDEMPOTENCY_DEFAULT_TTL` (86400); capped at `IDEMPOTENCY_MAX_TTL_SECONDS` (86400). Zero or negative is a `400`. |
 | `requestBody` | string | no | Any string that identifies the request, usually its body. Only its SHA-256 is stored. The hash is over the exact UTF-8 bytes, so reordered or reformatted JSON hashes differently. |
 
 The record's TTL is a DynamoDB TTL attribute. DynamoDB removes expired items
@@ -324,6 +328,7 @@ been removed.
 | `202` | `in_progress` | The key is pending. Do not run the operation. |
 | `200` | `duplicate` | The operation completed; `originalResponse` holds what was stored. |
 | `409` | `conflict` | This check's `requestBody` hash differs from the stored one. |
+| `400` | `validation_error` | `ttl` is zero or negative. Nothing is claimed. |
 
 A conflict needs both hashes: a check without `requestBody`, or a key claimed
 without one, never conflicts.
@@ -489,7 +494,10 @@ permission check still runs first, so a key without the permission gets 403.
 | `message` | string or null | Why it was refused |
 | `reservationId` | string or null | Set when allowed; pass it to `/v1/quota/reconcile` |
 
-An estimate larger than a level's limit is always refused.
+**400, never fits:** the estimate alone is larger than a requested level's
+limit, so no window could admit it. Nothing is reserved, and there is no
+`Retry-After`: `{"error": "validation_error", "message": "estimate of 1001
+tokens exceeds the user limit of 1000, so it can never be admitted"}`.
 
 **503, contended:** the store lost every conditional write in its 25 attempts,
 or the reservation record could not be written (the charge is then released).
@@ -658,8 +666,9 @@ store, starting from `rate-limit.default-*` (100 tokens, 10/s).
 
 | Status | `error` | Route | Cause |
 |--------|---------|-------|-------|
-| 400 | `validation_error` | `POST /v1/ratelimit/check` | `cost` below 1, or an unknown `profile` |
-| 400 | `validation_error` | `POST /v1/quota/check`, `/reconcile` | A negative token count |
+| 400 | `validation_error` | `POST /v1/ratelimit/check` | `cost` below 1 or above the profile's capacity, or an unknown `profile` |
+| 400 | `validation_error` | `POST /v1/idempotency/check` | `ttl` zero or negative |
+| 400 | `validation_error` | `POST /v1/quota/check`, `/reconcile` | A negative token count, or an estimate above a level's limit |
 | 403 | `forbidden` | Any authenticated route | The key lacks the route's permission |
 | 403 | `profile_not_permitted` | `POST /v1/ratelimit/check` | `profile` above the key's tier |
 | 404 | `reservation_not_found` | `POST /v1/quota/reconcile` | Unknown, expired, or another client's reservation |

@@ -46,6 +46,13 @@ object QuotaDecision:
     */
   case class Contended(attempts: Int) extends QuotaDecision
 
+  /** The estimate alone is above a level's limit, so no window could admit it.
+    * Nothing was reserved. It used to be `Exceeded`, with a retryAfter that
+    * could not come true.
+    */
+  case class NeverFits(level: QuotaLevel, limit: Long, requested: Long)
+      extends QuotaDecision
+
 sealed trait ReconcileResult
 object ReconcileResult:
   /** Applied, or already applied with the same actual usage. The deltas are
@@ -387,6 +394,19 @@ object TokenQuotaService:
         estimatedOutputTokens: Long,
     ): F[QuotaDecision] =
       val levels = levelsFor(clientId, identifier)
+      val requested = estimatedInputTokens + estimatedOutputTokens
+      levels.find(_.limit < requested) match
+        case Some(l) => Async[F]
+            .pure(QuotaDecision.NeverFits(l.level, l.limit, requested))
+        case None =>
+          reserve(clientId, levels, estimatedInputTokens, estimatedOutputTokens)
+
+    private def reserve(
+        clientId: String,
+        levels: List[Level],
+        estimatedInputTokens: Long,
+        estimatedOutputTokens: Long,
+    ): F[QuotaDecision] =
       for
         nowMs <- Clock[F].realTime.map(_.toMillis)
         reservationId <- Async[F].delay(java.util.UUID.randomUUID().toString)

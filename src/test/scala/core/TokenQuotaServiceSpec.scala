@@ -186,21 +186,44 @@ class TokenQuotaServiceSpec
           8500,
           0,
         )
-      yield result match
-        case QuotaDecision.Exceeded(level, limit, _, _) =>
-          level shouldBe QuotaLevel.Agent
-          limit shouldBe 8000L
-        case other => fail(s"expected Exceeded, got $other")
+      // 8,500 fits the configured 9,000 but not the 8,000 cap.
+      yield result shouldBe
+        QuotaDecision.NeverFits(QuotaLevel.Agent, 8000L, 8500L)
     }
 
-    "reserves nothing at any level when a later level is exceeded" in {
+    // It used to be Exceeded, with a retryAfter that could not come true.
+    "an estimate above a level's limit never fits, and reserves nothing" in {
       val config = defaultConfig.copy(orgLimit = 1_000)
       for
         (svc, store) <- service(config)
         result <- svc.checkQuota(
           client,
           QuotaIdentifier("user1", orgId = Some("org1")),
-          5000,
+          1_001,
+          0,
+        )
+        user <- store.getQuota(userPk("user1"))
+      yield
+        result shouldBe QuotaDecision.NeverFits(QuotaLevel.Org, 1_000L, 1_001L)
+        user shouldBe None
+    }
+
+    "reserves nothing at any level when a later level is exceeded" in {
+      val config = defaultConfig.copy(orgLimit = 1_000)
+      for
+        (svc, store) <- service(config)
+        // Another user fills most of the org, so user1's 500 fits its own
+        // level and the org's limit, but not what is left of the org.
+        _ <- svc.checkQuota(
+          client,
+          QuotaIdentifier("user0", orgId = Some("org1")),
+          800,
+          0,
+        )
+        result <- svc.checkQuota(
+          client,
+          QuotaIdentifier("user1", orgId = Some("org1")),
+          500,
           0,
         )
         user <- store.getQuota(userPk("user1"))
@@ -208,7 +231,7 @@ class TokenQuotaServiceSpec
       yield
         result shouldBe a[QuotaDecision.Exceeded]
         user shouldBe None
-        org shouldBe None
+        org.map(_.totalTokens) shouldBe Some(800L)
     }
 
     "never admits more than the limit under concurrent checks" in {

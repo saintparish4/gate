@@ -120,6 +120,19 @@ class RateLimitApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
         Left(ProfileRefusal.AboveTier("fast", ClientTier.Basic))
     }.asserting(_ => succeed)
 
+    // Under the sliding window ttlSeconds is the window: the same capacity over
+    // a shorter one is a wider limit, and it used to pass as narrower.
+    "a shorter window is above the tier" in IO {
+      val windows = ladder.copy(
+        algorithm = "sliding-window",
+        profiles = ladder.profiles +
+          ("quick" -> RateLimitProfileConfig(100, 10.0, 60)),
+      )
+      RateLimitApi
+        .selectProfile(windows, ClientTier.Basic, Some("quick")) shouldBe
+        Left(ProfileRefusal.AboveTier("quick", ClientTier.Basic))
+    }.asserting(_ => succeed)
+
     "an unknown name is refused as unknown" in
       IO(RateLimitApi.selectProfile(ladder, ClientTier.Enterprise, Some("gold")))
         .asserting(_ shouldBe Left(ProfileRefusal.Unknown("gold")))
@@ -134,6 +147,26 @@ class RateLimitApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
     "rejects negative cost with 400 BadRequest" in makeApi()
       .flatMap(api => api.check(postCheckRequest("k1", -5), testClient))
       .asserting((r: Response[IO]) => r.status.shouldBe(Status.BadRequest))
+
+    // It was refused with nothing but a Retry-After that could never come true.
+    "a cost above the profile's capacity is 400 and consumes nothing" in
+      makeApi().flatMap(api =>
+        for
+          r <- api.check(
+            postCheckRequest("k-cost", 6, profile = Some("tiny")),
+            testClient,
+          )
+          message <- r.bodyText.compile.string
+          ok <- api.check(
+            postCheckRequest("k-cost", 5, profile = Some("tiny")),
+            testClient,
+          )
+        yield (r.status, message, ok.status),
+      ).asserting { case (status, message, ok) =>
+        status shouldBe Status.BadRequest
+        message should include("cost 6 exceeds the profile's capacity 5")
+        ok shouldBe Status.Ok
+      }
 
     "a named profile narrower than the tier is used" in makeApi().flatMap(api =>
       api.check(
