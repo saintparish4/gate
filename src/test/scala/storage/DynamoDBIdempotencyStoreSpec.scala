@@ -11,7 +11,7 @@ import org.scalatest.matchers.should.Matchers
 
 import cats.effect.*
 import cats.effect.testing.scalatest.AsyncIOSpec
-import core.IdempotencyResult
+import core.{CorruptIdempotencyRecordException, IdempotencyResult}
 import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient
 import software.amazon.awssdk.services.dynamodb.model.*
 
@@ -35,32 +35,33 @@ class DynamoDBIdempotencyStoreSpec
     ).asJava
   }.build()
 
-  /** Loses the first `losses` claims, and reads every record as Failed. */
-  private def client(losses: Int, puts: AtomicInteger): DynamoDbAsyncClient =
-    Proxy.newProxyInstance(
-      classOf[DynamoDbAsyncClient].getClassLoader,
-      Array(classOf[DynamoDbAsyncClient]),
-      new InvocationHandler:
-        override def invoke(
-            proxy: Object,
-            method: java.lang.reflect.Method,
-            args: Array[Object],
-        ): Object = method.getName match
-          case "putItem" =>
-            if puts.getAndIncrement() < losses then
-              CompletableFuture.failedFuture[Object](
-                ConditionalCheckFailedException.builder().message("lost").build(),
-              )
-            else
-              CompletableFuture.completedFuture(PutItemResponse.builder().build())
-          case "getItem" => CompletableFuture.completedFuture(failedRecord)
-          case "serviceName" => "DynamoDB"
-          case "close" => null
-          case other => CompletableFuture
-              .failedFuture[Object](new UnsupportedOperationException(
-                s"Stub does not implement: $other",
-              )),
-    ).asInstanceOf[DynamoDbAsyncClient]
+  /** Loses the first `losses` claims, and reads every record as `record`. */
+  private def client(
+      losses: Int,
+      puts: AtomicInteger,
+      record: GetItemResponse = failedRecord,
+  ): DynamoDbAsyncClient = Proxy.newProxyInstance(
+    classOf[DynamoDbAsyncClient].getClassLoader,
+    Array(classOf[DynamoDbAsyncClient]),
+    new InvocationHandler:
+      override def invoke(
+          proxy: Object,
+          method: java.lang.reflect.Method,
+          args: Array[Object],
+      ): Object = method.getName match
+        case "putItem" =>
+          if puts.getAndIncrement() < losses then
+            CompletableFuture.failedFuture[Object](
+              ConditionalCheckFailedException.builder().message("lost").build(),
+            )
+          else CompletableFuture.completedFuture(PutItemResponse.builder().build())
+        case "getItem" => CompletableFuture.completedFuture(record)
+        case "serviceName" => "DynamoDB"
+        case "close" => null
+        case other => CompletableFuture.failedFuture[Object](
+            new UnsupportedOperationException(s"Stub does not implement: $other"),
+          ),
+  ).asInstanceOf[DynamoDbAsyncClient]
 
   "a Failed record read after a lost claim is claimed again, not answered New" in {
     val puts = AtomicInteger(0)
@@ -78,4 +79,24 @@ class DynamoDBIdempotencyStoreSpec
         result.isLeft shouldBe true
         puts.get shouldBe 4
       }
+  }
+
+  // It was read with `.n().toLong`, so a wrongly typed number threw a
+  // NullPointerException, which the API answers 503 storage_unavailable
+  // (retry) instead of storage_corruption (do not proceed).
+  "a wrongly typed number reads as a corrupt record" in {
+    val stringCreatedAt = GetItemResponse.builder().item(
+      (failedRecord.item().asScala.toMap +
+        ("status" -> AttributeValue.builder().s("Pending").build()) +
+        ("ttl" -> AttributeValue.builder().n("99999999999").build()) +
+        ("createdAt" -> AttributeValue.builder().s("yesterday").build())).asJava,
+    ).build()
+    DynamoDBIdempotencyStore[IO](
+      client(losses = 0, AtomicInteger(0), stringCreatedAt),
+      "t",
+    ).get("k").attempt.asserting {
+      case Left(e: CorruptIdempotencyRecordException) => e.getMessage should
+          include("'createdAt' is not a number attribute")
+      case other => fail(s"expected a corrupt record, got $other")
+    }
   }

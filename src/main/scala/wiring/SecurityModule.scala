@@ -54,5 +54,15 @@ object SecurityModule:
           config.security.authentication.rateLimitPerMinute,
         ))
 
-      middleware = ApiKeyAuth.middleware[F](apiKeyStore, Some(authRateLimiter))
+      failedAttempts <- Resource.eval(
+        FailedAttemptThrottle
+          .inMemory[F](config.security.authentication.failedAttemptsPerMinute),
+      )
+
+      middleware = ApiKeyAuth.middleware[F](
+        apiKeyStore,
+        Some(authRateLimiter),
+        Some(failedAttempts),
+        config.security.authentication.trustForwardedFor,
+      )
     yield SecurityModule(apiKeyStore, middleware)

@@ -1,6 +1,9 @@
 package resilience
 
+import scala.concurrent.duration.FiniteDuration
+
 import cats.effect.*
+import cats.effect.syntax.all.*
 import cats.syntax.all.*
 import io.circe.*
 import io.circe.syntax.*
@@ -40,18 +43,32 @@ trait HealthSource[F[_]]:
 
 object HealthAggregator:
 
+  /** Probes every source at once, each bounded by `probeTimeout`; a source that
+    * does not answer in time is an error. The probes were sequential and
+    * bounded only by the SDK's 10 s request timeout, longer than the ALB's 5 s
+    * health check, so a slow DynamoDB failed health checks with no answer at
+    * all instead of a 503 naming the table.
+    */
   def aggregate[F[_]: Temporal](
       sources: List[HealthSource[F]],
-  ): F[AggregateHealth] = sources
-    .traverse(s => s.check.map(_.copy(required = s.required)))
-    .map { components =>
-      val failing = components.filterNot(_.status == "ok")
-      val status =
-        if failing.isEmpty then "ok"
-        else if failing.exists(_.required) then "unavailable"
-        else "degraded"
-      AggregateHealth(status, components)
-    }
+      probeTimeout: FiniteDuration,
+  ): F[AggregateHealth] = sources.parTraverseN(math.max(1, sources.size))(s =>
+    s.check.timeoutTo(
+      probeTimeout,
+      Temporal[F].pure(ComponentHealth(
+        s.name,
+        "error",
+        Some(Json.fromString(s"no answer within $probeTimeout")),
+      )),
+    ).map(_.copy(required = s.required)),
+  ).map { components =>
+    val failing = components.filterNot(_.status == "ok")
+    val status =
+      if failing.isEmpty then "ok"
+      else if failing.exists(_.required) then "unavailable"
+      else "degraded"
+    AggregateHealth(status, components)
+  }
 
   def dynamoDbSource[F[_]: Temporal](
       name: String,

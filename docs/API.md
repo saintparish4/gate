@@ -62,6 +62,7 @@ requests for paths that do not exist.
 |------|--------|------|
 | No key, or an unknown key | `401` | empty |
 | Valid key, sending faster than the auth throttle allows | `429` + `Retry-After` | `{"error": "Rate limited", "retryAfter": 42}` |
+| Any key, from a source over its unknown-key limit | `429` + `Retry-After` | `{"error": "Rate limited", "retryAfter": 42}` |
 | Valid key without the route's permission | `403` | `{"error": "forbidden", "message": "Insufficient permissions: QuotaCheck required"}` |
 | Valid key, path that no route matches (or wrong method) | `404` | `Not found` (text) |
 
@@ -76,6 +77,16 @@ instance, over a one-minute window that starts at the key's first request.
 Past it, the answer is 429, not 401: back off for `Retry-After` seconds, do not
 fix credentials. It counts every authenticated request, including ones that
 end in 403 or 404.
+
+**Unknown-key throttle.** Each source may present
+`security.authentication.failed-attempts-per-minute` (20) unknown keys per
+minute. After that, every request from it that carries a key, valid or not,
+answers 429 with `Retry-After` until its minute ends, and no key is looked up.
+A missing key is not counted. The source is the connecting address, or, with
+`AUTH_TRUST_FORWARDED_FOR=true` (Terraform sets it, since the ALB fronts every
+task), the last `X-Forwarded-For` entry, which the ALB appends. The count is in
+memory on each instance, so it slows a guesser at one address, not one spread
+across many; that is the ALB's or WAF's job.
 
 ### Permissions
 

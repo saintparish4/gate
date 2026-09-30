@@ -66,10 +66,11 @@ services:
       # CI correctness job measures real behaviour; allow-all would turn a
       # tripped circuit breaker into unlimited admissions.
       # Meta auth rate limit (per API key, per minute) — raised for load tests
-      # and CI so the single shared `test-api-key` isn't throttled by the
-      # anti-abuse counter the auth middleware uses against brute-force
-      # key-guessing. Production keeps the default (1000).
+      # and CI so the single shared `test-api-key` isn't throttled by the auth
+      # middleware's per-key request ceiling. Production keeps the default (1000).
       - AUTH_RATE_LIMIT_PER_MINUTE=${AUTH_RATE_LIMIT_PER_MINUTE:-10000000}
+      # Exposed directly, so X-Forwarded-For is the client's to forge.
+      - AUTH_TRUST_FORWARDED_FOR=false
       # The demo dashboard is unauthenticated, so it is on only here.
       - DASHBOARD_ENABLED=true
       # The built-in keys (test-api-key, free-api-key, admin-api-key) are

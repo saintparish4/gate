@@ -80,8 +80,11 @@ case class TracingConfig(enabled: Boolean = false) derives ConfigReader
 // Security configuration. `enabled`, `header-name` and `api-key-prefix` used to
 // sit here too: nothing read them, auth was always on, and the headers were
 // hard-coded, so each one was a switch that did nothing.
-case class AuthenticationConfig(rateLimitPerMinute: Int = 1000)
-    derives ConfigReader
+case class AuthenticationConfig(
+    rateLimitPerMinute: Int = 1000,
+    failedAttemptsPerMinute: Int = 20,
+    trustForwardedFor: Boolean = false,
+) derives ConfigReader
 
 case class SecretsConfig(
     enabled: Boolean = false,
@@ -185,8 +188,9 @@ case class TimeoutSettings(
     // attempts) inside this bound, and it guards an LLM call that takes
     // seconds anyway.
     quotaCheck: FiniteDuration = scala.concurrent.duration.Duration(5, "seconds"),
+    // Each /ready probe; under the ALB's 5 s health check timeout.
     healthCheck: FiniteDuration = scala.concurrent.duration
-      .Duration(5, "seconds"),
+      .Duration(3, "seconds"),
 ) derives ConfigReader
 
 case class ResilienceConfig(
@@ -308,8 +312,13 @@ object AppConfig:
     val degradationErrors =
       validateDegradationMode(config.resilience.degradationMode).toList
     val keySourceErrors = validateKeySource(config.security).toList
+    // Zero would refuse every source before its first attempt.
+    val authErrors = Option.when(
+      config.security.authentication.failedAttemptsPerMinute < 1,
+    )(s"security.authentication.failed-attempts-per-minute must be >= 1, got ${config
+        .security.authentication.failedAttemptsPerMinute}").toList
     profileErrors ++ idempotencyErrors ++ quotaErrors ++ degradationErrors ++
-      keySourceErrors ++ validateChoices(config)
+      keySourceErrors ++ authErrors ++ validateChoices(config)
 
   /** Load and validate, failing on any error.
     *

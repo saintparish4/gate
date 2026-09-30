@@ -70,7 +70,7 @@ Middleware, outermost first:
 2. **[CorrelationIdMiddleware](../src/main/scala/observability/CorrelationIdMiddleware.scala).** It takes `X-Request-Id` or generates a UUID, keeps it in an `IOLocal` for audit events, and echoes it on the response.
 3. **[TracingMiddleware](../src/main/scala/observability/TracingMiddleware.scala).** One server span per request, with `http.method`, `http.target`, and `http.status_code`.
 4. **Public routes** `/health` and `/ready`, then the dashboard routes when enabled. Neither goes through authentication.
-5. **[ApiKeyAuth.middleware](../src/main/scala/security/ApiKeyAuth.scala).** It reads the key from `Authorization: Bearer <key>`, `Authorization: ApiKey <key>`, or `X-Api-Key`. A missing or unknown key gets a bare 401. A known key then passes the per-instance auth throttle: `security.authentication.rate-limit-per-minute` (1,000) requests per key, in a minute that starts at the key's first request. Over it, the answer is 429 with `Retry-After`, not 401, because the two need opposite client behavior: fix the credentials, or back off.
+5. **[ApiKeyAuth.middleware](../src/main/scala/security/ApiKeyAuth.scala).** It reads the key from `Authorization: Bearer <key>`, `Authorization: ApiKey <key>`, or `X-Api-Key`. A missing or unknown key gets a bare 401. A known key then passes the per-instance auth throttle: `security.authentication.rate-limit-per-minute` (1,000) requests per key, in a minute that starts at the key's first request. Over it, the answer is 429 with `Retry-After`, not 401, because the two need opposite client behavior: fix the credentials, or back off. Unknown keys are counted per source (`failed-attempts-per-minute`, 20); a source over it gets the same 429 with no lookup, valid key or not, so a guess that lands does not get through. Behind the ALB (`trust-forwarded-for`, set by Terraform) the source is the last `X-Forwarded-For` entry; otherwise it is the connecting address.
 6. **Permission check** (`ApiKeyAuth.requirePermission`). A key without the route's permission gets 403 before any state is touched.
 
 An unauthenticated request to an unknown path therefore gets 401; an authenticated one gets 404.
@@ -258,7 +258,7 @@ A rate-limit check emits `rate_limit_allowed` or `rate_limit_rejected`, an idemp
 | `dynamodb_quota` | `DescribeTable` on the quota table; present only when quotas are on | yes |
 | `kinesis` | `DescribeStreamSummary`; always `ok` when Kinesis is off | no |
 
-The overall status is `ok` when every check passes, `degraded` (still 200) when only Kinesis fails, and `unavailable` (503) when a required component fails. The ALB routes on `/ready`. Kinesis is optional because no request waits on it; when it counted, one Kinesis fault took every task out of service. The checks call the stores directly, so neither `resilience.timeout.health-check` nor the circuit breaker applies; each call is bounded only by the SDK's `dynamodb.request-timeout` (10 s).
+The overall status is `ok` when every check passes, `degraded` (still 200) when only Kinesis fails, and `unavailable` (503) when a required component fails. The ALB routes on `/ready`. Kinesis is optional because no request waits on it; when it counted, one Kinesis fault took every task out of service. The checks call the stores directly, so the circuit breaker does not apply. They run at once, each bounded by `resilience.timeout.health-check` (3 s, under the ALB's 5 s check timeout); a check that does not answer in time is an error, so a slow table answers 503 naming it rather than nothing.
 
 ## Observability
 
@@ -311,6 +311,7 @@ Item shapes. Timestamps, counts, and versions are numbers; the rest are strings,
 | Key reload fails | Keeps the current keys | `SecretsManagerApiKeyStore.refresh` |
 | Missing or unknown key | 401 | `ApiKeyAuth.middleware` |
 | Key over the auth throttle | 429 with `Retry-After` | `AuthRateLimiter` |
+| Source over its unknown-key limit | 429 with `Retry-After`, no key lookup | `FailedAttemptThrottle` |
 | Key lacks the route's permission | 403, no state touched | `ApiKeyAuth.requirePermission` |
 | Body not JSON, or the wrong shape | 400 or 422 | `ErrorHandling` in `Main` |
 | Rate-limit OCC retries run out | 429 | Each rate-limit store's `checkAndConsume` |

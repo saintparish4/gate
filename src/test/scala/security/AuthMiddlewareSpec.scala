@@ -237,6 +237,102 @@ class AuthMiddlewareSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
       ).asserting(_ shouldBe (Some(Status.TooManyRequests), Some(Status.Ok)))
   }
 
+  "ApiKeyAuth middleware — failed-key throttle" - {
+    // The per-key throttle ran only after a key was found, so guessing keys was
+    // never throttled, although its comments said it protected against that.
+
+    def guarded(limit: Int, trust: Boolean = true): IO[HttpRoutes[IO]] =
+      FailedAttemptThrottle.inMemory[IO](limit).map(t =>
+        ApiKeyAuth.middleware[IO](
+          keyStore,
+          failedAttempts = Some(t),
+          trustForwardedFor = trust,
+        )(protectedRoutes),
+      )
+
+    def from(source: String, key: String): Request[IO] = requestWithBearer(key)
+      .putHeaders(Header.Raw(ci"X-Forwarded-For", source))
+
+    def statuses(r: HttpRoutes[IO], reqs: List[Request[IO]]) = reqs
+      .traverse(req => r.run(req).value.map(_.map(_.status)))
+
+    "the unknown key after the limit gets 429 with Retry-After" in
+      guarded(3).flatMap(r =>
+        for
+          first <-
+            statuses(r, List.tabulate(3)(i => from("203.0.113.7", s"guess-$i")))
+          fourth <- r.run(from("203.0.113.7", "guess-3")).value
+        yield (
+          first,
+          fourth.map(_.status),
+          fourth.flatMap(_.headers.get(ci"Retry-After").map(_.head.value)),
+        ),
+      ).asserting { case (first, fourth, retryAfter) =>
+        first shouldBe List.fill(3)(Some(Status.Unauthorized))
+        fourth shouldBe Some(Status.TooManyRequests)
+        retryAfter.flatMap(_.toIntOption)
+          .exists(n => n >= 1 && n <= 60) shouldBe true
+      }
+
+    // Otherwise a guess that landed would still get through.
+    "a throttled source is refused even with a valid key" in
+      guarded(2).flatMap(r =>
+        statuses(
+          r,
+          List(
+            from("203.0.113.7", "guess-1"),
+            from("203.0.113.7", "guess-2"),
+            from("203.0.113.7", "test-api-key"),
+          ),
+        ),
+      ).asserting(_.last shouldBe Some(Status.TooManyRequests))
+
+    "other sources, and valid keys under the limit, are unaffected" in
+      guarded(1).flatMap(r =>
+        statuses(
+          r,
+          List(
+            from("203.0.113.7", "test-api-key"),
+            from("203.0.113.7", "guess-1"),
+            from("198.51.100.9", "test-api-key"),
+            from("198.51.100.9", "guess-2"),
+          ),
+        ),
+      ).asserting(
+        _ shouldBe List(
+          Some(Status.Ok),
+          Some(Status.Unauthorized),
+          Some(Status.Ok),
+          Some(Status.Unauthorized),
+        ),
+      )
+
+    "a missing key is not counted" in guarded(1).flatMap(r =>
+      statuses(
+        r,
+        List(
+          requestWithNoAuth,
+          requestWithNoAuth,
+          from("203.0.113.7", "test-api-key"),
+        ),
+      ),
+    ).asserting(_.last shouldBe Some(Status.Ok))
+
+    "the source is the last X-Forwarded-For entry, the one the ALB appends" in {
+      // A client can send any X-Forwarded-For; the ALB appends the real one.
+      val forged = requestWithBearer("k")
+        .putHeaders(Header.Raw(ci"X-Forwarded-For", "10.0.0.1, 203.0.113.7"))
+      IO((
+        ApiKeyAuth.sourceOf(forged, trustForwardedFor = true),
+        ApiKeyAuth.sourceOf(forged, trustForwardedFor = false),
+      )).asserting { case (trusted, direct) =>
+        trusted shouldBe "203.0.113.7"
+        // Without a proxy the header is forgeable, so it is ignored.
+        direct should not be "203.0.113.7"
+      }
+    }
+  }
+
   "AuthRateLimiter.inMemory" - {
 
     "allows up to the limit, then throttles with a retry-after inside the window" in

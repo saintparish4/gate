@@ -43,6 +43,31 @@ object ResilientRateLimitStore:
       case _: core.GateError.ConfigError => false
       case _ => true
 
+  /** Whether a failed check is worth another attempt: only a transient fault.
+    *
+    * Every `SdkServiceException` used to be retried, including a 400 such as a
+    * validation error that fails the same way every time, while an
+    * `SdkClientException` -- how the SDK reports a connection reset or refused
+    * -- was not. A service error is now retried when it is throttling or a 5xx,
+    * and a client error when it is an attempt timeout or an I/O fault.
+    */
+  private[resilience] def isRetryable(error: Throwable): Boolean = error match
+    case e: java.util.concurrent.CompletionException if e.getCause != null =>
+      isRetryable(e.getCause)
+    case e: software.amazon.awssdk.core.exception.SdkServiceException =>
+      e.isThrottlingException || e.statusCode >= 500
+    case _: software.amazon.awssdk.core.exception.ApiCallAttemptTimeoutException =>
+      true
+    case e: software.amazon.awssdk.core.exception.SdkClientException =>
+      causedByIo(e)
+    case _: java.util.concurrent.TimeoutException => true
+    case _: java.io.IOException => true
+    case _ => false
+
+  private def causedByIo(e: Throwable): Boolean = Iterator
+    .iterate(e.getCause)(_.getCause).takeWhile(_ != null).take(10)
+    .exists(_.isInstanceOf[java.io.IOException])
+
   /** Wrap a rate limit store with production resilience patterns.
     */
   def apply[F[_]: Temporal: Logger](
@@ -80,9 +105,6 @@ object ResilientRateLimitStore:
           ).map(Some(_))
         else Temporal[F].pure(None),
       )
-
-      // Create health tracker
-      healthTracker <- Resource.eval(HealthAwareService.tracker[F]())
     yield new RateLimitStore[F]:
       private val logger = Logger[F]
 
@@ -108,10 +130,7 @@ object ResilientRateLimitStore:
         val wrappedOp = applyPatterns(operation, "checkAndConsume")
 
         // Handle failures with graceful degradation
-        wrappedOp.flatTap(_ => healthTracker.recordSuccess).handleErrorWith(
-          error =>
-            healthTracker.recordFailure(error) *> handleDegradation(key, error),
-        )
+        wrappedOp.handleErrorWith(handleDegradation(key, _))
 
       override def getStatus(
           key: String,
@@ -124,20 +143,13 @@ object ResilientRateLimitStore:
 
         // A failure propagates. It used to become None, which the API renders
         // as a key never seen, so a store outage reported every bucket full.
-        applyPatterns(operation, "getStatus")
-          .flatTap(_ => healthTracker.recordSuccess).onError(error =>
-            healthTracker.recordFailure(error) *>
-              logger.warn(s"Failed to get status for $key: ${error.getMessage}"),
-          )
-
-      override def healthCheck: F[Either[String, Unit]] = healthTracker
-        .isHealthy.flatMap(healthy =>
-          if healthy then
-            Temporal[F]
-              .timeout(underlying.healthCheck, config.timeout.healthCheck)
-              .handleError(e => Left(e.getMessage))
-          else Temporal[F].pure(Left("circuit breaker open")),
+        applyPatterns(operation, "getStatus").onError(error =>
+          logger.warn(s"Failed to get status for $key: ${error.getMessage}"),
         )
+
+      // /ready probes the raw store (Main), never this. A health tracker used
+      // to answer here from the outcome of recent checks; nothing read it.
+      override def healthCheck: F[Either[String, Unit]] = underlying.healthCheck
 
       private def applyPatterns[A](operation: F[A], name: String): F[A] =
         val withTimeout = Temporal[F]
@@ -191,12 +203,3 @@ object ResilientRateLimitStore:
           ) *>
             metrics.increment("RateLimitDegraded", Map("reason" -> "error")) *>
             GracefulDegradation.degradedDecision(degradationMode)
-
-      private def isRetryable(error: Throwable): Boolean = error match
-        case _: software.amazon.awssdk.services.dynamodb.model.ProvisionedThroughputExceededException =>
-          true
-        case _: software.amazon.awssdk.core.exception.SdkServiceException =>
-          true
-        case _: java.util.concurrent.TimeoutException => true
-        case _: java.io.IOException => true
-        case _ => false
