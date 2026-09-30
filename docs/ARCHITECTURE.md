@@ -70,7 +70,7 @@ Middleware, outermost first:
 2. **[CorrelationIdMiddleware](../src/main/scala/observability/CorrelationIdMiddleware.scala).** It takes `X-Request-Id` or generates a UUID, keeps it in an `IOLocal` for audit events, and echoes it on the response.
 3. **[TracingMiddleware](../src/main/scala/observability/TracingMiddleware.scala).** One server span per request, with `http.method`, `http.target`, and `http.status_code`.
 4. **Public routes** `/health` and `/ready`, then the dashboard routes when enabled. Neither goes through authentication.
-5. **[ApiKeyAuth.middleware](../src/main/scala/security/ApiKeyAuth.scala).** It reads the key from `Authorization: Bearer <key>`, `Authorization: ApiKey <key>`, or `X-Api-Key`. A missing or unknown key gets a bare 401. A known key then passes the per-instance auth throttle: `security.authentication.rate-limit-per-minute` (1,000) requests per key, in a minute that starts at the key's first request. Over it, the answer is 429 with `Retry-After`, not 401, because the two need opposite client behavior: fix the credentials, or back off.
+5. **[ApiKeyAuth.middleware](../src/main/scala/security/ApiKeyAuth.scala).** It reads the key from `Authorization: Bearer <key>`, `Authorization: ApiKey <key>`, or `X-Api-Key`. A missing or unknown key gets a bare 401. A known key then passes the per-instance auth throttle: `security.authentication.rate-limit-per-minute` (1,000) requests per key, in a minute that starts at the key's first request. Over it, the answer is 429 with `Retry-After`, not 401, because the two need opposite client behavior: fix the credentials, or back off. Unknown keys are counted per source (`failed-attempts-per-minute`, 20); a source over it gets the same 429 with no lookup, valid key or not, so a guess that lands does not get through. Behind the ALB (`trust-forwarded-for`, set by Terraform) the source is the last `X-Forwarded-For` entry; otherwise it is the connecting address.
 6. **Permission check** (`ApiKeyAuth.requirePermission`). A key without the route's permission gets 403 before any state is touched.
 
 An unauthenticated request to an unknown path therefore gets 401; an authenticated one gets 404.
@@ -311,6 +311,7 @@ Item shapes. Timestamps, counts, and versions are numbers; the rest are strings,
 | Key reload fails | Keeps the current keys | `SecretsManagerApiKeyStore.refresh` |
 | Missing or unknown key | 401 | `ApiKeyAuth.middleware` |
 | Key over the auth throttle | 429 with `Retry-After` | `AuthRateLimiter` |
+| Source over its unknown-key limit | 429 with `Retry-After`, no key lookup | `FailedAttemptThrottle` |
 | Key lacks the route's permission | 403, no state touched | `ApiKeyAuth.requirePermission` |
 | Body not JSON, or the wrong shape | 400 or 422 | `ErrorHandling` in `Main` |
 | Rate-limit OCC retries run out | 429 | Each rate-limit store's `checkAndConsume` |

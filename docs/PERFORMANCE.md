@@ -32,11 +32,11 @@ is the honest signal that the system is at capacity.
 
 ### Before your first run: the meta auth rate limit
 
-Gate's auth middleware has its own anti-brute-force counter (see
+Gate's auth middleware has its own per-key request ceiling (see
 `AuthRateLimiter` in [`ApiKeyAuth.scala`](../src/main/scala/security/ApiKeyAuth.scala)).
 It's keyed **per API key, per minute**, and the production default is 1,000
 req/min. The load sim uses a single shared test key, so a real load test would
-saturate the meta limit in the first second and get 401s for the rest of the
+saturate the meta limit in the first second and get 429s for the rest of the
 minute.
 
 The `docker-compose.yml` dev stack already sets `AUTH_RATE_LIMIT_PER_MINUTE`

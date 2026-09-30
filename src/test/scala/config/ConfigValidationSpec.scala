@@ -47,3 +47,8 @@ class ConfigValidationSpec extends AnyFreeSpec with Matchers:
     refused("idempotency.max-ttl-seconds = 0") should
       include("idempotency.max-ttl-seconds must be > 0")
   }
+
+  "a failed-attempt limit of zero stops startup" in {
+    refused("security.authentication.failed-attempts-per-minute = 0") should
+      include("failed-attempts-per-minute must be >= 1")
+  }

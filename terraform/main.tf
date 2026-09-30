@@ -174,13 +174,19 @@ module "ecs" {
     # failures in a single load run, each opening a doomed socket on a task
     # that was already starving for CPU. OTEL_SDK_DISABLED is set as well
     # because it is honoured by the SDK itself, not just our config.
-    # Per-key ceiling on the auth middleware's anti-brute-force counter. The
+    # Per-key request ceiling in the auth middleware. The
     # application default is 1000/min and Terraform set nothing, so the deployed
     # task inherited it while docker-compose raises it to 10,000,000 for load
     # tests. Any correctness run therefore died at ~1000 requests into the
     # minute with HTTP 401 -- on AWS only, and looking exactly like an auth
     # failure rather than a throttle.
     AUTH_RATE_LIMIT_PER_MINUTE = tostring(var.auth_rate_limit_per_minute)
+
+    # The task is only reachable through the ALB, which appends the client's
+    # address to X-Forwarded-For. Without this every request's source is an ALB
+    # node, so one key guesser would lock every client out of the failed-key
+    # throttle.
+    AUTH_TRUST_FORWARDED_FOR = "true"
 
     # Pinned off. Every dashboard route is unauthenticated: its config POST
     # rewrites the live demo profile and its decision stream carries every

@@ -62,7 +62,7 @@ deliberately out of scope for now.
 | Idempotency | Conditional claim, replay, request-hash conflicts, `/complete`, `/fail`, a 350 KB stored-response cap | | Streaming replay (SSE capture, partial replay, body offload) |
 | Token quotas | User, agent, and org fixed windows; reserve, then reconcile against the stored reservation | | |
 | Tenancy | Every storage key scoped to the authenticated client ([ADR-005](docs/adr/005-tenant-namespaced-storage-keys.md)), with cross-tenant tests and invariant D | | Hosted multi-tenant service: accounts, billing, a managed control plane |
-| Access | API keys from Secrets Manager, a permission per route, a per-task auth throttle | Audit records for failed authentication and permission refusals | SSO and role management |
+| Access | API keys from Secrets Manager, a permission per route, a per-task throttle per key and on unknown keys per source | Audit records for failed authentication and permission refusals | SSO and role management |
 | Failure behavior | Resilience stack on the rate-limit path; timeout and bulkhead on idempotency and quota; corrupt state fails closed and self-heals | | Serving decisions from a local cache during an outage |
 | Events and audit | Kinesis events at most once; `AUDIT` log lines | Firehose to S3 (Parquet), Glue, Athena, and 7-year retention: in Terraform, never deployed ([COMPLIANCE.md](docs/COMPLIANCE.md)) | |
 | Consistency | One AWS Region is the consistency boundary | A written statement of the single-region semantics | Exact limits across Regions (global tables) |
@@ -305,7 +305,9 @@ permission, before the route touches any state. The built-in `test-api-key`
 and `free-api-key` hold the six standard permissions; `admin-api-key` also
 holds `AdminMetrics`. Each key is also throttled to
 `AUTH_RATE_LIMIT_PER_MINUTE` authentications (default 1,000); past that the
-answer is **429** with `Retry-After`, distinct from a bucket rejection.
+answer is **429** with `Retry-After`, distinct from a bucket rejection. A
+source that presents more than 20 unknown keys in a minute gets the same 429,
+for any key, until the minute ends.
 Malformed JSON answers 400 and JSON that does not match the schema answers
 422.
 

@@ -21,7 +21,7 @@ import io.circe.syntax.*
   *
   * Provides:
   *   - API key validation from Authorization header
-  *   - Rate limiting on the rate limiter itself (meta!)
+  *   - A per-key request throttle, and a per-source throttle on unknown keys
   *   - Client identification for per-client rate limits
   */
 
@@ -176,42 +176,60 @@ object ApiKeyAuth:
     *
     * The throttle now answers 429 with `Retry-After`. Missing and invalid keys
     * keep the bare 401 they always had.
+    *
+    * The per-key throttle ran only once a key was found, so guessing keys was
+    * never throttled, although its comments claimed brute-force protection.
+    * `failedAttempts` counts unknown keys per source. A source over its limit
+    * gets the same 429 with no lookup at all, even for a valid key: otherwise a
+    * guess that landed would still get through.
     */
   def middleware[F[_]: Temporal: Logger](
       apiKeyStore: ApiKeyStore[F],
       authRateLimiter: Option[AuthRateLimiter[F]] = None,
+      failedAttempts: Option[FailedAttemptThrottle[F]] = None,
+      trustForwardedFor: Boolean = false,
   ): AuthMiddleware[F, AuthenticatedClient] =
     val logger = Logger[F]
 
     def fail(e: AuthError): AuthResult = Left(e)
     def ok(c: AuthenticatedClient): AuthResult = Right(c)
 
-    val authUser: Kleisli[F, Request[F], AuthResult] = Kleisli { request =>
+    lazy val authUser: Kleisli[F, Request[F], AuthResult] = Kleisli { request =>
       extractApiKey(request).flatMap {
         case None => logger.debug("Request missing API key")
             .as(fail(AuthError.MissingApiKey))
 
-        case Some(apiKey) => apiKeyStore.findByKey(apiKey).flatMap {
-            case None => logger
-                .warn(s"Invalid API key attempted: ${maskKey(apiKey)}")
-                .as(fail(AuthError.InvalidApiKey))
-
-            case Some(client) => authRateLimiter match
-                case None => logger.debug(s"Authenticated client: ${client
-                      .clientName}").as(ok(client))
-
-                case Some(limiter) => limiter.checkLimit(client.apiKeyId)
-                    .flatMap {
-                      case AuthLimitDecision.Allowed => logger
-                          .debug(s"Authenticated client: ${client.clientName}")
-                          .as(ok(client))
-                      case AuthLimitDecision.Throttled(retryAfter) =>
-                        logger.warn(s"Client ${client.clientName} hit auth rate limit; retry after ${retryAfter}s")
-                          .as(fail(AuthError.RateLimited(retryAfter)))
-                    }
+        case Some(apiKey) =>
+          val source = sourceOf(request, trustForwardedFor)
+          failedAttempts.flatTraverse(_.blocked(source)).flatMap {
+            case Some(retryAfter) =>
+              logger.warn(s"Source $source is over its failed-key limit; refused without a lookup, retry after ${retryAfter}s")
+                .as(fail(AuthError.RateLimited(retryAfter)))
+            case None => lookUp(apiKey, source)
           }
       }
     }
+
+    def lookUp(apiKey: String, source: String): F[AuthResult] = apiKeyStore
+      .findByKey(apiKey).flatMap {
+        case None => failedAttempts.traverse_(_.recordFailure(source)) *>
+            logger.warn(
+              s"Invalid API key attempted: ${maskKey(apiKey)} source=$source",
+            ).as(fail(AuthError.InvalidApiKey))
+
+        case Some(client) => authRateLimiter match
+            case None => logger.debug(s"Authenticated client: ${client
+                  .clientName}").as(ok(client))
+
+            case Some(limiter) => limiter.checkLimit(client.apiKeyId).flatMap {
+                case AuthLimitDecision.Allowed => logger
+                    .debug(s"Authenticated client: ${client.clientName}")
+                    .as(ok(client))
+                case AuthLimitDecision.Throttled(retryAfter) =>
+                  logger.warn(s"Client ${client.clientName} hit auth rate limit; retry after ${retryAfter}s")
+                    .as(fail(AuthError.RateLimited(retryAfter)))
+              }
+      }
 
     val onFailure: AuthedRoutes[AuthError, F] = Kleisli(authed =>
       OptionT.liftF(Temporal[F].pure(
@@ -244,6 +262,25 @@ object ApiKeyAuth:
     ),
   )
 
+  /** Where a request came from, for the failed-attempt throttle. Behind the
+    * ALB, the connecting address is the ALB's, so every client would share one
+    * count and one guesser could lock everyone out. The ALB appends the real
+    * client to `X-Forwarded-For`, so the last entry is the one to trust;
+    * earlier entries are whatever the client sent. Without a proxy
+    * (`trustForwardedFor = false`) the header is the client's to forge, so the
+    * connecting address is used.
+    */
+  private[security] def sourceOf[F[_]](
+      request: Request[F],
+      trustForwardedFor: Boolean,
+  ): String =
+    val forwarded =
+      if !trustForwardedFor then None
+      else
+        request.headers.get(ci"X-Forwarded-For").flatMap(_.toList.lastOption)
+          .flatMap(_.value.split(',').map(_.trim).filter(_.nonEmpty).lastOption)
+    forwarded.orElse(request.remoteAddr.map(_.toString)).getOrElse("unknown")
+
   /** Mask API key for logging (show first/last 4 chars) */
   private def maskKey(key: String): String =
     if key.length > 8 then s"${key.take(4)}...${key.takeRight(4)}" else "****"
@@ -272,8 +309,8 @@ enum AuthLimitDecision:
   case Allowed
   case Throttled(retryAfterSeconds: Int)
 
-/** Rate limiter for authentication attempts. Protects against brute-force API
-  * key guessing.
+/** Per-key request throttle, run once a key is found. It does not slow key
+  * guessing, which never finds a key; [[FailedAttemptThrottle]] does.
   */
 trait AuthRateLimiter[F[_]]:
   /** Check if a client can make a request */
@@ -305,20 +342,70 @@ object AuthRateLimiter:
           val counter = requestCounts.get(clientId, _ => new AtomicInteger(0))
           val count = counter.incrementAndGet()
           if count <= maxRequestsPerMinute then AuthLimitDecision.Allowed
-          else AuthLimitDecision.Throttled(secondsUntilReset(clientId))
+          else
+            AuthLimitDecision
+              .Throttled(secondsLeft(requestCounts, clientId, window))
         }
+  }
 
-      // Caffeine reports the entry's age against the fixed expiry, which is
-      // exactly the time left in the window. Whole window if it cannot -- the
-      // entry expired between the increment and this read.
-      private def secondsUntilReset(clientId: String): Int =
-        val remaining =
-          for
-            policy <- toOption(requestCounts.policy().expireAfterWrite())
-            age <- toOption(policy.ageOf(clientId))
-          yield window.minus(age)
-        remaining.map(d => math.max(1, math.ceil(d.toMillis / 1000.0).toInt))
-          .getOrElse(window.toSeconds.toInt)
+  // Caffeine reports the entry's age against the fixed expiry, which is
+  // exactly the time left in the window. Whole window if it cannot -- the
+  // entry expired between the increment and this read.
+  private[security] def secondsLeft(
+      cache: com.github.benmanes.caffeine.cache.Cache[String, ?],
+      key: String,
+      window: java.time.Duration,
+  ): Int =
+    val remaining =
+      for
+        policy <- toOption(cache.policy().expireAfterWrite())
+        age <- toOption(policy.ageOf(key))
+      yield window.minus(age)
+    remaining.map(d => math.max(1, math.ceil(d.toMillis / 1000.0).toInt))
+      .getOrElse(window.toSeconds.toInt)
+
+/** Per-source throttle on unknown API keys. Per instance, like the per-key
+  * throttle, and bounded in memory, so it slows a guesser at one address but
+  * not one spread across many; that is the ALB's or WAF's job.
+  */
+trait FailedAttemptThrottle[F[_]]:
+  /** Seconds until `source` may present a key again, while it is over its
+    * limit.
+    */
+  def blocked(source: String): F[Option[Int]]
+
+  /** Count an unknown key presented by `source`. */
+  def recordFailure(source: String): F[Unit]
+
+object FailedAttemptThrottle:
+  import java.util.concurrent.atomic.AtomicInteger
+
+  import com.github.benmanes.caffeine.cache.Caffeine
+
+  /** Allows `maxFailuresPerMinute` unknown keys per source in a minute that
+    * starts at its first failure; from the next one on, the source is refused.
+    * At most `maxSources` are tracked at once, the least recent evicted first,
+    * so a flood of addresses cannot exhaust memory.
+    */
+  def inMemory[F[_]: Sync](
+      maxFailuresPerMinute: Int,
+      maxSources: Long = 100_000,
+  ): F[FailedAttemptThrottle[F]] = Sync[F].delay {
+    val window = java.time.Duration.ofMinutes(1)
+    val failures = Caffeine.newBuilder().expireAfterWrite(window)
+      .maximumSize(maxSources).build[String, AtomicInteger]()
+
+    new FailedAttemptThrottle[F]:
+      override def blocked(source: String): F[Option[Int]] = Sync[F].delay(
+        Option(failures.getIfPresent(source))
+          .filter(_.get >= maxFailuresPerMinute)
+          .map(_ => AuthRateLimiter.secondsLeft(failures, source, window)),
+      )
+
+      override def recordFailure(source: String): F[Unit] = Sync[F].delay {
+        failures.get(source, _ => new AtomicInteger(0)).incrementAndGet()
+        ()
+      }
   }
 
 /** Request context enriched with authentication info.
