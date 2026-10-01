@@ -60,12 +60,15 @@ object StoreGuard:
         idempotencyKey: String,
         clientId: String,
         response: StoredResponse,
+        claimId: Option[String],
     ): F[Boolean] =
-      guard(underlying.storeResponse(idempotencyKey, clientId, response))
+      guard(underlying.storeResponse(idempotencyKey, clientId, response, claimId))
     override def markFailed(
         idempotencyKey: String,
         clientId: String,
-    ): F[Boolean] = guard(underlying.markFailed(idempotencyKey, clientId))
+        claimId: Option[String],
+    ): F[Boolean] =
+      guard(underlying.markFailed(idempotencyKey, clientId, claimId))
     override def get(idempotencyKey: String): F[Option[IdempotencyRecord]] =
       guard(underlying.get(idempotencyKey))
     override def healthCheck: F[Either[String, Unit]] = underlying.healthCheck

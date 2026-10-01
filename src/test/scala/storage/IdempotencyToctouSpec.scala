@@ -56,11 +56,14 @@ class IdempotencyToctouSpec
                 key: String,
                 clientId: String,
                 response: StoredResponse,
-            ): IO[Boolean] = delegateStore.storeResponse(key, clientId, response)
+                claimId: Option[String],
+            ): IO[Boolean] = delegateStore
+              .storeResponse(key, clientId, response, claimId)
             override def markFailed(
                 key: String,
                 clientId: String,
-            ): IO[Boolean] = delegateStore.markFailed(key, clientId)
+                claimId: Option[String],
+            ): IO[Boolean] = delegateStore.markFailed(key, clientId, claimId)
             override def get(key: String): IO[Option[IdempotencyRecord]] =
               delegateStore.get(key)
             override def healthCheck: IO[Either[String, Unit]] =

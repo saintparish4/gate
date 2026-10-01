@@ -3,6 +3,7 @@ package core
 import java.time.Instant
 
 import cats.effect.*
+import cats.effect.std.UUIDGen
 import cats.syntax.all.*
 
 /** Result of an idempotency check.
@@ -11,8 +12,13 @@ sealed trait IdempotencyResult
 
 object IdempotencyResult:
   /** First time seeing this idempotency key - proceed with the operation.
+    *
+    * @param claimId
+    *   Names this claim, not the key (ADR-006). `storeResponse` and
+    *   `markFailed` given it act only on this claim, so a run that outlived its
+    *   TTL cannot end the claim of the run that replaced it.
     */
-  case class New(idempotencyKey: String, createdAt: Instant)
+  case class New(idempotencyKey: String, createdAt: Instant, claimId: String)
       extends IdempotencyResult
 
   /** Duplicate request detected - return cached response.
@@ -58,6 +64,9 @@ case class IdempotencyRecord(
     ttl: Long,
     version: Long,
     requestHash: Option[String] = None,
+    // The claim that created this record. None on a record written before
+    // ADR-006.
+    claimId: Option[String] = None,
 ):
   /** Past its TTL (epoch seconds, as DynamoDB TTL reads it). DynamoDB deletes
     * an expired item lazily, often days later, so every read and claim checks
@@ -122,12 +131,14 @@ trait IdempotencyStore[F[_]]:
     * created by `clientId`, and has not expired: an expired claim has lapsed,
     * and the next check claims the key afresh.
     *
-    * It cannot tell a reclaimed key's first owner from its second. Both are the
-    * same client, so once a later check has claimed an expired key, a late call
-    * from the earlier run completes the new claim. Keys are already scoped per
-    * client (ADR-005); this is the second guard, so a key-construction bug
-    * still cannot let one client complete another's record with a forged
-    * response.
+    * Without `claimId` it cannot tell a reclaimed key's first owner from its
+    * second. Both are the same client, so once a later check has claimed an
+    * expired key, a late call from the earlier run completes the new claim.
+    * With it, only the claim that was issued that ID is completed (ADR-006).
+    *
+    * Keys are already scoped per client (ADR-005); the client check is the
+    * second guard, so a key-construction bug still cannot let one client
+    * complete another's record with a forged response.
     *
     * @param idempotencyKey
     *   The key from the original check
@@ -135,14 +146,18 @@ trait IdempotencyStore[F[_]]:
     *   The client completing it; must match the client that created it
     * @param response
     *   The response to store
+    * @param claimId
+    *   The ID `check` returned with `New`. When given, the record must be that
+    *   claim's.
     * @return
-    *   true if stored; false if the record is missing, not Pending, expired, or
-    *   owned by another client
+    *   true if stored; false if the record is missing, not Pending, expired,
+    *   owned by another client, or another claim's
     */
   def storeResponse(
       idempotencyKey: String,
       clientId: String,
       response: StoredResponse,
+      claimId: Option[String] = None,
   ): F[Boolean]
 
   /** Mark a pending operation as failed, so the next check with this key claims
@@ -156,11 +171,19 @@ trait IdempotencyStore[F[_]]:
     *   The key from the original check
     * @param clientId
     *   The client failing it; must match the client that created it
+    * @param claimId
+    *   The ID `check` returned with `New`. When given, the record must be that
+    *   claim's. Without it, a run that outlived its TTL can release the claim
+    *   of the run that replaced it.
     * @return
-    *   true if marked; false if the record is missing, not Pending, expired, or
-    *   owned by another client
+    *   true if marked; false if the record is missing, not Pending, expired,
+    *   owned by another client, or another claim's
     */
-  def markFailed(idempotencyKey: String, clientId: String): F[Boolean]
+  def markFailed(
+      idempotencyKey: String,
+      clientId: String,
+      claimId: Option[String] = None,
+  ): F[Boolean]
 
   /** Get the current status of an idempotency key.
     *
@@ -184,7 +207,7 @@ trait IdempotencyStore[F[_]]:
 object IdempotencyStore:
   /** Create an in-memory store for testing.
     */
-  def inMemory[F[_]: Temporal]: F[IdempotencyStore[F]] =
+  def inMemory[F[_]: Temporal: UUIDGen]: F[IdempotencyStore[F]] =
     import cats.effect.Ref
     import cats.effect.Clock
 
@@ -198,6 +221,8 @@ object IdempotencyStore:
         ): F[IdempotencyResult] =
           for
             now <- Clock[F].realTime.map(d => Instant.ofEpochMilli(d.toMillis))
+            // Used only if this check claims the key.
+            claimId <- UUIDGen[F].randomUUID.map(_.toString)
             result <- stateRef.modify { records =>
               records.get(idempotencyKey).filterNot(_.expired(now)) match
                 case Some(existing) => existing.status match
@@ -256,10 +281,11 @@ object IdempotencyStore:
                         ttl = now.getEpochSecond + ttlSeconds,
                         version = existing.version + 1,
                         requestHash = requestHash,
+                        claimId = Some(claimId),
                       )
                       (
                         records + (idempotencyKey -> newRecord),
-                        IdempotencyResult.New(idempotencyKey, now),
+                        IdempotencyResult.New(idempotencyKey, now, claimId),
                       )
 
                 case None =>
@@ -273,10 +299,11 @@ object IdempotencyStore:
                     ttl = now.getEpochSecond + ttlSeconds,
                     version = 1,
                     requestHash = requestHash,
+                    claimId = Some(claimId),
                   )
                   (
                     records + (idempotencyKey -> newRecord),
-                    IdempotencyResult.New(idempotencyKey, now),
+                    IdempotencyResult.New(idempotencyKey, now, claimId),
                   )
             }
           yield result
@@ -285,40 +312,44 @@ object IdempotencyStore:
             idempotencyKey: String,
             clientId: String,
             response: StoredResponse,
+            claimId: Option[String] = None,
         ): F[Boolean] =
           for
             now <- Clock[F].realTime.map(d => Instant.ofEpochMilli(d.toMillis))
-            result <- stateRef.modify(records =>
+            result <- stateRef.modify { records =>
               records.get(idempotencyKey) match
                 case Some(existing)
                     if existing.status == IdempotencyStatus.Pending &&
-                      existing.clientId == clientId && !existing.expired(now) =>
+                      existing.clientId == clientId && !existing.expired(now) &&
+                      claimId.forall(existing.claimId.contains) =>
                   val updated = existing.copy(
                     status = IdempotencyStatus.Completed,
                     response = Some(response),
                     updatedAt = now,
                   )
                   (records + (idempotencyKey -> updated), true)
-                case _ => (records, false),
-            )
+                case _ => (records, false)
+            }
           yield result
 
         override def markFailed(
             idempotencyKey: String,
             clientId: String,
+            claimId: Option[String] = None,
         ): F[Boolean] =
           for
             now <- Clock[F].realTime.map(d => Instant.ofEpochMilli(d.toMillis))
-            result <- stateRef.modify(records =>
+            result <- stateRef.modify { records =>
               records.get(idempotencyKey) match
                 case Some(existing)
                     if existing.status == IdempotencyStatus.Pending &&
-                      existing.clientId == clientId && !existing.expired(now) =>
+                      existing.clientId == clientId && !existing.expired(now) &&
+                      claimId.forall(existing.claimId.contains) =>
                   val updated = existing
                     .copy(status = IdempotencyStatus.Failed, updatedAt = now)
                   (records + (idempotencyKey -> updated), true)
-                case _ => (records, false),
-            )
+                case _ => (records, false)
+            }
           yield result
 
         override def get(idempotencyKey: String): F[Option[IdempotencyRecord]] =

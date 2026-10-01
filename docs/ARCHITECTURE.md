@@ -128,7 +128,7 @@ All three stores run the same loop ([ADR-004](adr/004-occ-over-pessimistic-locki
 [ResilientRateLimitStore](../src/main/scala/resilience/ResilientWrapper.scala) wraps the store in four layers, outermost first:
 
 - **Bulkhead** `ratelimit-operations`: at most `resilience.bulkhead.max-concurrent` (100) calls in flight, and a caller waits up to `max-wait` (500 ms) for a permit. Only the wait is bounded. Once admitted, a call runs to completion, so a slow backend does not cancel writes in flight.
-- **Circuit breaker** `dynamodb-ratelimit` ([ADR-002](adr/002-hand-rolled-circuit-breaker.md), [CircuitBreaker](../src/main/scala/resilience/CircuitBreaker.scala)). It opens after `max-failures` (20) consecutive counted failures, refuses without calling DynamoDB for `reset-timeout` (30 s), then lets one probe through at a time. A successful probe closes it; a counted failure reopens it.
+- **Circuit breaker** `dynamodb-ratelimit` ([ADR-002](adr/002-hand-rolled-circuit-breaker.md), [CircuitBreaker](../src/main/scala/resilience/CircuitBreaker.scala)). It opens after `max-failures` (20) consecutive counted failures, refuses without calling DynamoDB for `reset-timeout` (30 s), then lets up to `half-open-max-calls` (3) probes through at once. A successful probe closes it; a counted failure reopens it.
   - One breaker guards every key, so it counts only evidence that DynamoDB failed. OCC conflicts, corrupt items, conditional-check failures, and load already shed do not count; otherwise one contended key could open it for every tenant.
   - `max-failures` was 5. At production concurrency a single slow second put more than 5 calls in flight before a success could reset the count.
   - Its state is recorded as `CircuitBreakerState` after every call, including refused ones.
@@ -168,10 +168,11 @@ t1:<length of clientId>:<clientId>:<caller's key>
   - the record is gone by the read, because TTL deleted it between the put and the get;
   - the record now reads `Failed`, because its owner failed it after the claim lost. Answering `new` here without claiming once let two callers both run the operation.
 - **Replay.** A `duplicate` answer carries the stored `statusCode`, `body`, and `headers` as `originalResponse` in the JSON body; the caller replays them. The stored response is kept inline in the item, and replay is not streamed.
-- **Complete and fail.** Each is one `UpdateItem` conditioned on `status = Pending AND clientId = <caller>`.
+- **Complete and fail.** Each is one `UpdateItem` conditioned on `status = Pending AND clientId = <caller>` and on the record not having expired.
   - Complete sets `Completed` and stores the response.
   - Fail sets `Failed`, so the next check claims the key again.
-  - Either answers 409 when the record is missing, not pending, or another client's. A `Completed` record is never reopened, because its operation ran.
+  - Either answers 409 when the record is missing, not pending, expired, or another client's. A `Completed` record is never reopened, because its operation ran.
+- **Claim token.** Each winning claim writes a random `claimId` on the record, and `check` returns it with `new` ([ADR-006](adr/006-idempotency-claim-token.md)). A complete or fail that carries one adds `claimId = <sent>` to its condition, so a run that outlived its TTL cannot end the claim of the run that replaced it. The token is optional; a call without one is conditioned as above.
 - **Size cap.** Complete measures the response as encoded JSON, so escaping and headers count. Above 350 KB (`350 × 1024` bytes) it answers 413, stores nothing, and the key stays `Pending`. A DynamoDB item holds at most 400 KB, and a larger write used to fail and answer 503 as if the store were down.
 - **TTL.** `ttl` is the check time plus the requested TTL, which defaults to `idempotency.default-ttl-seconds` and is capped at `max-ttl-seconds` (both 86,400). DynamoDB's TTL process deletes expired items lazily, so the store checks expiry itself: the claim also succeeds on `ttl < now`, and `get` reads an expired record as absent. A crashed owner's key becomes claimable when its TTL passes.
 - **No lease on `Pending`.** A record stays `Pending` until its owner completes or fails it, or TTL removes it. A crashed owner leaves the key answering `in_progress` until then.

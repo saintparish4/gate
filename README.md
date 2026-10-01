@@ -723,7 +723,8 @@ terraform output api_endpoint
   [hand-rolled circuit breaker](docs/adr/002-hand-rolled-circuit-breaker.md),
   [fire-and-forget event publishing](docs/adr/003-fire-and-forget-event-publishing.md),
   [OCC over pessimistic locking](docs/adr/004-occ-over-pessimistic-locking.md),
-  [tenant-namespaced storage keys](docs/adr/005-tenant-namespaced-storage-keys.md)
+  [tenant-namespaced storage keys](docs/adr/005-tenant-namespaced-storage-keys.md),
+  [idempotency claim token](docs/adr/006-idempotency-claim-token.md)
 
 ## Technology stack
 

@@ -147,19 +147,16 @@ class DashboardApi[F[_]: Async](
       for
         profile <- getProfile
         maybeStatus <- rateLimitStore.getStatus(demoKey, profile)
-        response <- maybeStatus match
-          case Some(state) => Ok(Json.obj(
-              "tokensRemaining" -> Json.fromInt(state.tokensRemaining),
-              "limit" -> Json.fromInt(profile.capacity),
-              "resetAt" -> Json.fromString(""),
-            ))
-          case None =>
-            // Bucket not yet created — report full capacity
-            Ok(Json.obj(
-              "tokensRemaining" -> Json.fromInt(profile.capacity),
-              "limit" -> Json.fromInt(profile.capacity),
-              "resetAt" -> Json.fromString(""),
-            ))
+        now <- Clock[F].realTime.map(d => Instant.ofEpochMilli(d.toMillis))
+        // resetAt was always "". It is the store's value, as on
+        // /v1/ratelimit/status; a bucket not yet created is full, so it
+        // resets now.
+        response <- Ok(Json.obj(
+          "tokensRemaining" ->
+            Json.fromInt(maybeStatus.fold(profile.capacity)(_.tokensRemaining)),
+          "limit" -> Json.fromInt(profile.capacity),
+          "resetAt" -> Json.fromString(maybeStatus.fold(now)(_.resetAt).toString),
+        ))
       yield response
 
     // GET /dashboard/api/stats — Server-Sent Events stream for real-time updates

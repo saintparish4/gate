@@ -13,10 +13,9 @@ Every route, field, status code and header below is taken from the code under
 - **Fields:** outside the demo dashboard, every response field shown below is
   always present. An optional value that does not apply is `null` (responses
   are printed with nulls kept).
-- **`X-Request-Id`:** a response produced by a route (including the 401, 403
-  and 429 answers from authentication) echoes the request's `X-Request-Id`, or
-  a generated UUID when the request had none. The 400/422 body-decoding
-  answers and any 500 do not carry it.
+- **`X-Request-Id`:** every response echoes the request's `X-Request-Id`, or a
+  generated UUID when the request had none. That includes the 401, 403 and 429
+  answers from authentication, the 400/422 body-decoding answers, and a 500.
 - **Errors:** every answer that is not a 2xx has a JSON body with `error` (a
   stable code) and `message` (text for a person). See [Errors](#errors).
 - **Tenancy:** every key a caller names (rate-limit key, idempotency key,
@@ -303,9 +302,11 @@ in the `gate_degraded_total` metric.
 
 The flow:
 
-1. `check` the key. `new` means you now own it: run the operation.
+1. `check` the key. `new` means you now own it: keep the `claimId` it
+   returns, and run the operation.
 2. When it succeeds, `complete` the key with the response to replay. When it
-   fails without effect, `fail` the key so a retry can claim it.
+   fails without effect, `fail` the key so a retry can claim it. Send the
+   `claimId` with either ([why](#the-claim-id)).
 3. Later checks answer `in_progress` while the key is pending, `duplicate`
    with the stored response once it is completed, and `conflict` when the
    `requestBody` differs from the one that claimed it.
@@ -362,7 +363,8 @@ without one, never conflicts.
   },
   "firstSeenAt": "2026-09-27T11:58:02.114Z",
   "message": null,
-  "error": null
+  "error": null,
+  "claimId": null
 }
 ```
 
@@ -374,8 +376,22 @@ without one, never conflicts.
 | `firstSeenAt` | string (ISO-8601) or null | When the key was claimed; set for `in_progress` and `duplicate` |
 | `message` | string or null | `in_progress`: `"Operation is currently being processed"`. `conflict`: `"Request body does not match the original request for this idempotency key"`. |
 | `error` | string or null | `idempotency_conflict` on the 409; `null` otherwise |
+| `claimId` | string or null | Set on `new` only: a UUID naming this claim. Send it back on `complete` or `fail`. |
 
-A `new` answer is `{"status": "new", "idempotencyKey": "...", "originalResponse": null, "firstSeenAt": null, "message": null, "error": null}`.
+A `new` answer is `{"status": "new", "idempotencyKey": "...", "originalResponse": null, "firstSeenAt": null, "message": null, "error": null, "claimId": "0b9d6c1e-6a1f-4c55-9b0e-2f5a8f4f7d21"}`.
+
+#### The claim ID
+
+A key can be claimed more than once: after it is failed, and after its TTL
+passes. Both claims are yours, so without the ID a slow first run's late
+`complete` would store its response on the second run's claim, and its late
+`fail` would release that claim while the second run is still going. With the
+`claimId`, `complete` and `fail` apply only to the claim that was issued it;
+for any other they answer 409 `not_pending`
+([ADR-006](adr/006-idempotency-claim-token.md)).
+
+The ID is optional. A call without one is accepted on any pending claim of
+yours for the key, as before.
 
 **503:** `storage_unavailable` (the store failed or timed out, or the claim
 lost its retries to concurrent changes of the record) or `storage_corruption`
@@ -408,11 +424,12 @@ as given; it does not interpret them.
 | `statusCode` | integer | yes | Status to replay |
 | `body` | string | yes | Body to replay |
 | `headers` | object of strings | no | Headers to replay; `{}` if omitted |
+| `claimId` | string | no | The `claimId` from the `new` answer. When sent, only that claim is completed. |
 
 | Status | Body | Cause |
 |--------|------|-------|
 | `200` | `{"idempotencyKey": "payment:abc-123", "status": "completed", "message": null, "error": null}` | Stored |
-| `409` | `{"idempotencyKey": "...", "status": "conflict", "message": "Could not store response - key may not exist or is not pending", "error": "not_pending"}` | No pending key of yours by that name: never claimed, already completed, failed, expired, or another client's |
+| `409` | `{"idempotencyKey": "...", "status": "conflict", "message": "Could not store response - key may not exist or is not pending", "error": "not_pending"}` | No pending key of yours by that name: never claimed, already completed, failed, expired, or another client's. With a `claimId`: also when the key was claimed again since that ID was issued (the message says so). |
 | `413` | `{"error": "response_too_large", "message": "The response to store is 412345 bytes encoded; ..."}` | The stored response would exceed 358,400 bytes (350 KiB). The key stays pending: store a smaller response, such as a reference to the result, or fail the key. |
 | `503` | `{"error": "storage_unavailable", ...}` | Store failure or timeout |
 
@@ -431,14 +448,17 @@ curl -s -X POST http://localhost:8080/v1/idempotency/payment:abc-123/complete \
 
 ### `POST /v1/idempotency/{key}/fail`
 
-**Permission:** `IdempotencyComplete`. No body. Releases a pending key after its
+**Permission:** `IdempotencyComplete`. Releases a pending key after its
 operation failed without effect, so the next check answers `new` and the
 caller can retry. A completed key is never reopened: its operation ran.
+
+The body is optional: none, or `{"claimId": "..."}` with the `claimId` from
+the `new` answer. When sent, only that claim is released.
 
 | Status | Body | Cause |
 |--------|------|-------|
 | `200` | `{"idempotencyKey": "payment:abc-123", "status": "failed", "message": null, "error": null}` | Released |
-| `409` | `{"idempotencyKey": "...", "status": "conflict", "message": "Could not mark failed - key may not exist or is not pending", "error": "not_pending"}` | No pending key of yours by that name |
+| `409` | `{"idempotencyKey": "...", "status": "conflict", "message": "Could not mark failed - key may not exist or is not pending", "error": "not_pending"}` | No pending key of yours by that name; or, with a `claimId`, the key was claimed again since that ID was issued |
 | `503` | `{"error": "storage_unavailable", ...}` | Store failure or timeout |
 
 ```bash
@@ -667,7 +687,7 @@ store, starting from `rate-limit.default-*` (100 tokens, 10/s).
 | `GET` | `/dashboard/api/config` | `{"capacity", "refillRatePerSecond", "ttlSeconds"}` of the demo bucket |
 | `POST` | `/dashboard/api/config` | Body with the same three fields, each above 0. Answers them plus `"message": "Configuration updated successfully"`, or `400 {"error": "validation_error", "message": "<reason>"}`. |
 | `POST` | `/dashboard/api/check` | Consumes 1 token. Always `200`: `allowed`, `tokensRemaining`, `limit`, `resetAt`, plus `retryAfter` when refused |
-| `GET` | `/dashboard/api/status` | `tokensRemaining`, `limit`, and `resetAt` (always `""`) |
+| `GET` | `/dashboard/api/status` | `tokensRemaining`, `limit`, and `resetAt` (the store's value; the current time for a bucket not yet created) |
 | `GET` | `/dashboard/api/stats` | Server-sent events every 500 ms: `{"tokensRemaining", "limit", "timestamp"}` (epoch ms) |
 | `GET` | `/v1/ratelimit/dashboard/stats` | Server-sent events: each event the service publishes (rate-limit decisions, idempotency and quota events, audit events), as JSON with an `event_type` field. They pass through a 512-event queue: events are dropped while it is full, and concurrent viewers split the stream between them. |
 
@@ -705,7 +725,7 @@ unknown path, a body that cannot be decoded, and an unhandled failure.
 | 404 | `not_found` | Any path | No route matches; or a quota route with quotas disabled, or `/metrics` with Prometheus disabled |
 | 404 | `reservation_not_found` | `POST /v1/quota/reconcile` | Unknown, expired, or another client's reservation |
 | 409 | `idempotency_conflict` | `POST /v1/idempotency/check` | `requestBody` differs from the one that claimed the key |
-| 409 | `not_pending` | `POST /v1/idempotency/{key}/complete`, `/fail` | No pending key of yours by that name |
+| 409 | `not_pending` | `POST /v1/idempotency/{key}/complete`, `/fail` | No pending key of yours by that name, or the `claimId` sent is not the current claim's |
 | 409 | `already_reconciled` | `POST /v1/quota/reconcile` | Reconciled before with different usage |
 | 413 | `response_too_large` | `POST /v1/idempotency/{key}/complete` | Stored response over 358,400 bytes encoded |
 | 422 | `invalid_request` | Any route with a body | JSON without a required field, or a field of the wrong type. `message` names the field's path (`.cost`), never its value. |
@@ -732,10 +752,10 @@ Each point follows from the behavior above.
 - **Idempotency:** run the operation only on `new`, and finish every claimed
   key with `complete` or `fail`, or it answers `in_progress` until its TTL
   passes. A 503 means the state is unknown: do not run the operation.
-  Choose a TTL longer than the operation can take. Once it passes, `complete`
-  and `fail` answer 409 and the next check answers `new`; and if that check
-  has already reclaimed the key, a late `complete` from the first run is
-  accepted as the second's, because both come from the same client.
+  Choose a TTL longer than the operation can take: once it passes, the next
+  check answers `new` and the operation runs again. Send the `claimId` on
+  `complete` and `fail`, so a run that outlived its TTL gets a 409 instead of
+  ending the claim of the run that replaced it.
 - **Quota:** keep the check's `reservationId` and reconcile with it. After a
   503 on reconcile, send the same request again after `Retry-After`; a repeat
   with the same usage is safe. A 503 on check means you were not admitted.

@@ -240,9 +240,13 @@ class DynamoDBStoreErrorSpec
             key: String,
             clientId: String,
             response: StoredResponse,
+            claimId: Option[String],
         ): IO[Boolean] = IO.pure(false)
-        def markFailed(key: String, clientId: String): IO[Boolean] = IO
-          .pure(false)
+        def markFailed(
+            key: String,
+            clientId: String,
+            claimId: Option[String],
+        ): IO[Boolean] = IO.pure(false)
         def get(key: String): IO[Option[IdempotencyRecord]] = IO.pure(None)
         def healthCheck: IO[Either[String, Unit]] = IO.pure(Right(()))
 

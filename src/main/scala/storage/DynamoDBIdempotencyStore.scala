@@ -6,6 +6,7 @@ import scala.jdk.CollectionConverters.*
 import scala.jdk.FutureConverters.*
 
 import cats.effect.*
+import cats.effect.std.UUIDGen
 import cats.syntax.all.*
 import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient
 import software.amazon.awssdk.services.dynamodb.model.*
@@ -29,6 +30,8 @@ import DynamoDBOps.*
   *     scoped to the client by core.TenantKey (ADR-005)
   *   - clientId (S): Client that created the record; completing it requires the
   *     same client
+  *   - claimId (S): The claim that created the record (ADR-006); a complete or
+  *     fail that names one must match it
   *   - status (S): Pending | Completed | Failed
   *   - response (S): JSON-encoded response (if completed)
   *   - createdAt (N): Creation timestamp
@@ -77,66 +80,73 @@ class DynamoDBIdempotencyStore[F[_]: Async](
         ))
     for
       now <- Clock[F].realTime.map(d => Instant.ofEpochMilli(d.toMillis))
-      result <-
-        tryCreatePending(idempotencyKey, clientId, now, ttlSeconds, requestHash)
-          .flatMap {
-            case true => Async[F].pure(IdempotencyResult.New(idempotencyKey, now))
-            case false => get(idempotencyKey).flatMap {
-                case Some(record) => record.status match
-                    case IdempotencyStatus.Pending => requestHash match
-                        case Some(incoming) =>
-                          val stored = record.requestHash
-                          if stored.contains(incoming) || stored.isEmpty then
-                            Async[F].pure(
-                              IdempotencyResult
-                                .InProgress(idempotencyKey, record.createdAt),
-                            )
-                          else
-                            Async[F].pure(IdempotencyResult.KeyConflict(
-                              idempotencyKey,
-                              stored,
-                              Some(incoming),
-                            ))
-                        case None => Async[F].pure(
-                            IdempotencyResult
-                              .InProgress(idempotencyKey, record.createdAt),
-                          )
-                    case IdempotencyStatus.Completed => requestHash match
-                        case Some(incoming) =>
-                          val stored = record.requestHash
-                          if stored.contains(incoming) || stored.isEmpty then
-                            Async[F].pure(IdempotencyResult.Duplicate(
-                              idempotencyKey,
-                              record.response,
-                              record.createdAt,
-                            ))
-                          else
-                            Async[F].pure(IdempotencyResult.KeyConflict(
-                              idempotencyKey,
-                              stored,
-                              Some(incoming),
-                            ))
-                        case None => Async[F].pure(IdempotencyResult.Duplicate(
-                            idempotencyKey,
-                            record.response,
-                            record.createdAt,
-                          ))
-                    // Failed after our claim lost to its Pending owner. This
-                    // answered New without claiming, so a caller whose claim
-                    // on the Failed record did win was also told New, and both
-                    // ran the operation. Exposing markFailed made it reachable.
-                    case IdempotencyStatus.Failed => reclaim
-                // Deleted by TTL between tryCreatePending and get, or expired
-                // by then (the claim condition checks an earlier now).
-                case None => reclaim
-              }
+      // A new ID per attempt: it is stored only if this attempt's claim wins.
+      claimId <- UUIDGen[F].randomUUID.map(_.toString)
+      result <- tryCreatePending(
+        idempotencyKey,
+        clientId,
+        now,
+        ttlSeconds,
+        requestHash,
+        claimId,
+      ).flatMap {
+        case true => Async[F]
+            .pure(IdempotencyResult.New(idempotencyKey, now, claimId))
+        case false => get(idempotencyKey).flatMap {
+            case Some(record) => record.status match
+                case IdempotencyStatus.Pending => requestHash match
+                    case Some(incoming) =>
+                      val stored = record.requestHash
+                      if stored.contains(incoming) || stored.isEmpty then
+                        Async[F].pure(
+                          IdempotencyResult
+                            .InProgress(idempotencyKey, record.createdAt),
+                        )
+                      else
+                        Async[F].pure(
+                          IdempotencyResult
+                            .KeyConflict(idempotencyKey, stored, Some(incoming)),
+                        )
+                    case None => Async[F].pure(
+                        IdempotencyResult
+                          .InProgress(idempotencyKey, record.createdAt),
+                      )
+                case IdempotencyStatus.Completed => requestHash match
+                    case Some(incoming) =>
+                      val stored = record.requestHash
+                      if stored.contains(incoming) || stored.isEmpty then
+                        Async[F].pure(IdempotencyResult.Duplicate(
+                          idempotencyKey,
+                          record.response,
+                          record.createdAt,
+                        ))
+                      else
+                        Async[F].pure(
+                          IdempotencyResult
+                            .KeyConflict(idempotencyKey, stored, Some(incoming)),
+                        )
+                    case None => Async[F].pure(IdempotencyResult.Duplicate(
+                        idempotencyKey,
+                        record.response,
+                        record.createdAt,
+                      ))
+                // Failed after our claim lost to its Pending owner. This
+                // answered New without claiming, so a caller whose claim
+                // on the Failed record did win was also told New, and both
+                // ran the operation. Exposing markFailed made it reachable.
+                case IdempotencyStatus.Failed => reclaim
+            // Deleted by TTL between tryCreatePending and get, or expired
+            // by then (the claim condition checks an earlier now).
+            case None => reclaim
           }
+      }
     yield result
 
   override def storeResponse(
       idempotencyKey: String,
       clientId: String,
       response: StoredResponse,
+      claimId: Option[String] = None,
   ): F[Boolean] =
     for
       now <- Clock[F].realTime.map(d => Instant.ofEpochMilli(d.toMillis))
@@ -145,18 +155,18 @@ class DynamoDBIdempotencyStore[F[_]: Async](
         .key(Map("pk" -> attr(s"idempotency#$idempotencyKey")).asJava)
         .updateExpression(
           "SET #status = :status, #response = :response, #updatedAt = :updatedAt, #version = #version + :one",
-        ).conditionExpression(DynamoDBIdempotencyStore.LivePendingOwnedBy)
+        ).conditionExpression(DynamoDBIdempotencyStore.endCondition(claimId))
         .expressionAttributeNames(
-          Map(
+          (Map(
             "#status" -> "status",
             "#response" -> "response",
             "#updatedAt" -> "updatedAt",
             "#version" -> "version",
             "#clientId" -> "clientId",
             "#ttl" -> "ttl",
-          ).asJava,
+          ) ++ claimId.map(_ => "#claimId" -> "claimId")).asJava,
         ).expressionAttributeValues(
-          Map(
+          (Map(
             ":status" -> attr("Completed"),
             ":response" -> attr(response.asJson.noSpaces),
             ":updatedAt" -> attrN(now.toEpochMilli),
@@ -164,7 +174,7 @@ class DynamoDBIdempotencyStore[F[_]: Async](
             ":one" -> attrN(1),
             ":clientId" -> attr(clientId),
             ":now" -> attrN(now.getEpochSecond),
-          ).asJava,
+          ) ++ claimId.map(id => ":claimId" -> attr(id))).asJava,
         ).build()
 
       result <- conditionalUpdate(client, request)
@@ -177,6 +187,7 @@ class DynamoDBIdempotencyStore[F[_]: Async](
   override def markFailed(
       idempotencyKey: String,
       clientId: String,
+      claimId: Option[String] = None,
   ): F[Boolean] =
     for
       now <- Clock[F].realTime.map(d => Instant.ofEpochMilli(d.toMillis))
@@ -185,24 +196,24 @@ class DynamoDBIdempotencyStore[F[_]: Async](
         .key(Map("pk" -> attr(s"idempotency#$idempotencyKey")).asJava)
         .updateExpression(
           "SET #status = :status, #updatedAt = :updatedAt, #version = #version + :one",
-        ).conditionExpression(DynamoDBIdempotencyStore.LivePendingOwnedBy)
+        ).conditionExpression(DynamoDBIdempotencyStore.endCondition(claimId))
         .expressionAttributeNames(
-          Map(
+          (Map(
             "#status" -> "status",
             "#updatedAt" -> "updatedAt",
             "#version" -> "version",
             "#clientId" -> "clientId",
             "#ttl" -> "ttl",
-          ).asJava,
+          ) ++ claimId.map(_ => "#claimId" -> "claimId")).asJava,
         ).expressionAttributeValues(
-          Map(
+          (Map(
             ":status" -> attr("Failed"),
             ":updatedAt" -> attrN(now.toEpochMilli),
             ":pending" -> attr("Pending"),
             ":one" -> attrN(1),
             ":clientId" -> attr(clientId),
             ":now" -> attrN(now.getEpochSecond),
-          ).asJava,
+          ) ++ claimId.map(id => ":claimId" -> attr(id))).asJava,
         ).build()
 
       result <- conditionalUpdate(client, request)
@@ -244,12 +255,14 @@ class DynamoDBIdempotencyStore[F[_]: Async](
       now: Instant,
       ttlSeconds: Long,
       requestHash: Option[String],
+      claimId: String,
   ): F[Boolean] =
     val ttl = now.getEpochSecond + ttlSeconds
 
     val baseItem = Map(
       "pk" -> attr(s"idempotency#$idempotencyKey"),
       "clientId" -> attr(clientId),
+      "claimId" -> attr(claimId),
       "status" -> attr("Pending"),
       "createdAt" -> attrN(now.toEpochMilli),
       "updatedAt" -> attrN(now.toEpochMilli),
@@ -332,6 +345,7 @@ class DynamoDBIdempotencyStore[F[_]: Async](
       ttl = ttl.getOrElse(Long.MaxValue),
       version = version.getOrElse(0L),
       requestHash = requestHash,
+      claimId = item.get("claimId").map(_.s()),
     )
 
 object DynamoDBIdempotencyStore:
@@ -344,6 +358,15 @@ object DynamoDBIdempotencyStore:
     */
   private val LivePendingOwnedBy =
     "#status = :pending AND #clientId = :clientId AND (attribute_not_exists(#ttl) OR #ttl >= :now)"
+
+  /** With a claim ID the record must also be that claim's (ADR-006): a key
+    * reclaimed after expiry is live, Pending, and the same client's, so nothing
+    * else tells the first run's late call from the second run's. A record with
+    * no `claimId` attribute never matches one.
+    */
+  private def endCondition(claimId: Option[String]): String = claimId.fold(
+    LivePendingOwnedBy,
+  )(_ => s"$LivePendingOwnedBy AND #claimId = :claimId")
 
   def apply[F[_]: Async](
       client: DynamoDbAsyncClient,

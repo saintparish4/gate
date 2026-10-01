@@ -149,6 +149,49 @@ class InMemoryIdempotencyStoreSpec
       }.asserting(_ shouldBe List.fill(2)((false, false, true)))
     }
 
+    // ADR-006, in both in-memory interpreters: a reclaimed key is live,
+    // Pending, and the same client's, so only the claim ID separates the first
+    // run's late call from the second run's.
+    "a late complete or fail naming the first claim is refused on a reclaimed key" in {
+      val late = StoredResponse(200, "first run", Map.empty, Instant.EPOCH)
+      def claimIdOf(result: IdempotencyResult): Option[String] = result match {
+        case IdempotencyResult.New(_, _, claimId) => Some(claimId)
+        case _ => None
+      }
+      val stores = List(
+        core.IdempotencyStore.inMemory[IO],
+        InMemoryIdempotencyStore.create[IO].widen[core.IdempotencyStore[IO]],
+      )
+      stores.traverse {
+        _.flatMap { store =>
+          for {
+            // Failed and claimed again, which both interpreters treat as a
+            // reclaim; only the core one also reclaims on expiry.
+            first <- store.check("k", clientId = "c", ttlSeconds = 3600)
+            _ <- store.markFailed("k", "c", claimIdOf(first))
+            second <- store.check("k", clientId = "c", ttlSeconds = 3600)
+            completed <- store.storeResponse("k", "c", late, claimIdOf(first))
+            failed <- store.markFailed("k", "c", claimIdOf(first))
+            pending <- store.get("k").map(_.map(_.status))
+            own <- store.storeResponse("k", "c", late, claimIdOf(second))
+            unfenced <- store.check("u", clientId = "c", ttlSeconds = 3600) *>
+              store.storeResponse("u", "c", late)
+          } yield (
+            claimIdOf(first).isDefined && claimIdOf(first) != claimIdOf(second),
+            completed,
+            failed,
+            pending,
+            own,
+            unfenced,
+          )
+        }
+      }.asserting(
+        _ shouldBe List.fill(2)(
+          (true, false, false, Some(IdempotencyStatus.Pending), true, true),
+        ),
+      )
+    }
+
     "markFailed applies only to its owner's pending record" in {
       val test = for {
         store <- InMemoryIdempotencyStore.create[IO]

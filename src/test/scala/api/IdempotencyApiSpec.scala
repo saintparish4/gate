@@ -27,6 +27,11 @@ import io.circe.parser.*
   */
 class IdempotencyApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
 
+  /** The fail route's request: no body, as it always was, or a claim ID. */
+  private def failRequest(claimId: Option[String] = None): Request[IO] =
+    val request = Request[IO](Method.POST, uri"/v1/idempotency/k/fail")
+    claimId.fold(request)(id => request.withEntity(s"""{"claimId": "$id"}"""))
+
   "IdempotencyApi TTL capping" - {
 
     "should pass capped TTL to store when client requests TTL above max" in {
@@ -46,17 +51,22 @@ class IdempotencyApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
                 requestHash: Option[String] = None,
             ): IO[IdempotencyResult] = capturedTtl.set(Some(ttlSeconds)) *>
               Clock[IO].realTime.map(d =>
-                IdempotencyResult
-                  .New(idempotencyKey, Instant.ofEpochMilli(d.toMillis)),
+                IdempotencyResult.New(
+                  idempotencyKey,
+                  Instant.ofEpochMilli(d.toMillis),
+                  "claim-1",
+                ),
               )
             override def storeResponse(
                 idempotencyKey: String,
                 clientId: String,
                 response: StoredResponse,
+                claimId: Option[String],
             ): IO[Boolean] = IO.pure(false)
             override def markFailed(
                 idempotencyKey: String,
                 clientId: String,
+                claimId: Option[String],
             ): IO[Boolean] = IO.pure(false)
             override def get(
                 idempotencyKey: String,
@@ -145,16 +155,18 @@ class IdempotencyApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
                 requestHash: Option[String] = None,
             ): IO[IdempotencyResult] = Clock[IO].realTime.map(d =>
               IdempotencyResult
-                .New(idempotencyKey, Instant.ofEpochMilli(d.toMillis)),
+                .New(idempotencyKey, Instant.ofEpochMilli(d.toMillis), "claim-1"),
             )
             override def storeResponse(
                 idempotencyKey: String,
                 clientId: String,
                 response: StoredResponse,
+                claimId: Option[String],
             ): IO[Boolean] = IO.pure(false)
             override def markFailed(
                 idempotencyKey: String,
                 clientId: String,
+                claimId: Option[String],
             ): IO[Boolean] = IO.pure(false)
             override def get(
                 idempotencyKey: String,
@@ -202,10 +214,12 @@ class IdempotencyApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
               idempotencyKey: String,
               clientId: String,
               response: StoredResponse,
+              claimId: Option[String],
           ): IO[Boolean] = IO.raiseError(ex)
           override def markFailed(
               idempotencyKey: String,
               clientId: String,
+              claimId: Option[String],
           ): IO[Boolean] = IO.raiseError(ex)
           override def get(
               idempotencyKey: String,
@@ -241,7 +255,7 @@ class IdempotencyApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
 
       "maps a store failure on fail the same way" in {
         val api = apiWith(failingStore(new RuntimeException("pool exhausted")))
-        api.fail("k-1", testClient)
+        api.fail("k-1", failRequest(), testClient)
           .asserting(_.status shouldBe Status.ServiceUnavailable)
       }
 
@@ -337,7 +351,7 @@ class IdempotencyApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
       for
         api <- IdempotencyStore.inMemory[IO].map(apiWith)
         first <- check(api, testClient, "fail-1")
-        failed <- api.fail("fail-1", testClient)
+        failed <- api.fail("fail-1", failRequest(), testClient)
         retried <- check(api, testClient, "fail-1")
       yield
         first shouldBe Some("new")
@@ -349,7 +363,7 @@ class IdempotencyApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
       for
         api <- IdempotencyStore.inMemory[IO].map(apiWith)
         _ <- check(api, testClient, "fail-2")
-        forged <- api.fail("fail-2", other)
+        forged <- api.fail("fail-2", failRequest(), other)
         after <- check(api, testClient, "fail-2")
       yield
         forged.status shouldBe Status.Conflict
@@ -361,11 +375,119 @@ class IdempotencyApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
         api <- IdempotencyStore.inMemory[IO].map(apiWith)
         _ <- check(api, testClient, "fail-3")
         _ <- complete(api, "fail-3", "done")
-        refused <- api.fail("fail-3", testClient)
+        refused <- api.fail("fail-3", failRequest(), testClient)
         after <- check(api, testClient, "fail-3")
       yield
         refused.status shouldBe Status.Conflict
         after shouldBe Some("duplicate")
+    }
+  }
+
+  "IdempotencyApi — claim token" - {
+    // ADR-006. A key that fails or expires is claimed again by the same
+    // client, so only the claim ID tells a first run's late call from the
+    // second run's.
+
+    def apiWith(store: IdempotencyStore[IO]): IdempotencyApi[IO] =
+      IdempotencyApi[IO](
+        store,
+        IdempotencyConfig(defaultTtlSeconds = 3600, maxTtlSeconds = 86400),
+        EventPublisher.noop[IO],
+        MetricsPublisher.noop[IO],
+        org.typelevel.log4cats.noop.NoOpLogger[IO],
+        () => IO.pure("test-request-id"),
+      )
+
+    def json(response: Response[IO]): IO[io.circe.Json] = response.bodyText
+      .compile.string.flatMap(body => IO.fromEither(parse(body)))
+
+    def check(api: IdempotencyApi[IO], key: String): IO[io.circe.Json] = api
+      .check(
+        Request[IO](Method.POST, uri"/v1/idempotency/check")
+          .withEntity(s"""{"idempotencyKey": "$key"}"""),
+        testClient,
+      ).flatMap(json)
+
+    def claimId(answer: io.circe.Json): Option[String] = answer.hcursor
+      .get[Option[String]]("claimId").toOption.flatten
+
+    def complete(api: IdempotencyApi[IO], key: String, claim: Option[String]) =
+      api.complete(
+        key,
+        Request[IO](Method.POST, uri"/v1/idempotency/k/complete").withEntity(
+          io.circe.Json.obj(
+            "statusCode" -> io.circe.Json.fromInt(200),
+            "body" -> io.circe.Json.fromString("done"),
+            "claimId" -> claim.fold(io.circe.Json.Null)(io.circe.Json.fromString),
+          ).noSpaces,
+        ),
+        testClient,
+      )
+
+    "check answers a claimId on new, and none to a caller that did not win the claim" in {
+      for
+        api <- IdempotencyStore.inMemory[IO].map(apiWith)
+        won <- check(api, "claim-1")
+        lost <- check(api, "claim-1")
+      yield
+        won.hcursor.get[String]("status").toOption shouldBe Some("new")
+        claimId(won) shouldBe defined
+        lost.hcursor.get[String]("status").toOption shouldBe Some("in_progress")
+        claimId(lost) shouldBe None
+        // Present and null, like every other field that does not apply.
+        lost.hcursor.downField("claimId").focus shouldBe Some(io.circe.Json.Null)
+    }
+
+    "a first run's late complete or fail is 409 not_pending on a key claimed again" in {
+      for
+        api <- IdempotencyStore.inMemory[IO].map(apiWith)
+        first <- check(api, "claim-2").map(claimId)
+        _ <- api.fail("claim-2", failRequest(first), testClient)
+        second <- check(api, "claim-2").map(claimId)
+        lateComplete <- complete(api, "claim-2", first)
+        lateCompleteBody <- json(lateComplete)
+        lateFail <- api.fail("claim-2", failRequest(first), testClient)
+        still <- check(api, "claim-2")
+        own <- complete(api, "claim-2", second)
+      yield
+        first shouldBe defined
+        second shouldBe defined
+        first should not be second
+        lateComplete.status shouldBe Status.Conflict
+        lateCompleteBody.hcursor.get[String]("error").toOption shouldBe
+          Some("not_pending")
+        lateCompleteBody.hcursor.get[String]("message").toOption
+          .exists(_.contains("claimId")) shouldBe true
+        lateFail.status shouldBe Status.Conflict
+        still.hcursor.get[String]("status").toOption shouldBe Some("in_progress")
+        own.status shouldBe Status.Ok
+    }
+
+    "complete and fail without a claimId still work" in {
+      for
+        api <- IdempotencyStore.inMemory[IO].map(apiWith)
+        _ <- check(api, "claim-3")
+        completed <- complete(api, "claim-3", None)
+        _ <- check(api, "claim-4")
+        failed <- api.fail("claim-4", failRequest(), testClient)
+      yield
+        completed.status shouldBe Status.Ok
+        failed.status shouldBe Status.Ok
+    }
+
+    "a fail body that is not JSON, or has the wrong type, is a body failure, not a 409" in {
+      def failWith(body: String) = IdempotencyStore.inMemory[IO].map(apiWith)
+        .flatMap(_.fail(
+          "claim-5",
+          Request[IO](Method.POST, uri"/v1/idempotency/k/fail").withEntity(body),
+          testClient,
+        )).attempt
+      for
+        notJson <- failWith("nope")
+        wrongType <- failWith("""{"claimId": 5}""")
+      yield
+        notJson.left.toOption.get shouldBe a[MalformedMessageBodyFailure]
+        wrongType.left.toOption.get shouldBe an[InvalidMessageBodyFailure]
     }
   }
 
