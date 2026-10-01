@@ -113,9 +113,9 @@ class Routes[F[_]: Async: Tracer](
 
       // Release a pending key so the operation can be retried. It ends the
       // key's pending state, as completing does, so it takes the same grant.
-      case POST -> Root / "v1" / "idempotency" / key / "fail" as client =>
+      case req @ POST -> Root / "v1" / "idempotency" / key / "fail" as client =>
         guard(client, Permission.IdempotencyComplete)(
-          idempotencyApi.fail(key, client),
+          idempotencyApi.fail(key, req.req, client),
         )
 
       case req @ POST -> Root / "v1" / "quota" / "check" as client =>

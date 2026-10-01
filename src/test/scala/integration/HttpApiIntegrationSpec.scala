@@ -1198,6 +1198,84 @@ class HttpApiIntegrationSpec
       )
     }
 
+    "the claim token (ADR-006)" - {
+      def check(key: String): IO[Option[String]] = httpApp.run(withKey(
+        post(uri"/v1/idempotency/check", s"""{"idempotencyKey": "$key"}"""),
+      )).flatMap(_.as[String]).map(body =>
+        parse(body).toOption
+          .flatMap(_.hcursor.get[Option[String]]("claimId").toOption.flatten),
+      )
+      def fail(key: String, body: String = ""): IO[Response[IO]] =
+        val path = Uri.unsafeFromString(s"/v1/idempotency/$key/fail")
+        httpApp.run(withKey(
+          if body.isEmpty then Request[IO](Method.POST, path)
+          else post(path, body),
+        ))
+      def complete(key: String, claimId: String): IO[Response[IO]] = httpApp
+        .run(withKey(post(
+          Uri.unsafeFromString(s"/v1/idempotency/$key/complete"),
+          s"""{"statusCode": 200, "body": "{}", "claimId": "$claimId"}""",
+        )))
+
+      expect(
+        "complete naming a claim that was replaced",
+        Status.Conflict,
+        "not_pending",
+      )(
+        for {
+          first <- check("fenced-complete")
+          _ <- fail("fenced-complete")
+          _ <- check("fenced-complete")
+          late <- complete("fenced-complete", first.getOrElse(""))
+        } yield late,
+      )
+      expect(
+        "fail naming a claim that was replaced",
+        Status.Conflict,
+        "not_pending",
+      )(
+        for {
+          first <- check("fenced-fail")
+          _ <- fail("fenced-fail")
+          _ <- check("fenced-fail")
+          late <-
+            fail("fenced-fail", s"""{"claimId": "${first.getOrElse("")}"}""")
+        } yield late,
+      )
+      expect(
+        "fail with a body that is not JSON",
+        Status.BadRequest,
+        "invalid_request",
+      )(fail("fenced-body", "not json"))
+      expect(
+        "fail with a claimId of the wrong type",
+        Status.UnprocessableEntity,
+        "invalid_request",
+      )(fail("fenced-body", """{"claimId": 5}"""))
+
+      "the current claim's ID completes it, and a request without one still works" in {
+        for {
+          claimId <- check("fenced-own")
+          own <- complete("fenced-own", claimId.getOrElse(""))
+          _ <- check("unfenced-own")
+          bare <- httpApp.run(withKey(post(
+            uri"/v1/idempotency/unfenced-own/complete",
+            """{"statusCode": 200, "body": "{}"}""",
+          )))
+          _ <- check("unfenced-fail")
+          bareFail <- fail("unfenced-fail")
+          emptyObject <- check("empty-object-fail") *>
+            fail("empty-object-fail", "{}")
+        } yield {
+          claimId shouldBe defined
+          own.status shouldBe Status.Ok
+          bare.status shouldBe Status.Ok
+          bareFail.status shouldBe Status.Ok
+          emptyObject.status shouldBe Status.Ok
+        }
+      }
+    }
+
     "POST /v1/quota/check" - {
       def check(user: String, tokens: Long) = withKey(post(
         uri"/v1/quota/check",

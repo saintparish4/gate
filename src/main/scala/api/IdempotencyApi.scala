@@ -137,6 +137,7 @@ class IdempotencyApi[F[_]: Async: Tracer](
           TenantKey(client.clientId, key),
           client.clientId,
           storedResponse,
+          completeReq.claimId,
         ).flatMap(success =>
           if success then
             Ok(
@@ -152,8 +153,10 @@ class IdempotencyApi[F[_]: Async: Tracer](
               IdempotencyUpdateResponse(
                 idempotencyKey = key,
                 status = "conflict",
-                message =
-                  Some("Could not store response - key may not exist or is not pending"),
+                message = Some(
+                  IdempotencyApi
+                    .notPending("store response", completeReq.claimId),
+                ),
                 error = Some(IdempotencyApi.NotPendingCode),
               ).asJson,
             ),
@@ -168,11 +171,20 @@ class IdempotencyApi[F[_]: Async: Tracer](
     * retry in between answered in_progress. Only the client that claimed the
     * key can fail it, and only while it is Pending: a completed operation ran,
     * so reopening it would let a retry run it twice.
+    *
+    * The body is optional. With `{"claimId": ...}` only that claim is released
+    * (ADR-006); the route had no body before, so an empty one still works.
     */
-  def fail(key: String, client: AuthenticatedClient): F[Response[F]] = (for
+  def fail(
+      key: String,
+      request: Request[F],
+      client: AuthenticatedClient,
+  ): F[Response[F]] = (for
+    claimId <- failClaimId(request)
     _ <- logger
       .debug(s"Failing idempotency key: $key, client=${client.clientId}")
-    marked <- store.markFailed(TenantKey(client.clientId, key), client.clientId)
+    marked <- store
+      .markFailed(TenantKey(client.clientId, key), client.clientId, claimId)
     response <-
       if marked then
         Ok(
@@ -184,12 +196,28 @@ class IdempotencyApi[F[_]: Async: Tracer](
           IdempotencyUpdateResponse(
             idempotencyKey = key,
             status = "conflict",
-            message =
-              Some("Could not mark failed - key may not exist or is not pending"),
+            message = Some(IdempotencyApi.notPending("mark failed", claimId)),
             error = Some(IdempotencyApi.NotPendingCode),
           ).asJson,
         )
   yield response).handleErrorWith(storageFailure("fail"))
+
+  // Read by hand rather than with `request.as`: an empty body is valid here,
+  // and the JSON decoder refuses one. The failures are the ones `as` raises,
+  // so a bad body is still a 400 or a 422.
+  private def failClaimId(request: Request[F]): F[Option[String]] = request
+    .bodyText.compile.string.flatMap { text =>
+      if text.trim.isEmpty then Async[F].pure(None)
+      else
+        io.circe.parser.parse(text) match
+          case Left(e) => Async[F]
+              .raiseError(MalformedMessageBodyFailure("Invalid JSON", Some(e)))
+          case Right(json) => json.as[IdempotencyFailRequest] match
+              case Left(e) => Async[F].raiseError(
+                  InvalidMessageBodyFailure("Could not decode JSON", Some(e)),
+                )
+              case Right(body) => Async[F].pure(body.claimId)
+    }
 
   /** Corrupt records and unexpected store failures both become a structured 503
     * so the caller knows not to proceed; body decoding failures pass through so
@@ -221,11 +249,12 @@ class IdempotencyApi[F[_]: Async: Tracer](
 
   private def buildCheckResponse(result: IdempotencyResult): F[Response[F]] =
     result match
-      case IdempotencyResult.New(key, _, _) => Ok(
+      case IdempotencyResult.New(key, _, claimId) => Ok(
           IdempotencyCheckResponse(
             status = "new",
             idempotencyKey = key,
             originalResponse = None,
+            claimId = Some(claimId),
           ).asJson,
         )
 
@@ -360,6 +389,9 @@ case class IdempotencyCheckResponse(
     // Set with `message` on the 409, like every other error body. `status`
     // still carries the outcome.
     error: Option[String] = None,
+    // Set on `new` only: the caller that won the claim holds its token, and
+    // sends it back on complete or fail (ADR-006).
+    claimId: Option[String] = None,
 )
 
 case class OriginalResponse(
@@ -372,7 +404,11 @@ case class IdempotencyCompleteRequest(
     statusCode: Int,
     body: String,
     headers: Option[Map[String, String]] = None,
+    // From the `new` answer. Optional, so clients written before ADR-006 work.
+    claimId: Option[String] = None,
 )
+
+case class IdempotencyFailRequest(claimId: Option[String] = None)
 
 case class IdempotencyUpdateResponse(
     idempotencyKey: String,
@@ -384,6 +420,15 @@ case class IdempotencyUpdateResponse(
 object IdempotencyApi:
   val ConflictCode = "idempotency_conflict"
   val NotPendingCode = "not_pending"
+
+  /** Why a complete or fail was refused. A stale `claimId` is the same 409 as a
+    * key that is not pending: from that run's side its claim is gone.
+    */
+  def notPending(action: String, claimId: Option[String]): String = claimId.fold(
+    s"Could not $action - key may not exist or is not pending",
+  )(_ =>
+    s"Could not $action - key may not exist, is not pending, or was claimed again since this claimId was issued",
+  )
 
   /** The largest stored response, in bytes of its encoded JSON. A DynamoDB item
     * holds at most 400 KB, and the response is stored inline in the record
