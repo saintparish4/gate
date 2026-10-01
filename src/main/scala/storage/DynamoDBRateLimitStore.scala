@@ -225,8 +225,9 @@ class DynamoDBRateLimitStore[F[_]: Async: Logger](
       .item(item.asJava)
 
     // OCC: conditional write so only one writer wins. First write: attribute_not_exists(pk);
-    // subsequent: version = :expectedVersion. Caller retries on ConditionalCheckFailedException
-    // (1ms delay, max 10 attempts total); after that we reject (high contention).
+    // subsequent: version = :expectedVersion. A failed condition is retried by
+    // checkAndConsume under `retryPolicy` (RetryPolicy.occRetry: 10 retries,
+    // jittered backoff from 1 ms to 50 ms); after that the check is refused.
     val request =
       if expectedVersion == 0L then
         requestBuilder.conditionExpression("attribute_not_exists(pk)").build()

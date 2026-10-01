@@ -5,7 +5,6 @@ import scala.concurrent.duration.*
 import org.typelevel.log4cats.Logger
 
 import cats.effect.*
-import cats.effect.std.Semaphore
 import cats.syntax.all.*
 
 /** Circuit Breaker implementation for resilience against cascading failures.
@@ -20,6 +19,9 @@ import cats.syntax.all.*
   *   - Open -> HalfOpen: After reset timeout expires
   *   - HalfOpen -> Closed: When a probe request succeeds
   *   - HalfOpen -> Open: When a probe request fails
+  *
+  * While half-open, at most `halfOpenMaxCalls` probes are in flight; every
+  * other call is refused as if the breaker were open.
   */
 trait CircuitBreaker[F[_]]:
   /** Protect a call with the circuit breaker.
@@ -89,8 +91,15 @@ object CircuitBreaker:
       lastFailureTime: Option[Long],
       lastSuccessTime: Option[Long],
       openedAt: Option[Long],
+      // Probes in flight while half-open, at most halfOpenMaxCalls.
       halfOpenCalls: Int,
   )
+
+  /** What `protect` may do with a call, decided in one state update. */
+  private enum Admission:
+    case Run
+    case Probe(openedHalfOpen: Boolean)
+    case Refuse
 
   private object InternalState:
     def initial: InternalState = InternalState(
@@ -115,30 +124,57 @@ object CircuitBreaker:
       config: CircuitBreakerConfig = CircuitBreakerConfig.default,
       countsAsFailure: Throwable => Boolean = _ => true,
   ): F[CircuitBreaker[F]] =
-    for
-      stateRef <- Ref.of[F, InternalState](InternalState.initial)
-      semaphore <- Semaphore[F](1) // For half-open state coordination
+    for stateRef <- Ref.of[F, InternalState](InternalState.initial)
     yield new CircuitBreaker[F]:
       private val logger = Logger[F]
 
-      override def protect[A](fa: F[A]): F[A] =
-        for
-          now <- Clock[F].realTime.map(_.toMillis)
-          currentState <- stateRef.get
-          result <- currentState.circuitState match
-            case CircuitState.Closed => executeAndRecord(fa, now)
+      // A limit below one would leave a half-open breaker with no probe to
+      // close it.
+      private val maxProbes = math.max(1, config.halfOpenMaxCalls)
 
-            case CircuitState.Open => checkAndMaybeTransitionToHalfOpen(now) *>
-                stateRef.get.flatMap(s =>
-                  if s.circuitState == CircuitState.HalfOpen then
-                    executeHalfOpen(fa, now)
-                  else
-                    recordRejection *>
-                      Temporal[F].raiseError(core.GateError.CircuitOpen(name)),
-                )
+      // Only `fa` itself can be cancelled, so a claimed probe slot is always
+      // either used or handed back.
+      override def protect[A](fa: F[A]): F[A] = Temporal[F]
+        .uncancelable { poll =>
+          for
+            now <- Clock[F].realTime.map(_.toMillis)
+            admission <- admit(now)
+            result <- admission match
+              case Admission.Run => executeAndRecord(poll(fa), now)
+              case Admission.Probe(openedHalfOpen) =>
+                (if openedHalfOpen then
+                   logger
+                     .info(s"Circuit breaker '$name' transitioning to half-open")
+                 else Temporal[F].unit) *> executeHalfOpen(poll(fa), now)
+              case Admission.Refuse => Temporal[F]
+                  .raiseError(core.GateError.CircuitOpen(name))
+          yield result
+        }
 
-            case CircuitState.HalfOpen => executeHalfOpen(fa, now)
-        yield result
+      // The transition to half-open and the claim of a probe slot are one
+      // update. They were a read followed by a write, behind a single-permit
+      // semaphore: every caller that saw the timeout pass reset the probe
+      // count to zero, and the semaphore let one probe run at a time whatever
+      // `halfOpenMaxCalls` said, so the setting did nothing.
+      private def admit(now: Long): F[Admission] = stateRef.modify { s =>
+        def refuse =
+          (s.copy(rejectedCount = s.rejectedCount + 1), Admission.Refuse)
+        s.circuitState match
+          case CircuitState.Closed => (s, Admission.Run)
+          case CircuitState.Open
+              if s.openedAt.exists(now - _ >= config.resetTimeout.toMillis) =>
+            (
+              s.copy(circuitState = CircuitState.HalfOpen, halfOpenCalls = 1),
+              Admission.Probe(openedHalfOpen = true),
+            )
+          case CircuitState.Open => refuse
+          case CircuitState.HalfOpen if s.halfOpenCalls < maxProbes =>
+            (
+              s.copy(halfOpenCalls = s.halfOpenCalls + 1),
+              Admission.Probe(openedHalfOpen = false),
+            )
+          case CircuitState.HalfOpen => refuse
+      }
 
       override def state: F[CircuitState] = stateRef.get.map(_.circuitState)
 
@@ -164,35 +200,63 @@ object CircuitBreaker:
               Temporal[F].raiseError(error)
         }
 
-      private def executeHalfOpen[A](fa: F[A], now: Long): F[A] = semaphore
-        .tryPermit.use { acquired =>
-          if acquired then
-            stateRef.get.flatMap { s =>
-              if s.halfOpenCalls >= config.halfOpenMaxCalls then
-                recordRejection *>
-                  Temporal[F].raiseError(core.GateError.CircuitOpen(name))
-              else
-                stateRef.update(_.copy(halfOpenCalls = s.halfOpenCalls + 1)) *>
-                  fa.attempt.flatMap {
-                    case Right(result) => transitionToClosed(now) *> logger.info(
-                        s"Circuit breaker '$name' closed after successful probe",
-                      ) *> Temporal[F].pure(result)
-                    // The probe told us nothing about the dependency. Return the
-                    // slot, or a run of these strands the breaker in half-open
-                    // with no probes left and it never recovers.
-                    case Left(error) if !countsAsFailure(error) =>
-                      stateRef.update(st =>
-                        st.copy(halfOpenCalls = math.max(0, st.halfOpenCalls - 1)),
-                      ) *> Temporal[F].raiseError(error)
-                    case Left(error) => transitionToOpen(now) *> logger.warn(
-                        s"Circuit breaker '$name' reopened after failed probe",
-                      ) *> Temporal[F].raiseError(error)
-                  }
-            }
-          else
-            recordRejection *>
-              Temporal[F].raiseError(core.GateError.CircuitOpen(name))
+      // Several probes can be in flight, so each outcome applies only while
+      // the breaker is still half-open: a probe that returns after another one
+      // closed or reopened it must not undo that.
+      private def executeHalfOpen[A](fa: F[A], now: Long): F[A] = Temporal[F]
+        // A cancelled probe says nothing either. Its slot was never returned,
+        // and enough of them left no probe to close the breaker.
+        .onCancel(fa.attempt, releaseProbe).flatMap {
+          case Right(result) => stateRef.modify(s =>
+              if s.circuitState == CircuitState.HalfOpen then
+                (
+                  s.copy(
+                    circuitState = CircuitState.Closed,
+                    failures = 0,
+                    successes = 0,
+                    openedAt = None,
+                    halfOpenCalls = 0,
+                    lastSuccessTime = Some(now),
+                  ),
+                  true,
+                )
+              else (s, false),
+            ).flatMap(closed =>
+              if closed then
+                logger
+                  .info(s"Circuit breaker '$name' closed after successful probe")
+              else Temporal[F].unit,
+            ).as(result)
+          // The probe told us nothing about the dependency. Return the slot, or
+          // a run of these strands the breaker in half-open with no probes left
+          // and it never recovers.
+          case Left(error) if !countsAsFailure(error) =>
+            releaseProbe *> Temporal[F].raiseError(error)
+          case Left(error) => stateRef.modify(s =>
+              if s.circuitState == CircuitState.HalfOpen then
+                (
+                  s.copy(
+                    circuitState = CircuitState.Open,
+                    openedAt = Some(now),
+                    halfOpenCalls = 0,
+                    lastFailureTime = Some(now),
+                  ),
+                  true,
+                )
+              else (s, false),
+            ).flatMap(reopened =>
+              if reopened then
+                logger
+                  .warn(s"Circuit breaker '$name' reopened after failed probe")
+              else Temporal[F].unit,
+            ) *> Temporal[F].raiseError(error)
         }
+
+      private def releaseProbe: F[Unit] = stateRef.update(s =>
+        if s.circuitState == CircuitState.HalfOpen then
+          s.copy(halfOpenCalls = math.max(0, s.halfOpenCalls - 1))
+        else s,
+      )
 
       private def recordSuccess(now: Long): F[Unit] = stateRef.update(s =>
         s.copy(
@@ -207,9 +271,6 @@ object CircuitBreaker:
       private def recordFailure(now: Long): F[Unit] = stateRef.update(s =>
         s.copy(failures = s.failures + 1, lastFailureTime = Some(now)),
       )
-
-      private def recordRejection: F[Unit] = stateRef
-        .update(s => s.copy(rejectedCount = s.rejectedCount + 1))
 
       // Transition atomically and log exactly once. Reading state and then
       // writing it let all 50 concurrent callers each see failures >= threshold
@@ -233,32 +294,3 @@ object CircuitBreaker:
             .warn(s"Circuit breaker '$name' opened after $failures failures")
         case None => Temporal[F].unit
       }
-
-      private def checkAndMaybeTransitionToHalfOpen(now: Long): F[Unit] =
-        stateRef.get.flatMap(s =>
-          s.openedAt match
-            case Some(openTime)
-                if now - openTime >= config.resetTimeout.toMillis =>
-              stateRef.update(
-                _.copy(circuitState = CircuitState.HalfOpen, halfOpenCalls = 0),
-              ) *>
-                logger
-                  .info(s"Circuit breaker '$name' transitioning to half-open")
-            case _ => Temporal[F].unit,
-        )
-
-      private def transitionToOpen(now: Long): F[Unit] = stateRef.update(_.copy(
-        circuitState = CircuitState.Open,
-        openedAt = Some(now),
-        halfOpenCalls = 0,
-      ))
-
-      private def transitionToClosed(now: Long): F[Unit] = stateRef
-        .update(_.copy(
-          circuitState = CircuitState.Closed,
-          failures = 0,
-          successes = 0,
-          openedAt = None,
-          halfOpenCalls = 0,
-          lastSuccessTime = Some(now),
-        ))

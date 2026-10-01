@@ -31,9 +31,11 @@ import observability.MetricsPublisher
   *   - The drain fiber is managed by `KinesisPublisher.resource` and is
   *     cancelled on Resource release.
   *
-  * This replaces the previous fire-and-forget approach with bounded, observable
-  * back-pressure: the queue size is configurable (`kinesis.queue-size`) and
-  * dropped events are counted in CloudWatch.
+  * Publishing is still fire-and-forget, at most once (ADR-003), and nothing
+  * here pushes back on the request path: a full queue drops its oldest event.
+  * This comment used to call that back-pressure. What the queue adds is a bound
+  * and a count: its size is configurable (`kinesis.queue-size`) and dropped
+  * events are counted in CloudWatch.
   */
 class KinesisPublisher[F[_]: Async: Logger: Temporal](
     client: KinesisAsyncClient,
