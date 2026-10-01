@@ -197,25 +197,39 @@ object Routes:
     * 500. Statuses are unchanged: 400 for a body that is not JSON, 422 for one
     * that does not match the schema, 404 for an unknown path, 500 otherwise.
     * Main and the tests both build their app here, so they cannot drift.
+    *
+    * @param around
+    *   A middleware that must see every answer, error bodies included. Main
+    *   passes the correlation middleware: wrapped around the routes alone, it
+    *   never saw a failed request's answer, so the 400, 422 and 500 went out
+    *   without `X-Request-Id`.
     */
   def toHttpApp[F[_]: Async](
       routes: HttpRoutes[F],
       logger: Logger[F],
-  ): HttpApp[F] = cats.data.Kleisli { request =>
+      around: HttpRoutes[F] => HttpRoutes[F] = (r: HttpRoutes[F]) => r,
+  ): HttpApp[F] =
     val dsl = Http4sDsl[F]
     import dsl.*
-    routes.run(request).getOrElse(noRoute(request)).handleErrorWith {
-      case failure: MessageFailure =>
-        Response[F](failure.toHttpResponse[F](request.httpVersion).status)
-          .withEntity(ApiError.body(ApiError.InvalidRequest, describe(failure)))
-          .pure[F]
-      case error => logger.error(error)(s"Unhandled error serving ${request
-            .method} ${request.uri.path}") *> InternalServerError(ApiError.body(
-          ApiError.InternalError,
-          "The request failed unexpectedly; whether it took effect is unknown",
-        ))
+    val answered: HttpRoutes[F] = cats.data.Kleisli { request =>
+      cats.data.OptionT.liftF {
+        routes.run(request).getOrElse(noRoute(request)).handleErrorWith {
+          case failure: MessageFailure => Response[F](
+              failure.toHttpResponse[F](request.httpVersion).status,
+            ).withEntity(ApiError.body(ApiError.InvalidRequest, describe(failure)))
+              .pure[F]
+          case error => logger.error(error)(s"Unhandled error serving ${request
+                .method} ${request.uri.path}") *>
+              InternalServerError(ApiError.body(
+                ApiError.InternalError,
+                "The request failed unexpectedly; whether it took effect is unknown",
+              ))
+        }
+      }
     }
-  }
+    cats.data.Kleisli(request =>
+      around(answered).run(request).getOrElse(noRoute(request)),
+    )
 
   private def noRoute[F[_]](request: Request[F]): Response[F] =
     Response[F](Status.NotFound).withEntity(ApiError.body(

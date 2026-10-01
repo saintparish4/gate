@@ -13,10 +13,9 @@ Every route, field, status code and header below is taken from the code under
 - **Fields:** outside the demo dashboard, every response field shown below is
   always present. An optional value that does not apply is `null` (responses
   are printed with nulls kept).
-- **`X-Request-Id`:** a response produced by a route (including the 401, 403
-  and 429 answers from authentication) echoes the request's `X-Request-Id`, or
-  a generated UUID when the request had none. The 400/422 body-decoding
-  answers and any 500 do not carry it.
+- **`X-Request-Id`:** every response echoes the request's `X-Request-Id`, or a
+  generated UUID when the request had none. That includes the 401, 403 and 429
+  answers from authentication, the 400/422 body-decoding answers, and a 500.
 - **Errors:** every answer that is not a 2xx has a JSON body with `error` (a
   stable code) and `message` (text for a person). See [Errors](#errors).
 - **Tenancy:** every key a caller names (rate-limit key, idempotency key,

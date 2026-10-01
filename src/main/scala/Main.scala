@@ -139,13 +139,15 @@ object Main extends IOApp:
         getRequestId,
       ))
 
-      appWithCorrelation = CorrelationIdMiddleware
-        .middleware(correlationLocal)(routes.routes)
       // toHttpApp turns a MessageFailure into a 4xx (400 for a body that is
       // not JSON, 422 for one that does not match the schema); without it an
-      // undecodable body surfaces as an empty 500.
-      httpApp: org.http4s.HttpApp[IO] = Routes
-        .toHttpApp(appWithCorrelation, summon[Logger[IO]])
+      // undecodable body surfaces as an empty 500. The correlation middleware
+      // goes around that, so those answers carry X-Request-Id too.
+      httpApp: org.http4s.HttpApp[IO] = Routes.toHttpApp(
+        routes.routes,
+        summon[Logger[IO]],
+        CorrelationIdMiddleware.middleware(correlationLocal),
+      )
 
       _ <- Resource.make(Async[IO].unit)(_ =>
         summon[Logger[IO]]
