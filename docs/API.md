@@ -687,7 +687,7 @@ store, starting from `rate-limit.default-*` (100 tokens, 10/s).
 | `GET` | `/dashboard/api/config` | `{"capacity", "refillRatePerSecond", "ttlSeconds"}` of the demo bucket |
 | `POST` | `/dashboard/api/config` | Body with the same three fields, each above 0. Answers them plus `"message": "Configuration updated successfully"`, or `400 {"error": "validation_error", "message": "<reason>"}`. |
 | `POST` | `/dashboard/api/check` | Consumes 1 token. Always `200`: `allowed`, `tokensRemaining`, `limit`, `resetAt`, plus `retryAfter` when refused |
-| `GET` | `/dashboard/api/status` | `tokensRemaining`, `limit`, and `resetAt` (always `""`) |
+| `GET` | `/dashboard/api/status` | `tokensRemaining`, `limit`, and `resetAt` (the store's value; the current time for a bucket not yet created) |
 | `GET` | `/dashboard/api/stats` | Server-sent events every 500 ms: `{"tokensRemaining", "limit", "timestamp"}` (epoch ms) |
 | `GET` | `/v1/ratelimit/dashboard/stats` | Server-sent events: each event the service publishes (rate-limit decisions, idempotency and quota events, audit events), as JSON with an `event_type` field. They pass through a 512-event queue: events are dropped while it is full, and concurrent viewers split the stream between them. |
 
