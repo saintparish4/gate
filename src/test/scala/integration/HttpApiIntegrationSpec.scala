@@ -1,5 +1,7 @@
 package integration
 
+import scala.concurrent.duration.*
+
 import org.http4s.*
 import org.http4s.circe.*
 import org.http4s.headers.`Retry-After`
@@ -17,13 +19,16 @@ import api.{
   TokenQuotaCheckRequest, TokenQuotaReconcileRequest,
 }
 import config.{
-  IdempotencyConfig, RateLimitConfig, RateLimitProfileConfig, TokenQuotaConfig,
+  BulkheadSettings, CircuitBreakerSettings, IdempotencyConfig, RateLimitConfig,
+  RateLimitProfileConfig, ResilienceConfig, RetryConfig, RetrySettings,
+  TimeoutSettings, TokenQuotaConfig,
 }
 import events.{EventPublisher, RateLimitEvent}
 import observability.{MetricsPublisher, PrometheusMetrics}
-import resilience.AggregateHealth
+import resilience.{AggregateHealth, GracefulDegradation, ResilientRateLimitStore}
 import security.{
-  ApiKeyAuth, ApiKeyStore, AuthenticatedClient, ClientTier, Permission,
+  ApiKeyAuth, ApiKeyStore, AuthRateLimiter, AuthenticatedClient, ClientTier,
+  Permission,
 }
 import storage.{
   DynamoDBIdempotencyStore, DynamoDBRateLimitStore, DynamoDBTokenQuotaStore,
@@ -36,7 +41,7 @@ import cats.syntax.all.*
 import io.circe.generic.auto.*
 import io.circe.parser.*
 import io.circe.syntax.*
-import core.TokenQuotaService
+import core.{IdempotencyStore, RateLimitStore, TokenQuotaService}
 
 /** Integration tests for HTTP API endpoints.
   *
@@ -833,6 +838,7 @@ class HttpApiIntegrationSpec
           served <- httpApp.run(withKey(request, "test-key"))
         } yield {
           refused.status shouldBe Status.Forbidden
+          body should startWith("""{"error":"forbidden","message":""")
           body should include(permission.toString)
           served.status should not be Status.Forbidden
         }
@@ -908,5 +914,464 @@ class HttpApiIntegrationSpec
         response <- app.run(Request[IO](Method.GET, uri"/dashboard/api/config"))
       } yield response.status shouldBe Status.Ok
     }
+  }
+
+  "Error contract" - {
+    // Every answer that is not a 2xx carries {"error": code, "message": text}.
+    // There were five shapes, including an empty 401 and plain text for an
+    // undecodable body, so a client had to know which route refused it before
+    // it could read why. Each route is driven to each status it can answer.
+
+    def withKey(request: Request[IO], key: String = "test-key"): Request[IO] =
+      request.putHeaders(headers.Authorization(Credentials.Token(ci"Bearer", key)))
+
+    def post(path: Uri, body: String): Request[IO] =
+      Request[IO](Method.POST, path).withEntity(body)
+        .putHeaders(headers.`Content-Type`(MediaType.application.json))
+
+    def get(path: Uri): Request[IO] = Request[IO](Method.GET, path)
+
+    // Stores pointed at a table that does not exist: DynamoDB answers, but
+    // never with data, which is a store failure the routes must report.
+    lazy val brokenRateLimitStore = new DynamoDBRateLimitStore[IO](
+      dynamoDbClient,
+      "no-such-table",
+      MetricsPublisher.noop[IO],
+    )
+    lazy val brokenIdempotencyStore =
+      new DynamoDBIdempotencyStore[IO](dynamoDbClient, "no-such-table")
+    lazy val brokenQuotaApi = TokenQuotaApi[IO](
+      TokenQuotaService[IO](
+        DynamoDBTokenQuotaStore[IO](
+          dynamoDbClient,
+          "no-such-table",
+          logger,
+          metricsPublisher,
+        ),
+        testTokenQuotaConfig,
+        metricsPublisher,
+        logger,
+      ),
+      eventPublisher,
+      metricsPublisher,
+      logger,
+      () => IO.pure("test-request-id"),
+    )
+
+    def app(
+        rateLimit: RateLimitStore[IO] = rateLimitStore,
+        idempotency: IdempotencyStore[IO] = idempotencyStore,
+        quota: Option[TokenQuotaApi[IO]] = Some(tokenQuotaApi),
+        prometheus: Option[PrometheusMetrics[IO]] = Some(prometheusMetrics),
+        auth: org.http4s.server.AuthMiddleware[IO, AuthenticatedClient] =
+          authMiddleware,
+    ): HttpApp[IO] = new Routes[IO](
+      rateLimit,
+      idempotency,
+      eventPublisher,
+      metricsPublisher,
+      auth,
+      testRateLimitConfig,
+      testIdempotencyConfig,
+      logger,
+      dashboardApi = None,
+      tokenQuotaApi = quota,
+      prometheusMetrics = prometheus,
+      healthCheck = IO.pure(AggregateHealth("ok", Nil)),
+      getRequestId = () => IO.pure("test-request-id"),
+    ).httpApp
+
+    /** The status, and a body that is exactly the error contract: a JSON object
+      * whose `error` is `code` and whose `message` is non-empty text.
+      */
+    def assertError(
+        response: Response[IO],
+        status: Status,
+        code: String,
+    ): IO[org.scalatest.Assertion] = response.as[String].map { body =>
+      val cursor = parse(body).toOption.map(_.hcursor)
+      withClue(s"${response.status} $body: ") {
+        response.status shouldBe status
+        response.contentType.map(_.mediaType) shouldBe
+          Some(MediaType.application.json)
+        cursor.flatMap(_.get[String]("error").toOption) shouldBe Some(code)
+        cursor.flatMap(_.get[String]("message").toOption)
+          .exists(_.nonEmpty) shouldBe true
+      }
+    }
+
+    def expect(name: String, status: Status, code: String)(
+        response: => IO[Response[IO]],
+    ): Unit = s"$name is ${status.code} $code" in
+      response.flatMap(assertError(_, status, code))
+
+    val jsonRoutes: List[Uri] = List(
+      uri"/v1/ratelimit/check",
+      uri"/v1/idempotency/check",
+      uri"/v1/idempotency/contract-key/complete",
+      uri"/v1/quota/check",
+      uri"/v1/quota/reconcile",
+    )
+
+    val everyRoute: List[Request[IO]] = jsonRoutes.map(post(_, "{}")) ++ List(
+      Request[IO](Method.POST, uri"/v1/idempotency/contract-key/fail"),
+      get(uri"/v1/ratelimit/status/contract-key"),
+      get(uri"/metrics"),
+    )
+
+    "authentication" - {
+      everyRoute.foreach { request =>
+        expect(
+          s"${request.method} ${request.uri} without a key",
+          Status.Unauthorized,
+          "unauthorized",
+        )(httpApp.run(request))
+        expect(
+          s"${request.method} ${request.uri} with an unknown key",
+          Status.Unauthorized,
+          "unauthorized",
+        )(httpApp.run(withKey(request, "no-such-key")))
+      }
+
+      "the auth throttle is 429 rate_limited, with retryAfter beside the two fields" in {
+        val request = withKey(get(uri"/v1/ratelimit/status/throttled"))
+        for {
+          limiter <- AuthRateLimiter.inMemory[IO](1)
+          throttled =
+            app(auth = ApiKeyAuth.middleware[IO](testApiKeyStore, Some(limiter)))
+          _ <- throttled.run(request)
+          second <- throttled.run(request)
+          retryAfter = second.headers.get(ci"Retry-After").map(_.head.value)
+          body <- second.as[String].flatMap(b => IO.fromEither(parse(b)))
+        } yield {
+          second.status shouldBe Status.TooManyRequests
+          body.hcursor.get[String]("error").toOption shouldBe
+            Some("rate_limited")
+          body.hcursor.get[String]("message").toOption
+            .exists(_.nonEmpty) shouldBe true
+          body.hcursor.get[Int]("retryAfter").toOption.map(_.toString) shouldBe
+            retryAfter
+        }
+      }
+
+      expect("a route without its permission", Status.Forbidden, "forbidden")(
+        httpApp.run(withKey(get(uri"/metrics"))),
+      )
+    }
+
+    "paths and bodies" - {
+      expect("an unknown path", Status.NotFound, "not_found")(httpApp.run(
+        withKey(get(uri"/v1/no-such-route")),
+      ))
+
+      jsonRoutes.foreach { path =>
+        expect(
+          s"POST $path with a body that is not JSON",
+          Status.BadRequest,
+          "invalid_request",
+        )(httpApp.run(withKey(post(path, "not json"))))
+        expect(
+          s"POST $path with a body missing its fields",
+          Status.UnprocessableEntity,
+          "invalid_request",
+        )(httpApp.run(withKey(post(path, "{}"))))
+      }
+
+      "a body with a field of the wrong type names the field, not its value" in
+        httpApp.run(withKey(post(
+          uri"/v1/ratelimit/check",
+          """{"key": "typed", "cost": "sekrit"}""",
+        ))).flatMap(_.as[String]).asserting { body =>
+          body should include(".cost")
+          (body should not).include("sekrit")
+        }
+
+      expect(
+        "an unhandled failure",
+        Status.InternalServerError,
+        "internal_error",
+      )(
+        // The raw store, with no resilient wrapper to turn it into a degraded
+        // decision.
+        app(rateLimit = brokenRateLimitStore)
+          .run(withKey(post(uri"/v1/ratelimit/check", """{"key": "boom"}"""))),
+      )
+    }
+
+    "POST /v1/ratelimit/check" - {
+      expect("a cost of zero", Status.BadRequest, "validation_error")(
+        httpApp.run(withKey(
+          post(uri"/v1/ratelimit/check", """{"key": "c", "cost": 0}"""),
+        )),
+      )
+      expect(
+        "a profile above the tier",
+        Status.Forbidden,
+        "profile_not_permitted",
+      )(httpApp.run(withKey(post(
+        uri"/v1/ratelimit/check",
+        """{"key": "c", "profile": "enterprise"}""",
+      ))))
+
+      "an empty bucket is 429 rate_limit_exceeded, still with allowed and no degraded header" in {
+        val drain = withKey(
+          post(uri"/v1/ratelimit/check", """{"key": "drained", "cost": 10}"""),
+        )
+        for {
+          first <- httpApp.run(drain)
+          second <- httpApp.run(drain)
+          body <- second.as[String].flatMap(b => IO.fromEither(parse(b)))
+          _ <- httpApp.run(drain).flatMap(
+            assertError(_, Status.TooManyRequests, "rate_limit_exceeded"),
+          )
+        } yield {
+          first.headers.get(ci"X-Gate-Degraded") shouldBe None
+          second.headers.get(ci"X-Gate-Degraded") shouldBe None
+          body.hcursor.get[Boolean]("allowed").toOption shouldBe Some(false)
+        }
+      }
+    }
+
+    "GET /v1/ratelimit/status/:key" - expect(
+      "an unreadable store",
+      Status.ServiceUnavailable,
+      "storage_unavailable",
+    )(app(rateLimit = brokenRateLimitStore).run(withKey(
+      get(uri"/v1/ratelimit/status/any"),
+    )))
+
+    "POST /v1/idempotency/check" - {
+      expect("a ttl of zero", Status.BadRequest, "validation_error")(httpApp.run(
+        withKey(post(
+          uri"/v1/idempotency/check",
+          """{"idempotencyKey": "k", "ttl": 0}""",
+        )),
+      ))
+      expect(
+        "a different body for a claimed key",
+        Status.Conflict,
+        "idempotency_conflict",
+      )(
+        httpApp.run(withKey(post(
+          uri"/v1/idempotency/check",
+          """{"idempotencyKey": "mismatch", "requestBody": "a"}""",
+        ))) *> httpApp.run(withKey(post(
+          uri"/v1/idempotency/check",
+          """{"idempotencyKey": "mismatch", "requestBody": "b"}""",
+        ))),
+      )
+      expect("a failing store", Status.ServiceUnavailable, "storage_unavailable")(
+        app(idempotency = brokenIdempotencyStore).run(withKey(
+          post(uri"/v1/idempotency/check", """{"idempotencyKey": "k"}"""),
+        )),
+      )
+    }
+
+    "POST /v1/idempotency/:key/complete" - {
+      val done = """{"statusCode": 200, "body": "{}"}"""
+      expect("a key that is not pending", Status.Conflict, "not_pending")(
+        httpApp
+          .run(withKey(post(uri"/v1/idempotency/never-claimed/complete", done))),
+      )
+      expect(
+        "a response over the stored limit",
+        Status.PayloadTooLarge,
+        "response_too_large",
+      )(httpApp.run(withKey(post(
+        uri"/v1/idempotency/too-large/complete",
+        s"""{"statusCode": 200, "body": "${"x" * 360000}"}""",
+      ))))
+      expect("a failing store", Status.ServiceUnavailable, "storage_unavailable")(
+        app(idempotency = brokenIdempotencyStore)
+          .run(withKey(post(uri"/v1/idempotency/any/complete", done))),
+      )
+    }
+
+    "POST /v1/idempotency/:key/fail" - {
+      val fail =
+        Request[IO](Method.POST, uri"/v1/idempotency/never-claimed/fail")
+      expect("a key that is not pending", Status.Conflict, "not_pending")(
+        httpApp.run(withKey(fail)),
+      )
+      expect("a failing store", Status.ServiceUnavailable, "storage_unavailable")(
+        app(idempotency = brokenIdempotencyStore).run(withKey(fail)),
+      )
+    }
+
+    "POST /v1/quota/check" - {
+      def check(user: String, tokens: Long) = withKey(post(
+        uri"/v1/quota/check",
+        s"""{"userId": "$user", "estimatedInputTokens": $tokens}""",
+      ))
+      expect("a negative estimate", Status.BadRequest, "validation_error")(
+        httpApp.run(check("contract-neg", -1)),
+      )
+      expect(
+        "an estimate above the limit",
+        Status.BadRequest,
+        "validation_error",
+      )(httpApp.run(check("contract-big", 101)))
+      expect("a spent quota", Status.TooManyRequests, "quota_exceeded")(
+        httpApp.run(check("contract-spent", 100)) *>
+          httpApp.run(check("contract-spent", 1)),
+      )
+      expect("a failing store", Status.ServiceUnavailable, "storage_unavailable")(
+        app(quota = Some(brokenQuotaApi)).run(check("contract-down", 1)),
+      )
+      expect("quotas disabled", Status.NotFound, "not_found")(
+        app(quota = None).run(check("contract-off", 1)),
+      )
+    }
+
+    "POST /v1/quota/reconcile" - {
+      def reconcile(id: String, actual: Long) =
+        withKey(post(uri"/v1/quota/reconcile", s"""{"reservationId": "$id", "actualInputTokens": $actual, "actualOutputTokens": 0}"""))
+      expect("a negative count", Status.BadRequest, "validation_error")(
+        httpApp.run(reconcile("any", -1)),
+      )
+      expect("an unknown reservation", Status.NotFound, "reservation_not_found")(
+        httpApp.run(reconcile("no-such-reservation", 1)),
+      )
+      expect(
+        "a second reconcile with different usage",
+        Status.Conflict,
+        "already_reconciled",
+      )(
+        for {
+          reserved <- httpApp.run(withKey(post(
+            uri"/v1/quota/check",
+            """{"userId": "contract-twice", "estimatedInputTokens": 50}""",
+          ))).flatMap(_.as[String])
+          id <- IO.fromEither(
+            parse(reserved).flatMap(_.hcursor.get[String]("reservationId")),
+          )
+          _ <- httpApp.run(reconcile(id, 50))
+          again <- httpApp.run(reconcile(id, 10))
+        } yield again,
+      )
+      expect("a failing store", Status.ServiceUnavailable, "storage_unavailable")(
+        app(quota = Some(brokenQuotaApi)).run(reconcile("any", 1)),
+      )
+      expect("quotas disabled", Status.NotFound, "not_found")(
+        app(quota = None).run(reconcile("any", 1)),
+      )
+    }
+
+    "GET /metrics" - expect("Prometheus disabled", Status.NotFound, "not_found")(
+      app(prometheus = None).run(withKey(get(uri"/metrics"), "admin-key")),
+    )
+
+    "POST /dashboard/api/config" -
+      expect("a capacity of zero", Status.BadRequest, "validation_error") {
+        for {
+          queue <- Queue.bounded[IO, RateLimitEvent](8)
+          dashboard <- Routes[IO](
+            rateLimitStore,
+            idempotencyStore,
+            eventPublisher,
+            metricsPublisher,
+            authMiddleware,
+            testRateLimitConfig,
+            testIdempotencyConfig,
+            logger,
+            dashboardEventQueue = Some(queue),
+            healthCheck = IO.pure(AggregateHealth("ok", Nil)),
+            getRequestId = () => IO.pure("test-request-id"),
+          )
+          response <- dashboard.httpApp.run(post(
+            uri"/dashboard/api/config",
+            """{"capacity": 0, "refillRatePerSecond": 1, "ttlSeconds": 1}""",
+          ))
+        } yield response
+      }
+  }
+
+  "Degraded answers" - {
+    // When the store cannot answer, the degradation mode does. A reject-all
+    // 429 used to be indistinguishable from an empty bucket, and an allow-all
+    // 200 reported 100 tokens left whatever the profile's capacity.
+
+    // No retries, breaker, or bulkhead, so the first failure degrades.
+    val noPatterns: ResilienceConfig = ResilienceConfig(
+      circuitBreaker = CircuitBreakerSettings(
+        enabled = false,
+        dynamodb = config.CircuitBreakerConfig(),
+      ),
+      retry = RetrySettings(dynamodb =
+        RetryConfig(
+          maxRetries = 0,
+          baseDelay = 1.millis,
+          maxDelay = 1.millis,
+          multiplier = 1.0,
+        ),
+      ),
+      bulkhead = BulkheadSettings(enabled = false),
+      timeout = TimeoutSettings(rateLimitCheck = 5.seconds),
+    )
+
+    val check = Request[IO](Method.POST, uri"/v1/ratelimit/check")
+      .withEntity("""{"key": "degraded"}""").putHeaders(
+        headers.`Content-Type`(MediaType.application.json),
+        headers.Authorization(Credentials.Token(ci"Bearer", "test-key")),
+      )
+
+    def degradedCheck(
+        mode: GracefulDegradation.DegradationMode,
+    ): IO[(Response[IO], io.circe.Json)] = ResilientRateLimitStore[IO](
+      new DynamoDBRateLimitStore[IO](
+        dynamoDbClient,
+        "no-such-table",
+        MetricsPublisher.noop[IO],
+      ),
+      noPatterns,
+      MetricsPublisher.noop[IO],
+      mode,
+    ).use { store =>
+      val app = new Routes[IO](
+        store,
+        idempotencyStore,
+        eventPublisher,
+        metricsPublisher,
+        authMiddleware,
+        testRateLimitConfig,
+        testIdempotencyConfig,
+        logger,
+        dashboardApi = None,
+        tokenQuotaApi = None,
+        prometheusMetrics = None,
+        healthCheck = IO.pure(AggregateHealth("ok", Nil)),
+        getRequestId = () => IO.pure("test-request-id"),
+      ).httpApp
+      for {
+        response <- app.run(check)
+        body <- response.as[String].flatMap(b => IO.fromEither(parse(b)))
+      } yield (response, body)
+    }
+
+    def header(response: Response[IO], name: String): Option[String] = response
+      .headers.get(org.typelevel.ci.CIString(name)).map(_.head.value)
+
+    "reject-all is a 429 that says it is degraded, in a header and in the error" in
+      degradedCheck(GracefulDegradation.DegradationMode.RejectAll)
+        .asserting { case (response, body) =>
+          response.status shouldBe Status.TooManyRequests
+          header(response, "X-Gate-Degraded") shouldBe Some("true")
+          header(response, "Retry-After") shouldBe Some("60")
+          body.hcursor.get[String]("error").toOption shouldBe Some("degraded")
+          body.hcursor.get[String]("message").toOption
+            .exists(_.nonEmpty) shouldBe true
+          body.hcursor.get[Boolean]("allowed").toOption shouldBe Some(false)
+          body.hcursor.get[Int]("limit").toOption shouldBe Some(10)
+        }
+
+    "allow-all is a 200 with the header and the profile's capacity, not 100" in
+      degradedCheck(GracefulDegradation.DegradationMode.AllowAll)
+        .asserting { case (response, body) =>
+          response.status shouldBe Status.Ok
+          header(response, "X-Gate-Degraded") shouldBe Some("true")
+          body.hcursor.get[Boolean]("allowed").toOption shouldBe Some(true)
+          body.hcursor.get[Int]("tokensRemaining").toOption shouldBe Some(10)
+          body.hcursor.get[Int]("limit").toOption shouldBe Some(10)
+        }
   }
 }

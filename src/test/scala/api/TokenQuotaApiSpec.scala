@@ -16,10 +16,11 @@ import org.typelevel.otel4s.trace.Tracer
 
 import cats.effect.*
 import cats.effect.testing.scalatest.AsyncIOSpec
+import cats.syntax.all.*
 import io.circe.generic.auto.*
 import io.circe.syntax.*
 import core.*
-import config.TokenQuotaConfig
+import config.{IdempotencyConfig, RateLimitConfig, TokenQuotaConfig}
 import events.*
 import observability.MetricsPublisher
 import security.*
@@ -217,12 +218,13 @@ class TokenQuotaApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
       for
         resp <- api
           .check(checkRequest("user-f", estimatedInput = 10), testClient)
-        body <- resp.as[TokenQuotaCheckResponse]
+        body <- resp.bodyText.compile.string
       yield
         resp.status shouldBe Status.ServiceUnavailable
         resp.headers.get(ci"Retry-After").map(_.head.value) shouldBe Some("1")
-        body.allowed shouldBe false
-        body.exceededLevel shouldBe None
+        // The error shape, as reconcile's contended 503 has: it answered in
+        // the check's own shape, a second 503 body on one route.
+        body should startWith("""{"error":"contended","message":""")
     }
 
     "returns 400 for negative reconcile counts" in makeApi()
@@ -244,20 +246,43 @@ class TokenQuotaApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
         body should include("contended")
     }
 
-    "returns 404 when token-quota is disabled (tokenQuotaApi = None in Routes)" in {
-      // This tests the Routes-level guard, not the API directly.
-      // We construct a minimal Routes with tokenQuotaApi = None and verify 404.
-      // NOTE: Full Routes construction requires wiring auth middleware.
-      // As a simpler proxy, confirm the route shape returns 404 on None:
-      val routeResponse: IO[Option[Response[IO]]] =
-        // Reproduce the inline Routes logic for the quota endpoint
-        (None: Option[TokenQuotaApi[IO]]) match
-          case Some(_) => IO.raiseError(new Exception("should not reach"))
-          case None => IO.pure(Some(Response[IO](status = Status.NotFound)))
-
-      routeResponse.asserting(maybeResp =>
-        maybeResp.map(_.status) shouldBe Some(Status.NotFound),
-      )
+    // Through Routes itself, with no quota API wired. This used to assert on an
+    // inline copy of the route's `match`, so it passed whatever Routes did.
+    "both quota routes answer 404 when token-quota is disabled" in {
+      val keys = ApiKeyStore.inMemory[IO](Map("quota-off-key" -> testClient))
+      val bearer = headers
+        .Authorization(Credentials.Token(ci"Bearer", "quota-off-key"))
+      for
+        rateLimitStore <- RateLimitStore.inMemory[IO]
+        idempotencyStore <- IdempotencyStore.inMemory[IO]
+        routes <- Routes[IO](
+          rateLimitStore,
+          idempotencyStore,
+          EventPublisher.noop[IO],
+          MetricsPublisher.noop[IO],
+          ApiKeyAuth.middleware[IO](keys),
+          RateLimitConfig(
+            defaultCapacity = 10,
+            defaultRefillRatePerSecond = 1.0,
+            defaultTtlSeconds = 3600,
+          ),
+          IdempotencyConfig(),
+          Logger[IO],
+          tokenQuotaApi = None,
+          healthCheck = IO.pure(resilience.AggregateHealth("ok", Nil)),
+          getRequestId = () => IO.pure("test-request-id"),
+        )
+        answers <- List(
+          checkRequest("user-off", estimatedInput = 10),
+          reconcileRequest("reservation-off", 1, 0),
+        ).traverse(request =>
+          routes.httpApp.run(request.putHeaders(bearer))
+            .flatMap(r => r.bodyText.compile.string.map((r.status, _))),
+        )
+      yield answers.foreach { case (status, body) =>
+        status shouldBe Status.NotFound
+        body should include(""""error":"not_found"""")
+      }
     }
 
     "a store failure is a 503 the caller can act on, not a 500" in {

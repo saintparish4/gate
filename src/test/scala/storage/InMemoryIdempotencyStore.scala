@@ -117,7 +117,7 @@ class InMemoryIdempotencyStore[F[_]: Temporal](
         stateMap.get(idempotencyKey) match
           case Some(record)
               if record.status == IdempotencyStatus.Pending &&
-                record.clientId == clientId =>
+                record.clientId == clientId && !record.expired(now) =>
             val updated = record.copy(
               status = IdempotencyStatus.Completed,
               response = Some(response),
@@ -138,7 +138,7 @@ class InMemoryIdempotencyStore[F[_]: Temporal](
         stateMap.get(idempotencyKey) match
           case Some(record)
               if record.status == IdempotencyStatus.Pending &&
-                record.clientId == clientId =>
+                record.clientId == clientId && !record.expired(now) =>
             val updated = record
               .copy(status = IdempotencyStatus.Failed, updatedAt = now)
             (stateMap.updated(idempotencyKey, updated), true)

@@ -38,7 +38,7 @@ DynamoDB, zero errors. See [Correctness](#correctness).
 
 | Failure mode | Behaviour |
 |-------------|-----------|
-| **DynamoDB slow or partially down** | The rate-limit store is wrapped in a bulkhead (100 concurrent calls, 500 ms max wait), a process-wide circuit breaker (20 failures to open, 30 s reset, 3 half-open calls), a retry policy for SDK and I/O errors (3 retries, 100 ms base, 2x backoff, 10 s cap), and a 2 s timeout per check. A timed-out check is not retried: the bound covers the whole check. When a check reaches no decision (the breaker is open, the bulkhead is full, or the store times out or fails after retries), `DEGRADATION_MODE` decides: `reject-all` (default, safe for payments) or `allow-all` (for AI infrastructure where availability wins). Every degraded decision increments `gate_degraded_total`. `GET /v1/ratelimit/status` answers `503` when the store cannot be read, rather than reporting a full bucket. |
+| **DynamoDB slow or partially down** | The rate-limit store is wrapped in a bulkhead (100 concurrent calls, 500 ms max wait), a process-wide circuit breaker (20 failures to open, 30 s reset, 3 half-open calls), a retry policy for SDK and I/O errors (3 retries, 100 ms base, 2x backoff, 10 s cap), and a 2 s timeout per check. A timed-out check is not retried: the bound covers the whole check. When a check reaches no decision (the breaker is open, the bulkhead is full, or the store times out or fails after retries), `DEGRADATION_MODE` decides: `reject-all` (default, safe for payments) or `allow-all` (for AI infrastructure where availability wins). Every degraded decision carries `X-Gate-Degraded: true` and increments `gate_degraded_total`. `GET /v1/ratelimit/status` answers `503` when the store cannot be read, rather than reporting a full bucket. |
 | **A corrupt limiter or quota item** | It fails closed and self-heals. The store replaces the item, conditioned on its raw stored version, with the most conservative valid state: an empty token bucket, a full leaky bucket or sliding window, an exhausted quota window starting now. The key refuses until it refills, drains, or the window ends. Each read counts `CorruptStateRead`, which has an alarm. A corrupt idempotency record answers `503`, since whether its operation ran is unknowable. |
 | **Instance crash** | No in-process state. The next instance reads current DynamoDB state and continues correctly. |
 | **Kinesis failure** | Events go into a bounded in-memory queue (10,000, drop-oldest) that a background fiber drains to Kinesis. A failed publish is retried once, then dropped. Both an eviction from a full queue and a failed publish are counted, as `gate_events_dropped_total` and CloudWatch `DroppedKinesisEvent{reason=queue_full\|publish_failed}`. The request path never waits on Kinesis, and `/ready` reports a Kinesis fault as `degraded` without taking the task out of service. |
@@ -187,7 +187,8 @@ curl -s -X POST http://localhost:8080/v1/ratelimit/check \
   "retryAfter": null,
   "limit": 1000,
   "resetAt": "2026-09-14T10:30:05Z",
-  "message": null
+  "message": null,
+  "error": null
 }
 ```
 

@@ -99,12 +99,8 @@ class RateLimitApi[F[_]: Async: Tracer](
       resp <- buildCheckResponse(decision, profile)
     yield resp
 
-  private def validationError(message: String): F[Response[F]] = BadRequest(
-    io.circe.Json.obj(
-      "error" -> io.circe.Json.fromString("validation_error"),
-      "message" -> io.circe.Json.fromString(message),
-    ),
-  )
+  private def validationError(message: String): F[Response[F]] =
+    BadRequest(ApiError.body(ApiError.ValidationError, message))
 
   private def refuseProfile(
       refusal: ProfileRefusal,
@@ -115,13 +111,10 @@ class RateLimitApi[F[_]: Async: Tracer](
     case ProfileRefusal.AboveTier(name, tier) =>
       val tierName = tier.toString.toLowerCase
       logger.warn(s"AUDIT decision=profile_refused client=${client
-          .clientId} profile=$name tier=$tierName") *>
-        Forbidden(io.circe.Json.obj(
-          "error" -> io.circe.Json.fromString("profile_not_permitted"),
-          "message" ->
-            io.circe.Json
-              .fromString(s"profile '$name' exceeds the $tierName tier's limits"),
-        ))
+          .clientId} profile=$name tier=$tierName") *> Forbidden(ApiError.body(
+        "profile_not_permitted",
+        s"profile '$name' exceeds the $tierName tier's limits",
+      ))
 
   /** GET /v1/ratelimit/status/:key
     *
@@ -134,45 +127,42 @@ class RateLimitApi[F[_]: Async: Tracer](
       maybeStatus <- store.getStatus(TenantKey(client.clientId, key), profile)
       nowMs <- Clock[F].realTime.map(_.toMillis)
       response <- maybeStatus match
-        case Some(state) =>
-          // Calculate reset time based on current state
-          val resetAt = Instant.ofEpochMilli(nowMs).plusSeconds(
-            ((profile.capacity - state.tokensRemaining) /
-              profile.refillRatePerSecond).ceil.toLong,
-          )
-          Ok(
+        // The store's own resetAt. It was recomputed here with the token-bucket
+        // formula whatever the algorithm, so a leaky bucket or a sliding
+        // window reported a reset its check would not honor.
+        case Some(state) => Ok(
             RateLimitStatusResponse(
               key = key,
               tokensRemaining = state.tokensRemaining,
               limit = profile.capacity,
-              resetAt = resetAt.toString,
+              resetAt = state.resetAt.toString,
             ).asJson,
           )
-        case None =>
-          // No state means full capacity (never seen this key)
-          Ok(
+        // Never seen means full under every algorithm, so there is nothing to
+        // wait for: it resets now. It said 60 s from `Instant.now()`, a clock
+        // no test could control.
+        case None => Ok(
             RateLimitStatusResponse(
               key = key,
               tokensRemaining = profile.capacity,
               limit = profile.capacity,
-              resetAt = Instant.now().plusSeconds(60).toString,
+              resetAt = Instant.ofEpochMilli(nowMs).toString,
             ).asJson,
           )
     yield response).handleErrorWith(error =>
       logger
         .warn(s"Rate-limit status for $key unavailable: ${error.getMessage}") *>
-        ServiceUnavailable(io.circe.Json.obj(
-          "error" -> io.circe.Json.fromString("storage_unavailable"),
-          "message" ->
-            io.circe.Json.fromString("The rate-limit store could not be read; the status is unknown, not full"),
+        ServiceUnavailable(ApiError.body(
+          ApiError.StorageUnavailable,
+          "The rate-limit store could not be read; the status is unknown, not full",
         )),
     )
 
   private def buildCheckResponse(
       decision: RateLimitDecision,
       profile: RateLimitProfile,
-  ): F[Response[F]] = decision match
-    case RateLimitDecision.Allowed(tokensRemaining, resetAt) => Ok(
+  ): F[Response[F]] = (decision match
+    case RateLimitDecision.Allowed(tokensRemaining, resetAt, _) => Ok(
         RateLimitCheckResponse(
           allowed = true,
           tokensRemaining = Some(tokensRemaining),
@@ -187,16 +177,28 @@ class RateLimitApi[F[_]: Async: Tracer](
         Header.Raw(ci"X-RateLimit-Reset", resetAt.getEpochSecond.toString),
       ))
 
-    case RateLimitDecision.Rejected(retryAfter, resetAt) => TooManyRequests(
+    case RateLimitDecision.Rejected(retryAfter, resetAt, degraded) =>
+      TooManyRequests(
         RateLimitCheckResponse(
           allowed = false,
           tokensRemaining = None,
           retryAfter = Some(retryAfter),
           limit = profile.capacity,
           resetAt = resetAt.toString,
-          message = Some("Rate limit exceeded"),
+          message = Some(RateLimitApi.rejectionReason(degraded)),
+          error = Some(
+            if degraded then RateLimitApi.DegradedCode
+            else RateLimitApi.ExceededCode,
+          ),
         ).asJson,
       ).map(_.putHeaders(Header.Raw(ci"Retry-After", retryAfter.toString)))
+  ).map(resp =>
+    // Said in a header so it reads the same on the 200 and the 429. A degraded
+    // reject-all 429 used to be indistinguishable from an empty bucket.
+    if decision.degraded then
+      resp.putHeaders(Header.Raw(RateLimitApi.DegradedHeader, "true"))
+    else resp,
+  )
 
   private def currentTraceId: F[Option[String]] = Tracer[F].currentSpanContext
     .map(_.filter(_.isValid).map(_.traceIdHex))
@@ -209,7 +211,7 @@ class RateLimitApi[F[_]: Async: Tracer](
       traceId: Option[String],
   ): F[Unit] =
     val event = decision match
-      case RateLimitDecision.Allowed(tokensRemaining, _) => RateLimitEvent
+      case RateLimitDecision.Allowed(tokensRemaining, _, _) => RateLimitEvent
           .Allowed(
             timestamp = timestamp,
             apiKey = client.apiKeyId,
@@ -220,23 +222,24 @@ class RateLimitApi[F[_]: Async: Tracer](
             tier = client.tier.toString,
             traceId = traceId,
           )
-      case RateLimitDecision.Rejected(retryAfter, _) => RateLimitEvent.Rejected(
-          timestamp = timestamp,
-          apiKey = client.apiKeyId,
-          clientId = client.clientId,
-          endpoint = request.endpoint.getOrElse("unknown"),
-          retryAfterSeconds = retryAfter,
-          reason = "Rate limit exceeded",
-          tier = client.tier.toString,
-          traceId = traceId,
-        )
+      case RateLimitDecision.Rejected(retryAfter, _, degraded) => RateLimitEvent
+          .Rejected(
+            timestamp = timestamp,
+            apiKey = client.apiKeyId,
+            clientId = client.clientId,
+            endpoint = request.endpoint.getOrElse("unknown"),
+            retryAfterSeconds = retryAfter,
+            reason = RateLimitApi.rejectionReason(degraded),
+            tier = client.tier.toString,
+            traceId = traceId,
+          )
 
     val publishMain = eventPublisher.publish(event).handleErrorWith(error =>
       logger.warn(s"Failed to publish rate limit event: ${error.getMessage}"),
     )
 
     val publishAudit = decision match
-      case RateLimitDecision.Rejected(_, _) => getRequestId()
+      case RateLimitDecision.Rejected(_, _, degraded) => getRequestId()
           .flatMap { requestId =>
             val auditEvent = RateLimitEvent.AuditEvent(
               timestamp = timestamp,
@@ -244,7 +247,7 @@ class RateLimitApi[F[_]: Async: Tracer](
               apiKey = client.apiKeyId,
               clientId = client.clientId,
               decision = "rejected",
-              reason = "Rate limit exceeded",
+              reason = RateLimitApi.rejectionReason(degraded),
               endpoint = request.endpoint,
               sourceIp = None,
               tier = Some(client.tier.toString),
@@ -288,6 +291,9 @@ case class RateLimitCheckResponse(
     limit: Int,
     resetAt: String,
     message: Option[String] = None,
+    // Set with `message` on every answer that is not a 200, so a refusal reads
+    // like any other error body. `allowed` still carries the decision.
+    error: Option[String] = None,
 )
 
 case class RateLimitStatusResponse(
@@ -303,6 +309,17 @@ enum ProfileRefusal:
   case AboveTier(name: String, tier: ClientTier)
 
 object RateLimitApi:
+
+  /** Set to `true` on a check the degradation mode answered, in either mode. */
+  val DegradedHeader = ci"X-Gate-Degraded"
+
+  val ExceededCode = "rate_limit_exceeded"
+  val DegradedCode = "degraded"
+
+  def rejectionReason(degraded: Boolean): String =
+    if degraded then
+      "The rate-limit store could not answer; refused by the degradation mode"
+    else "Rate limit exceeded"
 
   /** The client's tier picks its profile; a `profile` named in the request may
     * only narrow it, never widen it. It used to win outright, so a free key

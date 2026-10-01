@@ -1,7 +1,7 @@
 import scala.concurrent.duration.*
 
 import org.http4s.ember.server.EmberServerBuilder
-import org.http4s.server.{Router, Server}
+import org.http4s.server.Server
 import org.typelevel.log4cats.Logger
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 import org.typelevel.otel4s.oteljava.OtelJava
@@ -141,11 +141,11 @@ object Main extends IOApp:
 
       appWithCorrelation = CorrelationIdMiddleware
         .middleware(correlationLocal)(routes.routes)
-      // ErrorHandling turns a MessageFailure into a 4xx (400 for a body that
-      // is not JSON, 422 for one that does not match the schema); without it
-      // an undecodable body surfaces as an empty 500.
-      httpApp: org.http4s.HttpApp[IO] = org.http4s.server.middleware
-        .ErrorHandling.httpApp(Router("/" -> appWithCorrelation).orNotFound)
+      // toHttpApp turns a MessageFailure into a 4xx (400 for a body that is
+      // not JSON, 422 for one that does not match the schema); without it an
+      // undecodable body surfaces as an empty 500.
+      httpApp: org.http4s.HttpApp[IO] = Routes
+        .toHttpApp(appWithCorrelation, summon[Logger[IO]])
 
       _ <- Resource.make(Async[IO].unit)(_ =>
         summon[Logger[IO]]

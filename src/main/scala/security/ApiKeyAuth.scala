@@ -16,6 +16,7 @@ import cats.effect.*
 import cats.syntax.all.*
 import io.circe.Json
 import io.circe.syntax.*
+import core.ApiError
 
 /** API key authentication for securing rate limiter endpoints.
   *
@@ -175,7 +176,7 @@ object ApiKeyAuth:
     * first diagnosed as capacity exhaustion; it was this throttle.
     *
     * The throttle now answers 429 with `Retry-After`. Missing and invalid keys
-    * keep the bare 401 they always had.
+    * stay a 401, with the same `{"error", "message"}` body as every refusal.
     *
     * The per-key throttle ran only once a key was found, so guessing keys was
     * never throttled, although its comments claimed brute-force protection.
@@ -231,16 +232,24 @@ object ApiKeyAuth:
               }
       }
 
-    val onFailure: AuthedRoutes[AuthError, F] = Kleisli(authed =>
-      OptionT.liftF(Temporal[F].pure(
-        authed.context match
-          case AuthError.RateLimited(retryAfter) =>
-            Response[F](Status.TooManyRequests).withEntity(
-              Json.obj("error" := "Rate limited", "retryAfter" := retryAfter),
-            ).putHeaders(Header.Raw(ci"Retry-After", retryAfter.toString))
-          case _ => Response[F](Status.Unauthorized),
-      )),
-    )
+    val onFailure: AuthedRoutes[AuthError, F] = Kleisli { authed =>
+      OptionT.liftF {
+        Temporal[F].pure {
+          authed.context match
+            case e @ AuthError.RateLimited(retryAfter) =>
+              Response[F](Status.TooManyRequests).withEntity(ApiError.body(
+                ApiError.RateLimited,
+                e.getMessage,
+                "retryAfter" -> Json.fromInt(retryAfter),
+              )).putHeaders(Header.Raw(ci"Retry-After", retryAfter.toString))
+            // A missing key and an unknown one say so, and nothing more: the
+            // body was empty, so a client could not tell a 401 from this service
+            // from one a proxy in front of it made up.
+            case e => Response[F](Status.Unauthorized)
+                .withEntity(ApiError.body(ApiError.Unauthorized, e.getMessage))
+        }
+      }
+    }
 
     AuthMiddleware(authUser, onFailure)
 
@@ -297,9 +306,9 @@ object ApiKeyAuth:
   )(route: => F[Response[F]]): F[Response[F]] =
     if client.permissions.contains(permission) then route
     else
-      Response[F](Status.Forbidden).withEntity(Json.obj(
-        "error" := "forbidden",
-        "message" := AuthError.InsufficientPermissions(permission).getMessage,
+      Response[F](Status.Forbidden).withEntity(ApiError.body(
+        ApiError.Forbidden,
+        AuthError.InsufficientPermissions(permission).getMessage,
       )).pure[F]
 
 /** Outcome of the auth-layer throttle. `Throttled` carries the seconds until

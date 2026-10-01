@@ -127,6 +127,28 @@ class InMemoryIdempotencyStoreSpec
       }
     }
 
+    // Both in-memory interpreters, the one STORAGE_BACKEND=in-memory wires and
+    // the test one: a late complete or fail on an expired record answered true.
+    "storeResponse and markFailed refuse an expired record" in {
+      val late = StoredResponse(200, "late", Map.empty, Instant.EPOCH)
+      val stores = List(
+        core.IdempotencyStore.inMemory[IO],
+        InMemoryIdempotencyStore.create[IO].widen[core.IdempotencyStore[IO]],
+      )
+      stores.traverse {
+        _.flatMap { store =>
+          for {
+            _ <- store.check("lapsed-done", clientId = "c", ttlSeconds = -60)
+            completed <- store.storeResponse("lapsed-done", "c", late)
+            _ <- store.check("lapsed-fail", clientId = "c", ttlSeconds = -60)
+            failed <- store.markFailed("lapsed-fail", "c")
+            _ <- store.check("live", clientId = "c", ttlSeconds = 3600)
+            live <- store.storeResponse("live", "c", late)
+          } yield (completed, failed, live)
+        }
+      }.asserting(_ shouldBe List.fill(2)((false, false, true)))
+    }
+
     "markFailed applies only to its owner's pending record" in {
       val test = for {
         store <- InMemoryIdempotencyStore.create[IO]

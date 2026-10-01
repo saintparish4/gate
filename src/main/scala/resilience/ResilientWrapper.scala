@@ -130,7 +130,7 @@ object ResilientRateLimitStore:
         val wrappedOp = applyPatterns(operation, "checkAndConsume")
 
         // Handle failures with graceful degradation
-        wrappedOp.handleErrorWith(handleDegradation(key, _))
+        wrappedOp.handleErrorWith(handleDegradation(key, profile, _))
 
       override def getStatus(
           key: String,
@@ -182,6 +182,7 @@ object ResilientRateLimitStore:
 
       private def handleDegradation(
           key: String,
+          profile: RateLimitProfile,
           error: Throwable,
       ): F[RateLimitDecision] = error match
         case _: CircuitBreakerOpen => logger.warn(
@@ -189,17 +190,17 @@ object ResilientRateLimitStore:
           ) *> metrics.increment(
             "RateLimitDegraded",
             Map("reason" -> "circuit_breaker"),
-          ) *> GracefulDegradation.degradedDecision(degradationMode)
+          ) *> GracefulDegradation.degradedDecision(degradationMode, profile)
 
         case _: BulkheadRejected => logger.warn(
             s"Bulkhead rejected for key $key, applying degradation mode",
           ) *>
             metrics
               .increment("RateLimitDegraded", Map("reason" -> "bulkhead")) *>
-            GracefulDegradation.degradedDecision(degradationMode)
+            GracefulDegradation.degradedDecision(degradationMode, profile)
 
         case _ => logger.error(error)(
             s"Unexpected error for key $key, applying degradation mode",
           ) *>
             metrics.increment("RateLimitDegraded", Map("reason" -> "error")) *>
-            GracefulDegradation.degradedDecision(degradationMode)
+            GracefulDegradation.degradedDecision(degradationMode, profile)

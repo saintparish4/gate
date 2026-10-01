@@ -118,10 +118,16 @@ trait IdempotencyStore[F[_]]:
   /** Store the response for a completed operation.
     *
     * Should only be called after check() returns New and the operation has
-    * completed successfully. Stores only when the record is Pending and was
-    * created by `clientId`. Keys are already scoped per client (ADR-005); this
-    * is the second guard, so a key-construction bug still cannot let one client
-    * complete another's record with a forged response.
+    * completed successfully. Stores only when the record is Pending, was
+    * created by `clientId`, and has not expired: an expired claim has lapsed,
+    * and the next check claims the key afresh.
+    *
+    * It cannot tell a reclaimed key's first owner from its second. Both are the
+    * same client, so once a later check has claimed an expired key, a late call
+    * from the earlier run completes the new claim. Keys are already scoped per
+    * client (ADR-005); this is the second guard, so a key-construction bug
+    * still cannot let one client complete another's record with a forged
+    * response.
     *
     * @param idempotencyKey
     *   The key from the original check
@@ -130,7 +136,8 @@ trait IdempotencyStore[F[_]]:
     * @param response
     *   The response to store
     * @return
-    *   true if stored successfully
+    *   true if stored; false if the record is missing, not Pending, expired, or
+    *   owned by another client
     */
   def storeResponse(
       idempotencyKey: String,
@@ -141,7 +148,7 @@ trait IdempotencyStore[F[_]]:
   /** Mark a pending operation as failed, so the next check with this key claims
     * it again and the caller can retry.
     *
-    * Like `storeResponse`, it applies only to a Pending record created by
+    * Like `storeResponse`, it applies only to a live Pending record created by
     * `clientId`. A Completed record is never reopened: its operation ran, and
     * reopening it would let a retry run it twice.
     *
@@ -150,8 +157,8 @@ trait IdempotencyStore[F[_]]:
     * @param clientId
     *   The client failing it; must match the client that created it
     * @return
-    *   true if marked; false if the record is missing, not Pending, or owned by
-    *   another client
+    *   true if marked; false if the record is missing, not Pending, expired, or
+    *   owned by another client
     */
   def markFailed(idempotencyKey: String, clientId: String): F[Boolean]
 
@@ -285,7 +292,7 @@ object IdempotencyStore:
               records.get(idempotencyKey) match
                 case Some(existing)
                     if existing.status == IdempotencyStatus.Pending &&
-                      existing.clientId == clientId =>
+                      existing.clientId == clientId && !existing.expired(now) =>
                   val updated = existing.copy(
                     status = IdempotencyStatus.Completed,
                     response = Some(response),
@@ -306,7 +313,7 @@ object IdempotencyStore:
               records.get(idempotencyKey) match
                 case Some(existing)
                     if existing.status == IdempotencyStatus.Pending &&
-                      existing.clientId == clientId =>
+                      existing.clientId == clientId && !existing.expired(now) =>
                   val updated = existing
                     .copy(status = IdempotencyStatus.Failed, updatedAt = now)
                   (records + (idempotencyKey -> updated), true)

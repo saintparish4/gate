@@ -16,7 +16,9 @@ Every route, field, status code and header below is taken from the code under
 - **`X-Request-Id`:** a response produced by a route (including the 401, 403
   and 429 answers from authentication) echoes the request's `X-Request-Id`, or
   a generated UUID when the request had none. The 400/422 body-decoding
-  answers, the 404 for an unknown path and any 500 do not carry it.
+  answers and any 500 do not carry it.
+- **Errors:** every answer that is not a 2xx has a JSON body with `error` (a
+  stable code) and `message` (text for a person). See [Errors](#errors).
 - **Tenancy:** every key a caller names (rate-limit key, idempotency key,
   quota user/agent/org, reservation ID) is scoped to the authenticated client
   ([ADR-005](adr/005-tenant-namespaced-storage-keys.md)). Two clients using the
@@ -60,11 +62,12 @@ requests for paths that do not exist.
 
 | Case | Status | Body |
 |------|--------|------|
-| No key, or an unknown key | `401` | empty |
-| Valid key, sending faster than the auth throttle allows | `429` + `Retry-After` | `{"error": "Rate limited", "retryAfter": 42}` |
-| Any key, from a source over its unknown-key limit | `429` + `Retry-After` | `{"error": "Rate limited", "retryAfter": 42}` |
+| No key | `401` | `{"error": "unauthorized", "message": "Missing API key in Authorization header"}` |
+| An unknown key | `401` | `{"error": "unauthorized", "message": "Invalid API key"}` |
+| Valid key, sending faster than the auth throttle allows | `429` + `Retry-After` | `{"error": "rate_limited", "message": "Rate limited. Retry after 42 seconds", "retryAfter": 42}` |
+| Any key, from a source over its unknown-key limit | `429` + `Retry-After` | The same body |
 | Valid key without the route's permission | `403` | `{"error": "forbidden", "message": "Insufficient permissions: QuotaCheck required"}` |
-| Valid key, path that no route matches (or wrong method) | `404` | `Not found` (text) |
+| Valid key, path that no route matches (or wrong method) | `404` | `{"error": "not_found", "message": "No route for GET /v1/nope"}` |
 
 The permission check runs before the route touches any state. The 403 message
 names the permission by its code name (`QuotaCheck`), not its secret name
@@ -165,7 +168,7 @@ bucket for `key`, or refuses without consuming.
 
 ```json
 { "allowed": true, "tokensRemaining": 999, "retryAfter": null, "limit": 1000,
-  "resetAt": "2026-09-27T12:00:00.010Z", "message": null }
+  "resetAt": "2026-09-27T12:00:00.010Z", "message": null, "error": null }
 ```
 
 Headers: `X-RateLimit-Limit` (the profile's capacity), `X-RateLimit-Remaining`,
@@ -176,7 +179,8 @@ as `retryAfter`). No `X-RateLimit-*` headers.
 
 ```json
 { "allowed": false, "tokensRemaining": null, "retryAfter": 1, "limit": 1000,
-  "resetAt": "2026-09-27T12:00:10.000Z", "message": "Rate limit exceeded" }
+  "resetAt": "2026-09-27T12:00:10.000Z", "message": "Rate limit exceeded",
+  "error": "rate_limit_exceeded" }
 ```
 
 | Field | Type | Description |
@@ -187,6 +191,7 @@ as `retryAfter`). No `X-RateLimit-*` headers.
 | `limit` | integer | Capacity of the profile applied |
 | `resetAt` | string (ISO-8601) | When the bucket would be full again, per the configured algorithm |
 | `message` | string or null | `"Rate limit exceeded"` when refused |
+| `error` | string or null | `rate_limit_exceeded` when refused; `degraded` when the store could not answer and the [degradation mode](#when-the-store-cannot-answer) refused |
 
 **Other answers:**
 
@@ -225,11 +230,11 @@ decoded before use.
 | `key` | string | The key as you sent it |
 | `tokensRemaining` | integer | Tokens in the bucket now |
 | `limit` | integer | Your tier's capacity |
-| `resetAt` | string (ISO-8601) | Now plus the seconds to refill to capacity at your tier's rate |
+| `resetAt` | string (ISO-8601) | When the bucket would be full again, per the configured algorithm: the same value a check on it would report |
 
 Status always uses your tier's profile, even if checks on this key named a
-narrower one. A key never seen reads as full, with `resetAt` 60 seconds from
-now. No `X-RateLimit-*` headers.
+narrower one. A key never seen reads as full, with `resetAt` the current time:
+there is nothing to wait for. No `X-RateLimit-*` headers.
 
 **503:** the store could not be read. The service does not guess "full":
 
@@ -284,11 +289,13 @@ answered by `DEGRADATION_MODE`:
 
 | Mode | Answer |
 |------|--------|
-| `reject-all` (default) | `429`, `retryAfter: 60`, `Retry-After: 60`, `resetAt` 60 s from now, `message: "Rate limit exceeded"`. The body does not say it was degraded. |
-| `allow-all` | `200`, `tokensRemaining: 100` whatever the profile, `limit` the profile's capacity. Nothing is counted, so spend is unbounded while degraded. |
+| `reject-all` (default) | `429`, `retryAfter: 60`, `Retry-After: 60`, `resetAt` 60 s from now, `error: "degraded"`, `message: "The rate-limit store could not answer; refused by the degradation mode"`. |
+| `allow-all` | `200`, `tokensRemaining` and `limit` both the profile's capacity, `resetAt` 60 s from now. Nothing is counted, so spend is unbounded while degraded. |
 
-Any other value stops startup. Degraded answers are counted in the
-`gate_degraded_total` metric.
+Both carry the header `X-Gate-Degraded: true`, which no other answer has: it
+is the way to tell a degraded 429 from an empty bucket, and a degraded 200
+from a counted one. Any other mode stops startup. Degraded answers are counted
+in the `gate_degraded_total` metric.
 
 ---
 
@@ -354,7 +361,8 @@ without one, never conflicts.
     "headers": { "Content-Type": "application/json" }
   },
   "firstSeenAt": "2026-09-27T11:58:02.114Z",
-  "message": null
+  "message": null,
+  "error": null
 }
 ```
 
@@ -365,8 +373,9 @@ without one, never conflicts.
 | `originalResponse` | object or null | For `duplicate`: `statusCode` (integer), `body` (string), `headers` (object, `{}` if none were stored). `null` otherwise. |
 | `firstSeenAt` | string (ISO-8601) or null | When the key was claimed; set for `in_progress` and `duplicate` |
 | `message` | string or null | `in_progress`: `"Operation is currently being processed"`. `conflict`: `"Request body does not match the original request for this idempotency key"`. |
+| `error` | string or null | `idempotency_conflict` on the 409; `null` otherwise |
 
-A `new` answer is `{"status": "new", "idempotencyKey": "...", "originalResponse": null, "firstSeenAt": null, "message": null}`.
+A `new` answer is `{"status": "new", "idempotencyKey": "...", "originalResponse": null, "firstSeenAt": null, "message": null, "error": null}`.
 
 **503:** `storage_unavailable` (the store failed or timed out, or the claim
 lost its retries to concurrent changes of the record) or `storage_corruption`
@@ -402,8 +411,8 @@ as given; it does not interpret them.
 
 | Status | Body | Cause |
 |--------|------|-------|
-| `200` | `{"idempotencyKey": "payment:abc-123", "status": "completed", "message": null}` | Stored |
-| `409` | `{"idempotencyKey": "...", "status": "conflict", "message": "Could not store response - key may not exist or is not pending"}` | No pending key of yours by that name: never claimed, already completed, failed, expired, or another client's |
+| `200` | `{"idempotencyKey": "payment:abc-123", "status": "completed", "message": null, "error": null}` | Stored |
+| `409` | `{"idempotencyKey": "...", "status": "conflict", "message": "Could not store response - key may not exist or is not pending", "error": "not_pending"}` | No pending key of yours by that name: never claimed, already completed, failed, expired, or another client's |
 | `413` | `{"error": "response_too_large", "message": "The response to store is 412345 bytes encoded; ..."}` | The stored response would exceed 358,400 bytes (350 KiB). The key stays pending: store a smaller response, such as a reference to the result, or fail the key. |
 | `503` | `{"error": "storage_unavailable", ...}` | Store failure or timeout |
 
@@ -428,8 +437,8 @@ caller can retry. A completed key is never reopened: its operation ran.
 
 | Status | Body | Cause |
 |--------|------|-------|
-| `200` | `{"idempotencyKey": "payment:abc-123", "status": "failed", "message": null}` | Released |
-| `409` | `{"idempotencyKey": "...", "status": "conflict", "message": "Could not mark failed - key may not exist or is not pending"}` | No pending key of yours by that name |
+| `200` | `{"idempotencyKey": "payment:abc-123", "status": "failed", "message": null, "error": null}` | Released |
+| `409` | `{"idempotencyKey": "...", "status": "conflict", "message": "Could not mark failed - key may not exist or is not pending", "error": "not_pending"}` | No pending key of yours by that name |
 | `503` | `{"error": "storage_unavailable", ...}` | Store failure or timeout |
 
 ```bash
@@ -485,7 +494,7 @@ permission check still runs first, so a key without the permission gets 403.
 ```json
 { "allowed": true, "remainingTokens": { "user": 998400, "agent": 498400, "org": 9998400 },
   "exceededLevel": null, "retryAfter": null, "message": null,
-  "reservationId": "5f0c2a6e-8a53-4c43-9f53-8f0d7e1f3b0a" }
+  "reservationId": "5f0c2a6e-8a53-4c43-9f53-8f0d7e1f3b0a", "error": null }
 ```
 
 **Exceeded (429):** nothing was charged. Header: `Retry-After` (same as
@@ -493,7 +502,8 @@ permission check still runs first, so a key without the permission gets 403.
 
 ```json
 { "allowed": false, "remainingTokens": {}, "exceededLevel": "org", "retryAfter": 1740,
-  "message": "org quota exceeded: 9999000/10000000 tokens used", "reservationId": null }
+  "message": "org quota exceeded: 9999000/10000000 tokens used", "reservationId": null,
+  "error": "quota_exceeded" }
 ```
 
 | Field | Type | Description |
@@ -501,9 +511,10 @@ permission check still runs first, so a key without the permission gets 403.
 | `allowed` | boolean | Whether the estimate was charged |
 | `remainingTokens` | object | Per requested level (`user`, `agent`, `org`): the limit minus usage after this charge. `{}` unless allowed. |
 | `exceededLevel` | string or null | `user`, `agent` or `org` on a 429 |
-| `retryAfter` | integer or null | 429: seconds until the exceeded level's window ends (at least 1). Contended 503: `1`. |
+| `retryAfter` | integer or null | 429: seconds until the exceeded level's window ends (at least 1) |
 | `message` | string or null | Why it was refused |
 | `reservationId` | string or null | Set when allowed; pass it to `/v1/quota/reconcile` |
+| `error` | string or null | `quota_exceeded` on the 429; `null` when allowed |
 
 **400, never fits:** the estimate alone is larger than a requested level's
 limit, so no window could admit it. Nothing is reserved, and there is no
@@ -512,9 +523,11 @@ tokens exceeds the user limit of 1000, so it can never be admitted"}`.
 
 **503, contended:** the store lost every conditional write in its 25 attempts,
 or the reservation record could not be written (the charge is then released).
-Nothing was reserved; retry after `Retry-After: 1`. Body in the same shape:
-`allowed: false`, `remainingTokens: {}`, `exceededLevel: null`,
-`retryAfter: 1`, `message: "quota state contended after 25 attempts; nothing was reserved, retry shortly"`.
+Nothing was reserved; retry after `Retry-After: 1`.
+
+```json
+{ "error": "contended", "message": "quota state contended after 25 attempts; nothing was reserved, retry shortly" }
+```
 
 **503, store failure:** a timeout, a full bulkhead or an SDK error, with
 `Retry-After: 1`. A check that timed out may still have charged; that charge
@@ -652,7 +665,7 @@ store, starting from `rate-limit.default-*` (100 tokens, 10/s).
 |--------|------|--------|
 | `GET` | `/dashboard` | The HTML page |
 | `GET` | `/dashboard/api/config` | `{"capacity", "refillRatePerSecond", "ttlSeconds"}` of the demo bucket |
-| `POST` | `/dashboard/api/config` | Body with the same three fields, each above 0. Answers them plus `"message": "Configuration updated successfully"`, or `400 {"error": "<reason>"}`. |
+| `POST` | `/dashboard/api/config` | Body with the same three fields, each above 0. Answers them plus `"message": "Configuration updated successfully"`, or `400 {"error": "validation_error", "message": "<reason>"}`. |
 | `POST` | `/dashboard/api/check` | Consumes 1 token. Always `200`: `allowed`, `tokensRemaining`, `limit`, `resetAt`, plus `retryAfter` when refused |
 | `GET` | `/dashboard/api/status` | `tokensRemaining`, `limit`, and `resetAt` (always `""`) |
 | `GET` | `/dashboard/api/stats` | Server-sent events every 500 ms: `{"tokensRemaining", "limit", "timestamp"}` (epoch ms) |
@@ -664,30 +677,46 @@ store, starting from `rate-limit.default-*` (100 tokens, 10/s).
 
 ### Error shapes
 
+Every answer that is not a 2xx has a JSON body with two fields: `error`, a
+stable code to branch on, and `message`, text for a person. That holds for
+every route and every status, including the answers from authentication, an
+unknown path, a body that cannot be decoded, and an unhandled failure.
+
 | Shape | Where |
 |-------|-------|
-| `{"error": "<code>", "message": "<text>"}` | Most refusals and store failures ([codes below](#error-codes)) |
-| The route's own response shape | Rate-limit 429; idempotency `conflict` 409 and the complete/fail 409s; quota check 429 and contended 503. The outcome is in `allowed` or `status`, not `error`. |
-| `{"error": "Rate limited", "retryAfter": N}` | Auth throttle 429 |
-| `{"error": "<reason>"}` | Dashboard config POST 400 |
-| Plain text | `400 The request body was malformed.` (not JSON, or empty); `422 The request body was invalid.` (JSON without a required field, or a field of the wrong type); `404 Not found` (unknown path, valid key) |
-| Empty body | `401` (no or unknown key); `404` (quota routes when disabled, `/metrics` when Prometheus is disabled); `500` (an unhandled error) |
+| `{"error": "<code>", "message": "<text>"}` | Refusals and failures ([codes below](#error-codes)) |
+| The same, plus `"retryAfter": N` | Auth throttle 429 |
+| The route's own response shape, with `error` and `message` set | Rate-limit 429; idempotency `conflict` 409 and the complete/fail 409s; quota check 429. The outcome is still in `allowed` or `status`. |
+
+`/ready` is not an error body: its 503 is the same health document as its 200.
 
 ### Error codes
 
 | Status | `error` | Route | Cause |
 |--------|---------|-------|-------|
+| 400 | `invalid_request` | Any route with a body | The body is not JSON, or is empty |
 | 400 | `validation_error` | `POST /v1/ratelimit/check` | `cost` below 1 or above the profile's capacity, or an unknown `profile` |
 | 400 | `validation_error` | `POST /v1/idempotency/check` | `ttl` zero or negative |
 | 400 | `validation_error` | `POST /v1/quota/check`, `/reconcile` | A negative token count, or an estimate above a level's limit |
+| 400 | `validation_error` | `POST /dashboard/api/config` | A missing field, or one not above 0 |
+| 401 | `unauthorized` | Any authenticated route | No key, or an unknown key |
 | 403 | `forbidden` | Any authenticated route | The key lacks the route's permission |
 | 403 | `profile_not_permitted` | `POST /v1/ratelimit/check` | `profile` above the key's tier |
+| 404 | `not_found` | Any path | No route matches; or a quota route with quotas disabled, or `/metrics` with Prometheus disabled |
 | 404 | `reservation_not_found` | `POST /v1/quota/reconcile` | Unknown, expired, or another client's reservation |
+| 409 | `idempotency_conflict` | `POST /v1/idempotency/check` | `requestBody` differs from the one that claimed the key |
+| 409 | `not_pending` | `POST /v1/idempotency/{key}/complete`, `/fail` | No pending key of yours by that name |
 | 409 | `already_reconciled` | `POST /v1/quota/reconcile` | Reconciled before with different usage |
 | 413 | `response_too_large` | `POST /v1/idempotency/{key}/complete` | Stored response over 358,400 bytes encoded |
+| 422 | `invalid_request` | Any route with a body | JSON without a required field, or a field of the wrong type. `message` names the field's path (`.cost`), never its value. |
+| 429 | `rate_limited` | Any authenticated route | The auth throttle, or a source over its unknown-key limit |
+| 429 | `rate_limit_exceeded` | `POST /v1/ratelimit/check` | The bucket cannot cover `cost` |
+| 429 | `degraded` | `POST /v1/ratelimit/check` | The store could not answer and `reject-all` refused; also `X-Gate-Degraded: true` |
+| 429 | `quota_exceeded` | `POST /v1/quota/check` | A level's quota is spent |
+| 500 | `internal_error` | Any route | An unhandled failure; whether the request took effect is unknown |
 | 503 | `storage_unavailable` | Rate-limit status, all idempotency routes, both quota routes (quota adds `Retry-After: 1`) | Store error, timeout, or full bulkhead |
 | 503 | `storage_corruption` | `POST /v1/idempotency/check` | The stored record cannot be decoded |
-| 503 | `contended` | `POST /v1/quota/reconcile` | Every conditional write lost; nothing recorded |
+| 503 | `contended` | `POST /v1/quota/check`, `/reconcile` | Every conditional write lost; nothing reserved or recorded |
 
 ---
 
@@ -696,12 +725,17 @@ store, starting from `rate-limit.default-*` (100 tokens, 10/s).
 Each point follows from the behavior above.
 
 - **Rate limit:** read `allowed`, not just the status code, and wait
-  `Retry-After` seconds after a 429. A 429 with `retryAfter: 60` may be a
-  degraded answer rather than an empty bucket. The auth throttle's 429 has
-  `"error": "Rate limited"` and no `allowed`; it also means back off.
+  `Retry-After` seconds after a 429. `X-Gate-Degraded: true` marks an answer
+  the degradation mode gave because the store could not: a 429 that is not an
+  empty bucket, or a 200 that was not counted. The auth throttle's 429 has
+  `"error": "rate_limited"` and no `allowed`; it also means back off.
 - **Idempotency:** run the operation only on `new`, and finish every claimed
   key with `complete` or `fail`, or it answers `in_progress` until its TTL
   passes. A 503 means the state is unknown: do not run the operation.
+  Choose a TTL longer than the operation can take. Once it passes, `complete`
+  and `fail` answer 409 and the next check answers `new`; and if that check
+  has already reclaimed the key, a late `complete` from the first run is
+  accepted as the second's, because both come from the same client.
 - **Quota:** keep the check's `reservationId` and reconcile with it. After a
   503 on reconcile, send the same request again after `Retry-After`; a repeat
   with the same usage is safe. A 503 on check means you were not admitted.

@@ -145,7 +145,7 @@ class DynamoDBIdempotencyStore[F[_]: Async](
         .key(Map("pk" -> attr(s"idempotency#$idempotencyKey")).asJava)
         .updateExpression(
           "SET #status = :status, #response = :response, #updatedAt = :updatedAt, #version = #version + :one",
-        ).conditionExpression("#status = :pending AND #clientId = :clientId")
+        ).conditionExpression(DynamoDBIdempotencyStore.LivePendingOwnedBy)
         .expressionAttributeNames(
           Map(
             "#status" -> "status",
@@ -153,6 +153,7 @@ class DynamoDBIdempotencyStore[F[_]: Async](
             "#updatedAt" -> "updatedAt",
             "#version" -> "version",
             "#clientId" -> "clientId",
+            "#ttl" -> "ttl",
           ).asJava,
         ).expressionAttributeValues(
           Map(
@@ -162,6 +163,7 @@ class DynamoDBIdempotencyStore[F[_]: Async](
             ":pending" -> attr("Pending"),
             ":one" -> attrN(1),
             ":clientId" -> attr(clientId),
+            ":now" -> attrN(now.getEpochSecond),
           ).asJava,
         ).build()
 
@@ -183,13 +185,14 @@ class DynamoDBIdempotencyStore[F[_]: Async](
         .key(Map("pk" -> attr(s"idempotency#$idempotencyKey")).asJava)
         .updateExpression(
           "SET #status = :status, #updatedAt = :updatedAt, #version = #version + :one",
-        ).conditionExpression("#status = :pending AND #clientId = :clientId")
+        ).conditionExpression(DynamoDBIdempotencyStore.LivePendingOwnedBy)
         .expressionAttributeNames(
           Map(
             "#status" -> "status",
             "#updatedAt" -> "updatedAt",
             "#version" -> "version",
             "#clientId" -> "clientId",
+            "#ttl" -> "ttl",
           ).asJava,
         ).expressionAttributeValues(
           Map(
@@ -198,6 +201,7 @@ class DynamoDBIdempotencyStore[F[_]: Async](
             ":pending" -> attr("Pending"),
             ":one" -> attrN(1),
             ":clientId" -> attr(clientId),
+            ":now" -> attrN(now.getEpochSecond),
           ).asJava,
         ).build()
 
@@ -331,6 +335,16 @@ class DynamoDBIdempotencyStore[F[_]: Async](
     )
 
 object DynamoDBIdempotencyStore:
+
+  /** What `storeResponse` and `markFailed` require: a Pending record of this
+    * client's that has not expired. Without the ttl term a late call on an
+    * expired record answered true, though the claim had lapsed and no check
+    * would ever replay what it stored. A record with no ttl never expires,
+    * matching the claim condition and `get`.
+    */
+  private val LivePendingOwnedBy =
+    "#status = :pending AND #clientId = :clientId AND (attribute_not_exists(#ttl) OR #ttl >= :now)"
+
   def apply[F[_]: Async](
       client: DynamoDbAsyncClient,
       tableName: String,

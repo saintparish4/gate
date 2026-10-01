@@ -11,6 +11,13 @@ import cats.effect.Temporal
 sealed trait RateLimitDecision:
   def allowed: Boolean
 
+  /** True when no store produced this answer: the breaker was open, the
+    * bulkhead was full, or the call failed, and the degradation mode answered
+    * instead. A degraded rejection used to look like an empty bucket, and a
+    * degraded admission like a real one.
+    */
+  def degraded: Boolean
+
 object RateLimitDecision:
   /** Request is allowed within the rate limit.
     *
@@ -19,8 +26,11 @@ object RateLimitDecision:
     * @param resetAt
     *   When the bucket will be fully replenished
     */
-  case class Allowed(tokensRemaining: Int, resetAt: Instant)
-      extends RateLimitDecision:
+  case class Allowed(
+      tokensRemaining: Int,
+      resetAt: Instant,
+      degraded: Boolean = false,
+  ) extends RateLimitDecision:
     val allowed: Boolean = true
 
   /** Request is rejected due to rate limit exceeded.
@@ -30,8 +40,11 @@ object RateLimitDecision:
     * @param resetAt
     *   When the bucket will be fully replenished
     */
-  case class Rejected(retryAfterSeconds: Int, resetAt: Instant)
-      extends RateLimitDecision:
+  case class Rejected(
+      retryAfterSeconds: Int,
+      resetAt: Instant,
+      degraded: Boolean = false,
+  ) extends RateLimitDecision:
     val allowed: Boolean = false
 
 /** Configuration for a rate limit profile.

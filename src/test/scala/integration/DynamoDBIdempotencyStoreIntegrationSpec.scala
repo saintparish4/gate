@@ -8,7 +8,7 @@ import org.scalatest.matchers.should.Matchers
 import org.typelevel.log4cats.Logger
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
-import core.{IdempotencyResult, StoredResponse}
+import core.{IdempotencyResult, IdempotencyStatus, StoredResponse}
 import storage.DynamoDBIdempotencyStore
 import cats.effect.IO
 import cats.effect.testing.scalatest.AsyncIOSpec
@@ -243,6 +243,49 @@ class DynamoDBIdempotencyStoreIntegrationSpec
       test.asserting { results =>
         results.count(_.isInstanceOf[IdempotencyResult.New]) shouldBe 1
         results.count(_.isInstanceOf[IdempotencyResult.InProgress]) shouldBe 9
+      }
+    }
+
+    // A late complete or fail on an expired record answered true: the caller
+    // was told its response was stored, though the claim had lapsed and the
+    // next check runs the operation again without replaying it.
+    "storeResponse and markFailed refuse an expired record, and leave it claimable" in {
+      val late = StoredResponse(200, "late", Map.empty, Instant.EPOCH)
+      val test = for {
+        _ <- store.check("lapsed-done", clientId = "client-1", ttlSeconds = -60)
+        completed <- store.storeResponse("lapsed-done", "client-1", late)
+        _ <- store.check("lapsed-fail", clientId = "client-1", ttlSeconds = -60)
+        failed <- store.markFailed("lapsed-fail", "client-1")
+        reclaimed <- store
+          .check("lapsed-done", clientId = "client-1", ttlSeconds = 3600)
+        record <- store.get("lapsed-done")
+      } yield (completed, failed, reclaimed, record)
+
+      test.asserting { case (completed, failed, reclaimed, record) =>
+        completed shouldBe false
+        failed shouldBe false
+        reclaimed shouldBe a[IdempotencyResult.New]
+        record.map(_.status) shouldBe Some(IdempotencyStatus.Pending)
+        record.flatMap(_.response) shouldBe None
+      }
+    }
+
+    // What the ttl condition cannot do. A reclaim is by the same client, so
+    // the first run's late complete matches the new claim; telling them apart
+    // needs a claim token the API does not have.
+    "a live record still completes, including one reclaimed after expiry" in {
+      val done = StoredResponse(200, "ok", Map.empty, Instant.EPOCH)
+      val test = for {
+        _ <- store.check("reclaimed", clientId = "client-1", ttlSeconds = -60)
+        _ <- store.check("reclaimed", clientId = "client-1", ttlSeconds = 3600)
+        completed <- store.storeResponse("reclaimed", "client-1", done)
+        replay <- store
+          .check("reclaimed", clientId = "client-1", ttlSeconds = 3600)
+      } yield (completed, replay)
+
+      test.asserting { case (completed, replay) =>
+        completed shouldBe true
+        replay shouldBe a[IdempotencyResult.Duplicate]
       }
     }
 

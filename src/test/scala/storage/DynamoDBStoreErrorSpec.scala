@@ -77,29 +77,7 @@ class DynamoDBStoreErrorSpec
     * fail immediately — if a test inadvertently calls them the test will fail.
     */
   private def stubClient(getItemResp: GetItemResponse): DynamoDbAsyncClient =
-    Proxy.newProxyInstance(
-      classOf[DynamoDbAsyncClient].getClassLoader,
-      Array(classOf[DynamoDbAsyncClient]),
-      new InvocationHandler:
-        override def invoke(
-            proxy: Object,
-            method: java.lang.reflect.Method,
-            args: Array[Object],
-        ): Object = method.getName match
-          case "getItem" => CompletableFuture.completedFuture(getItemResp)
-          case "putItem" => CompletableFuture
-              .completedFuture(PutItemResponse.builder().build())
-          case "updateItem" => CompletableFuture
-              .completedFuture(UpdateItemResponse.builder().build())
-          case "describeTable" => CompletableFuture
-              .completedFuture(DescribeTableResponse.builder().build())
-          case "serviceName" => "DynamoDB"
-          case "close" => null // void
-          case other => CompletableFuture
-              .failedFuture[Object](new UnsupportedOperationException(
-                s"Stub does not implement: $other",
-              )),
-    ).asInstanceOf[DynamoDbAsyncClient]
+    stubDynamoClient(getItemResp)
 
   /** A GetItemResponse that contains an existing rate-limit item with a
     * non-numeric "tokens" attribute value — this triggers the corrupt-state
@@ -133,10 +111,12 @@ class DynamoDBStoreErrorSpec
       ).use(resilientStore =>
         resilientStore.checkAndConsume("test-key", cost = 1, testProfile)
           .asserting { decision =>
+            // The profile's capacity, marked degraded. It was 100 whatever the
+            // profile, and nothing told it apart from a real admission.
             decision shouldBe a[RateLimitDecision.Allowed]
-            // GracefulDegradation.AllowAll grants 100 tokens as a sentinel value
+            decision.degraded shouldBe true
             decision.asInstanceOf[RateLimitDecision.Allowed]
-              .tokensRemaining shouldBe 100
+              .tokensRemaining shouldBe testProfile.capacity
           },
       )
     }
@@ -188,7 +168,10 @@ class DynamoDBStoreErrorSpec
         GracefulDegradation.DegradationMode.RejectAll,
       ).use(resilientStore =>
         resilientStore.checkAndConsume("reject-key", cost = 1, testProfile)
-          .asserting(decision => decision shouldBe a[RateLimitDecision.Rejected]),
+          .asserting { decision =>
+            decision shouldBe a[RateLimitDecision.Rejected]
+            decision.degraded shouldBe true
+          },
       )
     }
   }
