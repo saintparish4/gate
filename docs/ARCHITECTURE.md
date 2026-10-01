@@ -70,7 +70,7 @@ Middleware, outermost first:
 2. **[CorrelationIdMiddleware](../src/main/scala/observability/CorrelationIdMiddleware.scala).** It takes `X-Request-Id` or generates a UUID, keeps it in an `IOLocal` for audit events, and echoes it on the response.
 3. **[TracingMiddleware](../src/main/scala/observability/TracingMiddleware.scala).** One server span per request, with `http.method`, `http.target`, and `http.status_code`.
 4. **Public routes** `/health` and `/ready`, then the dashboard routes when enabled. Neither goes through authentication.
-5. **[ApiKeyAuth.middleware](../src/main/scala/security/ApiKeyAuth.scala).** It reads the key from `Authorization: Bearer <key>`, `Authorization: ApiKey <key>`, or `X-Api-Key`. A missing or unknown key gets a bare 401. A known key then passes the per-instance auth throttle: `security.authentication.rate-limit-per-minute` (1,000) requests per key, in a minute that starts at the key's first request. Over it, the answer is 429 with `Retry-After`, not 401, because the two need opposite client behavior: fix the credentials, or back off. Unknown keys are counted per source (`failed-attempts-per-minute`, 20); a source over it gets the same 429 with no lookup, valid key or not, so a guess that lands does not get through. Behind the ALB (`trust-forwarded-for`, set by Terraform) the source is the last `X-Forwarded-For` entry; otherwise it is the connecting address.
+5. **[ApiKeyAuth.middleware](../src/main/scala/security/ApiKeyAuth.scala).** It reads the key from `Authorization: Bearer <key>`, `Authorization: ApiKey <key>`, or `X-Api-Key`. A missing or unknown key gets a 401 with an `unauthorized` error body. A known key then passes the per-instance auth throttle: `security.authentication.rate-limit-per-minute` (1,000) requests per key, in a minute that starts at the key's first request. Over it, the answer is 429 with `Retry-After`, not 401, because the two need opposite client behavior: fix the credentials, or back off. Unknown keys are counted per source (`failed-attempts-per-minute`, 20); a source over it gets the same 429 with no lookup, valid key or not, so a guess that lands does not get through. Behind the ALB (`trust-forwarded-for`, set by Terraform) the source is the last `X-Forwarded-For` entry; otherwise it is the connecting address.
 6. **Permission check** (`ApiKeyAuth.requirePermission`). A key without the route's permission gets 403 before any state is touched.
 
 An unauthenticated request to an unknown path therefore gets 401; an authenticated one gets 404.
@@ -138,7 +138,7 @@ All three stores run the same loop ([ADR-004](adr/004-occ-over-pessimistic-locki
 When the wrapped call still fails, whether from an open breaker, a full bulkhead, an error, or a timeout, the check does not fail. It answers from `resilience.degradation-mode` ([GracefulDegradation](../src/main/scala/resilience/GracefulDegradation.scala)) and counts `RateLimitDegraded{reason}`:
 
 - `reject-all` (the default in `application.conf` and Terraform) answers 429 with `Retry-After: 60`.
-- `allow-all` answers 200 with 100 tokens remaining. Downstream spend is unbounded while degraded.
+- `allow-all` answers 200 with the profile's capacity remaining. Downstream spend is unbounded while degraded.
 
 `GET /v1/ratelimit/status/{key}` reads one item through the same wrapper, but a failure propagates instead of degrading, and the API answers 503 `storage_unavailable`. It used to report a failed read as a key never seen, so an outage showed every bucket full. A key that really was never seen reads as full capacity.
 

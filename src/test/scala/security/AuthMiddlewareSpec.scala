@@ -216,16 +216,28 @@ class AuthMiddlewareSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
         retryAfter.flatMap(_.toIntOption)
           .exists(n => n >= 1 && n <= 60) shouldBe true
         body should include("retryAfter")
-        body should include("Rate limited")
+        body should include(""""error":"rate_limited"""")
+        body should include(""""message":"Rate limited""")
       }
 
-    "a missing key is still a bare 401" in throttled(2)
-      .flatMap(r => statusAndBody(r, requestWithNoAuth))
-      .asserting(_ shouldBe Some((Status.Unauthorized, "")))
+    // The 401 was empty, the one error with no body to read.
+    "a missing key is a 401 that says so" in throttled(2)
+      .flatMap(r => statusAndBody(r, requestWithNoAuth)).asserting(
+        _ shouldBe Some((
+          Status.Unauthorized,
+          """{"error":"unauthorized","message":"Missing API key in Authorization header"}""",
+        )),
+      )
 
-    "an invalid key is still a bare 401" in throttled(2)
-      .flatMap(r => statusAndBody(r, requestWithBearer("not-a-real-key")))
-      .asserting(_ shouldBe Some((Status.Unauthorized, "")))
+    "an invalid key is a 401 that says so, without echoing the key" in
+      throttled(2)
+        .flatMap(r => statusAndBody(r, requestWithBearer("not-a-real-key")))
+        .asserting(
+          _ shouldBe Some((
+            Status.Unauthorized,
+            """{"error":"unauthorized","message":"Invalid API key"}""",
+          )),
+        )
 
     "the throttle is per client: one key over the limit does not affect another" in
       throttled(1).flatMap(r =>

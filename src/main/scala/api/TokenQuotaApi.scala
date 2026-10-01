@@ -118,24 +118,19 @@ class TokenQuotaApi[F[_]: Async: Tracer](
   ): Throwable => F[Response[F]] =
     case e: MessageFailure => Async[F].raiseError(e)
     case e => logger.error(e)(s"Token quota $op failed") *>
-        ServiceUnavailable(io.circe.Json.obj(
-          "error" -> io.circe.Json.fromString("storage_unavailable"),
-          "message" -> io.circe.Json.fromString(
-            if reconcile then
-              "The quota store did not answer; retry with the same usage"
-            else
-              "The quota store did not answer; the check did not complete, retry it",
-          ),
+        ServiceUnavailable(ApiError.body(
+          ApiError.StorageUnavailable,
+          if reconcile then
+            "The quota store did not answer; retry with the same usage"
+          else
+            "The quota store did not answer; the check did not complete, retry it",
         )).map(withRetryAfter(ContendedRetryAfterSeconds))
 
   private def nonNegative(
       values: Long*,
   )(message: String)(ok: => F[Response[F]]): F[Response[F]] =
     if values.exists(_ < 0) then
-      BadRequest(io.circe.Json.obj(
-        "error" -> io.circe.Json.fromString("validation_error"),
-        "message" -> io.circe.Json.fromString(message),
-      ))
+      BadRequest(ApiError.body(ApiError.ValidationError, message))
     else ok
 
   private def buildCheckResponse(decision: QuotaDecision): F[Response[F]] =
@@ -159,25 +154,21 @@ class TokenQuotaApi[F[_]: Async: Tracer](
             retryAfter = Some(retryAfter),
             message =
               Some(s"${level.prefix} quota exceeded: $used/$limit tokens used"),
+            error = Some(TokenQuotaApi.ExceededCode),
           ).asJson,
         ).map(withRetryAfter(retryAfter))
-      case QuotaDecision.NeverFits(level, limit, requested) =>
-        BadRequest(io.circe.Json.obj(
-          "error" -> io.circe.Json.fromString("validation_error"),
-          "message" ->
-            io.circe.Json
-              .fromString(s"estimate of $requested tokens exceeds the ${level
-                  .prefix} limit of $limit, so it can never be admitted"),
-        ))
+      case QuotaDecision.NeverFits(level, limit, requested) => BadRequest(
+          ApiError.body(
+            ApiError.ValidationError,
+            s"estimate of $requested tokens exceeds the ${level
+                .prefix} limit of $limit, so it can never be admitted",
+          ),
+        )
+      // The same body as reconcile's contended 503 and the store-failure 503.
+      // It answered in the check's own shape, so this route had two 503
+      // bodies and a client had to try both.
       case QuotaDecision.Contended(attempts) => ServiceUnavailable(
-          TokenQuotaCheckResponse(
-            allowed = false,
-            remainingTokens = Map.empty,
-            exceededLevel = None,
-            retryAfter = Some(ContendedRetryAfterSeconds),
-            message =
-              Some(s"quota state contended after $attempts attempts; nothing was reserved, retry shortly"),
-          ).asJson,
+          ApiError.body(ApiError.Contended, s"quota state contended after $attempts attempts; nothing was reserved, retry shortly"),
         ).map(withRetryAfter(ContendedRetryAfterSeconds))
 
   private def buildReconcileResponse(result: ReconcileResult): F[Response[F]] =
@@ -186,25 +177,18 @@ class TokenQuotaApi[F[_]: Async: Tracer](
           TokenQuotaReconcileResponse("reconciled", inputDelta, outputDelta)
             .asJson,
         )
-      case ReconcileResult.NotFound => NotFound(io.circe.Json.obj(
-          "error" -> io.circe.Json.fromString("reservation_not_found"),
-          "message" ->
-            io.circe.Json.fromString("No live reservation with this ID for this key: unknown, expired, or another client's"),
+      case ReconcileResult.NotFound => NotFound(ApiError.body(
+          "reservation_not_found",
+          "No live reservation with this ID for this key: unknown, expired, or another client's",
         ))
-      case ReconcileResult.Conflict(recorded) => Conflict(io.circe.Json.obj(
-          "error" -> io.circe.Json.fromString("already_reconciled"),
-          "message" ->
-            io.circe.Json
-              .fromString(s"Reservation already reconciled with ${recorded
-                  .actualInput} input and ${recorded
-                  .actualOutput} output tokens"),
+      case ReconcileResult.Conflict(recorded) => Conflict(ApiError.body(
+          "already_reconciled",
+          s"Reservation already reconciled with ${recorded
+              .actualInput} input and ${recorded.actualOutput} output tokens",
         ))
-      case ReconcileResult.Contended(attempts) =>
-        ServiceUnavailable(io.circe.Json.obj(
-          "error" -> io.circe.Json.fromString("contended"),
-          "message" ->
-            io.circe.Json.fromString(s"reconciliation contended after $attempts attempts; nothing was recorded, retry shortly"),
-        )).map(withRetryAfter(ContendedRetryAfterSeconds))
+      case ReconcileResult.Contended(attempts) => ServiceUnavailable(
+          ApiError.body(ApiError.Contended, s"reconciliation contended after $attempts attempts; nothing was recorded, retry shortly"),
+        ).map(withRetryAfter(ContendedRetryAfterSeconds))
 
   private def withRetryAfter(seconds: Int)(resp: Response[F]): Response[F] =
     resp.putHeaders(Header.Raw(ci"Retry-After", seconds.toString))
@@ -295,6 +279,8 @@ case class TokenQuotaCheckResponse(
     message: Option[String] = None,
     // Present when allowed; reconcile takes it.
     reservationId: Option[String] = None,
+    // Set with `message` on the 429, like every other error body.
+    error: Option[String] = None,
 )
 
 // The estimate is not part of the request: reconcile reads it from the
@@ -314,6 +300,8 @@ case class TokenQuotaReconcileResponse(
 object TokenQuotaApi:
   /** What a 503 tells clients to wait before retrying a contended write. */
   val ContendedRetryAfterSeconds: Int = 1
+
+  val ExceededCode = "quota_exceeded"
 
   def apply[F[_]: Async: Tracer](
       quotaService: TokenQuotaService[F],

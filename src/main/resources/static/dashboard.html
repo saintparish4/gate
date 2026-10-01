@@ -875,7 +875,7 @@
           if (!res.ok) {
             const error = await res.json();
             showConfigMessage(
-              error.error || "Failed to update configuration",
+              error.message || "Failed to update configuration",
               "error",
             );
             return;

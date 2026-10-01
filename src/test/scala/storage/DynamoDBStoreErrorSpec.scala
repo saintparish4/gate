@@ -133,10 +133,12 @@ class DynamoDBStoreErrorSpec
       ).use(resilientStore =>
         resilientStore.checkAndConsume("test-key", cost = 1, testProfile)
           .asserting { decision =>
+            // The profile's capacity, marked degraded. It was 100 whatever the
+            // profile, and nothing told it apart from a real admission.
             decision shouldBe a[RateLimitDecision.Allowed]
-            // GracefulDegradation.AllowAll grants 100 tokens as a sentinel value
+            decision.degraded shouldBe true
             decision.asInstanceOf[RateLimitDecision.Allowed]
-              .tokensRemaining shouldBe 100
+              .tokensRemaining shouldBe testProfile.capacity
           },
       )
     }
@@ -188,7 +190,10 @@ class DynamoDBStoreErrorSpec
         GracefulDegradation.DegradationMode.RejectAll,
       ).use(resilientStore =>
         resilientStore.checkAndConsume("reject-key", cost = 1, testProfile)
-          .asserting(decision => decision shouldBe a[RateLimitDecision.Rejected]),
+          .asserting { decision =>
+            decision shouldBe a[RateLimitDecision.Rejected]
+            decision.degraded shouldBe true
+          },
       )
     }
   }

@@ -9,7 +9,7 @@ import org.http4s.circe.CirceEntityDecoder.*
 import org.http4s.circe.CirceEntityEncoder.*
 import org.http4s.dsl.Http4sDsl
 import org.http4s.headers.`Content-Type`
-import org.http4s.server.{AuthMiddleware, Router}
+import org.http4s.server.AuthMiddleware
 import org.typelevel.log4cats.Logger
 import org.typelevel.otel4s.trace.Tracer
 
@@ -122,21 +122,28 @@ class Routes[F[_]: Async: Tracer](
         guard(client, Permission.QuotaCheck)(
           tokenQuotaApi match
             case Some(api) => api.check(req.req, client)
-            case None => Response[F](status = Status.NotFound).pure[F],
+            case None => quotaDisabled,
         )
 
       case req @ POST -> Root / "v1" / "quota" / "reconcile" as client =>
         guard(client, Permission.QuotaReconcile)(
           tokenQuotaApi match
             case Some(api) => api.reconcile(req.req, client)
-            case None => Response[F](status = Status.NotFound).pure[F],
+            case None => quotaDisabled,
         )
 
       // Prometheus scrape. It sat on the public routes while AdminMetrics went
       // unchecked, so anyone who could reach the listener could read it.
       case GET -> Root / "metrics" as client =>
         guard(client, Permission.AdminMetrics)(scrapeMetrics)
+
+      // The auth middleware answers an empty 404 itself for a path no route
+      // here matches, so the fallback in toHttpApp never sees it.
+      case req as _ => Routes.noRoute(req).pure[F]
     }
+
+  private def quotaDisabled: F[Response[F]] =
+    NotFound(ApiError.body(ApiError.NotFound, "Token quotas are not enabled"))
 
   private def guard(client: AuthenticatedClient, permission: Permission)(
       route: => F[Response[F]],
@@ -158,7 +165,9 @@ class Routes[F[_]: Async: Tracer](
             bytes.length.toLong,
           ))
       }
-    case None => NotFound()
+    case None => NotFound(
+        ApiError.body(ApiError.NotFound, "Prometheus metrics are not enabled"),
+      )
 
   // Combined routes — public probes first so health checks never hit auth
   val routes: HttpRoutes[F] = TracingMiddleware[F](
@@ -166,8 +175,7 @@ class Routes[F[_]: Async: Tracer](
       authMiddleware(authedRoutes),
   )
 
-  def httpApp: HttpApp[F] = org.http4s.server.middleware.ErrorHandling
-    .httpApp(Router("/" -> routes).orNotFound)
+  def httpApp: HttpApp[F] = Routes.toHttpApp(routes, logger)
 
 // API models
 case class HealthResponse(status: String, version: String)
@@ -181,6 +189,56 @@ object BuildInfo:
   val version = buildinfo.BuildInfo.version
 
 object Routes:
+
+  /** Close `routes` into an app whose every answer has a JSON error body.
+    *
+    * http4s' own `orNotFound` and `ErrorHandling` did this job and answered in
+    * plain text: `Not found`, `The request body was malformed.`, and an empty
+    * 500. Statuses are unchanged: 400 for a body that is not JSON, 422 for one
+    * that does not match the schema, 404 for an unknown path, 500 otherwise.
+    * Main and the tests both build their app here, so they cannot drift.
+    */
+  def toHttpApp[F[_]: Async](
+      routes: HttpRoutes[F],
+      logger: Logger[F],
+  ): HttpApp[F] = cats.data.Kleisli { request =>
+    val dsl = Http4sDsl[F]
+    import dsl.*
+    routes.run(request).getOrElse(noRoute(request)).handleErrorWith {
+      case failure: MessageFailure =>
+        Response[F](failure.toHttpResponse[F](request.httpVersion).status)
+          .withEntity(ApiError.body(ApiError.InvalidRequest, describe(failure)))
+          .pure[F]
+      case error => logger.error(error)(s"Unhandled error serving ${request
+            .method} ${request.uri.path}") *> InternalServerError(ApiError.body(
+          ApiError.InternalError,
+          "The request failed unexpectedly; whether it took effect is unknown",
+        ))
+    }
+  }
+
+  private def noRoute[F[_]](request: Request[F]): Response[F] =
+    Response[F](Status.NotFound).withEntity(ApiError.body(
+      ApiError.NotFound,
+      s"No route for ${request.method} ${request.uri.path}",
+    ))
+
+  // The path of the field that failed, never its value: the body is the
+  // caller's, but it has no place in a log line or an error another system
+  // may store.
+  private def describe(failure: MessageFailure): String = failure match
+    case InvalidMessageBodyFailure(
+          _,
+          Some(decoding: io.circe.DecodingFailure),
+        ) =>
+      val path = io.circe.CursorOp.opsToPath(decoding.history)
+      if path.isEmpty then "The request body was invalid."
+      else s"The request body was invalid at $path"
+    case _: InvalidMessageBodyFailure => "The request body was invalid."
+    case _: MalformedMessageBodyFailure =>
+      "The request body was not valid JSON."
+    case _ => "The request could not be read."
+
   def apply[F[_]: Async: Tracer](
       rateLimitStore: RateLimitStore[F],
       idempotencyStore: IdempotencyStore[F],

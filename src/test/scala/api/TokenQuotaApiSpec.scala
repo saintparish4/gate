@@ -217,12 +217,13 @@ class TokenQuotaApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
       for
         resp <- api
           .check(checkRequest("user-f", estimatedInput = 10), testClient)
-        body <- resp.as[TokenQuotaCheckResponse]
+        body <- resp.bodyText.compile.string
       yield
         resp.status shouldBe Status.ServiceUnavailable
         resp.headers.get(ci"Retry-After").map(_.head.value) shouldBe Some("1")
-        body.allowed shouldBe false
-        body.exceededLevel shouldBe None
+        // The error shape, as reconcile's contended 503 has: it answered in
+        // the check's own shape, a second 503 body on one route.
+        body should startWith("""{"error":"contended","message":""")
     }
 
     "returns 400 for negative reconcile counts" in makeApi()

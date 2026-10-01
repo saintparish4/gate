@@ -51,8 +51,9 @@ class DashboardApi[F[_]: Async](
 
     // GET /dashboard — serve the single-page HTML dashboard from classpath
     case req @ GET -> Root / "dashboard" => StaticFile
-        .fromResource[F]("static/dashboard.html", Some(req))
-        .getOrElseF(NotFound("Dashboard resource not found"))
+        .fromResource[F]("static/dashboard.html", Some(req)).getOrElseF(NotFound(
+          ApiError.body(ApiError.NotFound, "Dashboard resource not found"),
+        ))
 
     // GET /dashboard/api/config — bucket configuration for the UI
     case GET -> Root / "dashboard" / "api" / "config" =>
@@ -110,7 +111,9 @@ class DashboardApi[F[_]: Async](
           "message" -> Json.fromString("Configuration updated successfully"),
         ))
       yield response).handleErrorWith(error =>
-        BadRequest(Json.obj("error" -> Json.fromString(error.getMessage))),
+        // It answered `{"error": reason}` alone, with the reason where every
+        // other route puts a code.
+        BadRequest(ApiError.body(ApiError.ValidationError, error.getMessage)),
       )
 
     // POST /dashboard/api/check — consume one token from the demo bucket
@@ -121,14 +124,14 @@ class DashboardApi[F[_]: Async](
         now <- Clock[F].realTime.map(d => Instant.ofEpochMilli(d.toMillis))
         _ <- publishDashboardDecision(decision, now)
         response <- decision match
-          case RateLimitDecision.Allowed(tokensRemaining, resetAt) =>
+          case RateLimitDecision.Allowed(tokensRemaining, resetAt, _) =>
             Ok(Json.obj(
               "allowed" -> Json.True,
               "tokensRemaining" -> Json.fromInt(tokensRemaining),
               "limit" -> Json.fromInt(profile.capacity),
               "resetAt" -> Json.fromString(resetAt.toString),
             ))
-          case RateLimitDecision.Rejected(retryAfter, resetAt) =>
+          case RateLimitDecision.Rejected(retryAfter, resetAt, _) =>
             // Always 200 so dashboard JS can read the body without error handling.
             Ok(Json.obj(
               "allowed" -> Json.False,
@@ -174,7 +177,10 @@ class DashboardApi[F[_]: Async](
         yield ServerSentEvent(data = Some(data.noSpaces))
       }.handleErrorWith(error =>
         Stream.eval(Async[F].delay(ServerSentEvent(data =
-          Some(Json.obj("error" -> Json.fromString(error.getMessage)).noSpaces),
+          Some(
+            ApiError.body(ApiError.StorageUnavailable, error.getMessage)
+              .noSpaces,
+          ),
         ))),
       )
 
@@ -187,7 +193,10 @@ class DashboardApi[F[_]: Async](
           val eventStream = fs2.Stream.repeatEval(queue.take)
             .map(ev => ServerSentEvent(data = Some(ev.asJson.noSpaces)))
           Ok(eventStream)
-        case None => NotFound()
+        case None => NotFound(
+            ApiError
+              .body(ApiError.NotFound, "The decision stream is not enabled"),
+          )
   }
 
   private def publishDashboardDecision(
@@ -195,7 +204,7 @@ class DashboardApi[F[_]: Async](
       now: Instant,
   ): F[Unit] =
     val event = decision match
-      case RateLimitDecision.Allowed(tokensRemaining, _) => RateLimitEvent
+      case RateLimitDecision.Allowed(tokensRemaining, _, _) => RateLimitEvent
           .Allowed(
             timestamp = now,
             apiKey = "dashboard-demo",
@@ -205,15 +214,16 @@ class DashboardApi[F[_]: Async](
             cost = 1,
             tier = "dashboard",
           )
-      case RateLimitDecision.Rejected(retryAfter, _) => RateLimitEvent.Rejected(
-          timestamp = now,
-          apiKey = "dashboard-demo",
-          clientId = "dashboard",
-          endpoint = "dashboard",
-          retryAfterSeconds = retryAfter,
-          reason = "Rate limit exceeded",
-          tier = "dashboard",
-        )
+      case RateLimitDecision.Rejected(retryAfter, _, degraded) => RateLimitEvent
+          .Rejected(
+            timestamp = now,
+            apiKey = "dashboard-demo",
+            clientId = "dashboard",
+            endpoint = "dashboard",
+            retryAfterSeconds = retryAfter,
+            reason = RateLimitApi.rejectionReason(degraded),
+            tier = "dashboard",
+          )
     eventPublisher.publish(event).handleError(e =>
       logger.warn(s"Dashboard event publish failed: ${e.getMessage}"),
     )

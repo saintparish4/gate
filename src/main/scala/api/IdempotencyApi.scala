@@ -46,11 +46,10 @@ class IdempotencyApi[F[_]: Async: Tracer](
       checkReq <- request.as[IdempotencyCheckRequest]
       response <- checkReq.ttl.filter(_ <= 0) match
         // It used to be accepted, and wrote a record that was already expired.
-        case Some(ttl) => BadRequest(io.circe.Json.obj(
-            "error" -> io.circe.Json.fromString("validation_error"),
-            "message" ->
-              io.circe.Json.fromString(s"ttl must be positive, got $ttl"),
-          ))
+        case Some(ttl) => BadRequest(
+            ApiError
+              .body(ApiError.ValidationError, s"ttl must be positive, got $ttl"),
+          )
         case None => runCheck(checkReq, client, startTime)
     yield response).handleErrorWith(storageFailure("check"))
 
@@ -128,15 +127,11 @@ class IdempotencyApi[F[_]: Async: Tracer](
       .debug(s"Completing idempotency key: $key, client=${client.clientId}")
     response <-
       if storedBytes > IdempotencyApi.MaxStoredResponseBytes then
-        PayloadTooLarge {
-          io.circe.Json.obj(
-            "error" -> io.circe.Json.fromString("response_too_large"),
-            "message" -> io.circe.Json.fromString(
-              s"The response to store is $storedBytes bytes encoded; the limit is ${IdempotencyApi
-                  .MaxStoredResponseBytes}. The key stays pending: store a smaller response, such as a reference to the result, or mark the key failed.",
-            ),
-          )
-        }
+        PayloadTooLarge(ApiError.body(
+          "response_too_large",
+          s"The response to store is $storedBytes bytes encoded; the limit is ${IdempotencyApi
+              .MaxStoredResponseBytes}. The key stays pending: store a smaller response, such as a reference to the result, or mark the key failed.",
+        ))
       else
         store.storeResponse(
           TenantKey(client.clientId, key),
@@ -159,6 +154,7 @@ class IdempotencyApi[F[_]: Async: Tracer](
                 status = "conflict",
                 message =
                   Some("Could not store response - key may not exist or is not pending"),
+                error = Some(IdempotencyApi.NotPendingCode),
               ).asJson,
             ),
         )
@@ -190,6 +186,7 @@ class IdempotencyApi[F[_]: Async: Tracer](
             status = "conflict",
             message =
               Some("Could not mark failed - key may not exist or is not pending"),
+            error = Some(IdempotencyApi.NotPendingCode),
           ).asJson,
         )
   yield response).handleErrorWith(storageFailure("fail"))
@@ -201,20 +198,16 @@ class IdempotencyApi[F[_]: Async: Tracer](
   private def storageFailure(op: String): Throwable => F[Response[F]] =
     case e: CorruptIdempotencyRecordException => logger
         .error(e)(s"Corrupt idempotency record for key=${e.key}") *>
-        ServiceUnavailable(io.circe.Json.obj(
-          "error" -> io.circe.Json.fromString("storage_corruption"),
-          "message" ->
-            io.circe.Json
-              .fromString(s"Idempotency record corrupted: ${e.detail}"),
+        ServiceUnavailable(ApiError.body(
+          "storage_corruption",
+          s"Idempotency record corrupted: ${e.detail}",
         ))
     case e: MessageFailure => Async[F].raiseError(e)
     case e => logger.error(e)(s"Idempotency $op failed") *>
         (if op == "check" then countCheck("error") else Async[F].unit) *>
-        ServiceUnavailable(io.circe.Json.obj(
-          "error" -> io.circe.Json.fromString("storage_unavailable"),
-          "message" -> io.circe.Json.fromString(
-            s"Idempotency store failed during $op; retry the request",
-          ),
+        ServiceUnavailable(ApiError.body(
+          ApiError.StorageUnavailable,
+          s"Idempotency store failed during $op; retry the request",
         ))
 
   private def countCheck(result: String): F[Unit] = metricsPublisher
@@ -268,6 +261,7 @@ class IdempotencyApi[F[_]: Async: Tracer](
             originalResponse = None,
             message =
               Some("Request body does not match the original request for this idempotency key"),
+            error = Some(IdempotencyApi.ConflictCode),
           ).asJson,
         )
 
@@ -363,6 +357,9 @@ case class IdempotencyCheckResponse(
     originalResponse: Option[OriginalResponse] = None,
     firstSeenAt: Option[String] = None,
     message: Option[String] = None,
+    // Set with `message` on the 409, like every other error body. `status`
+    // still carries the outcome.
+    error: Option[String] = None,
 )
 
 case class OriginalResponse(
@@ -381,9 +378,13 @@ case class IdempotencyUpdateResponse(
     idempotencyKey: String,
     status: String,
     message: Option[String] = None,
+    error: Option[String] = None,
 )
 
 object IdempotencyApi:
+  val ConflictCode = "idempotency_conflict"
+  val NotPendingCode = "not_pending"
+
   /** The largest stored response, in bytes of its encoded JSON. A DynamoDB item
     * holds at most 400 KB, and the response is stored inline in the record
     * (replay is not streamed), so a larger one failed the write and answered

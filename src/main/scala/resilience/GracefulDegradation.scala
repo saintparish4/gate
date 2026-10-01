@@ -29,15 +29,32 @@ object GracefulDegradation:
     /** Fail closed: refuse everything. The default. */
     case object RejectAll extends DegradationMode
 
+  /** How long a degraded answer tells the caller to wait, and how far ahead its
+    * `resetAt` is. Nothing is known about the bucket, so it is a fixed guess.
+    */
+  val RetryAfterSeconds: Int = 60
+
+  /** The answer for `mode`, marked degraded so the API can say so. Allow-all
+    * reports the profile's capacity: it used to report 100 tokens whatever the
+    * profile, more than a 20-token bucket ever holds.
+    */
   def degradedDecision[F[_]: Temporal](
       mode: DegradationMode,
+      profile: core.RateLimitProfile,
   ): F[core.RateLimitDecision] = Clock[F].realTime.map { now =>
-    val resetAt = java.time.Instant.ofEpochMilli(now.toMillis + 60000)
+    val resetAt = java.time.Instant
+      .ofEpochMilli(now.toMillis + RetryAfterSeconds * 1000L)
     mode match
-      case DegradationMode.AllowAll => core.RateLimitDecision
-          .Allowed(tokensRemaining = 100, resetAt = resetAt)
-      case DegradationMode.RejectAll => core.RateLimitDecision
-          .Rejected(retryAfterSeconds = 60, resetAt = resetAt)
+      case DegradationMode.AllowAll => core.RateLimitDecision.Allowed(
+          tokensRemaining = profile.capacity,
+          resetAt = resetAt,
+          degraded = true,
+        )
+      case DegradationMode.RejectAll => core.RateLimitDecision.Rejected(
+          retryAfterSeconds = RetryAfterSeconds,
+          resetAt = resetAt,
+          degraded = true,
+        )
   }
 
 /** Bulkhead pattern implementation for isolating failures.
