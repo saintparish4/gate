@@ -77,3 +77,39 @@ package object testutil:
         profile: RateLimitProfile,
     ): IO[Option[RateLimitDecision.Allowed]] = IO.raiseError(ex)
     def healthCheck: IO[Either[String, Unit]] = IO.pure(Left(ex.getMessage))
+
+  /** A DynamoDbAsyncClient whose every `getItem` answers `getItemResp`, with no
+    * I/O, so a real store can run under `TestControl`. Writes succeed and
+    * ignore their conditions; anything else fails.
+    */
+  def stubDynamoClient(
+      getItemResp: software.amazon.awssdk.services.dynamodb.model.GetItemResponse,
+  ): software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient =
+    import java.lang.reflect.{InvocationHandler, Proxy}
+    import java.util.concurrent.CompletableFuture
+
+    import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient
+    import software.amazon.awssdk.services.dynamodb.model.*
+    Proxy.newProxyInstance(
+      classOf[DynamoDbAsyncClient].getClassLoader,
+      Array(classOf[DynamoDbAsyncClient]),
+      new InvocationHandler:
+        override def invoke(
+            proxy: Object,
+            method: java.lang.reflect.Method,
+            args: Array[Object],
+        ): Object = method.getName match
+          case "getItem" => CompletableFuture.completedFuture(getItemResp)
+          case "putItem" => CompletableFuture
+              .completedFuture(PutItemResponse.builder().build())
+          case "updateItem" => CompletableFuture
+              .completedFuture(UpdateItemResponse.builder().build())
+          case "describeTable" => CompletableFuture
+              .completedFuture(DescribeTableResponse.builder().build())
+          case "serviceName" => "DynamoDB"
+          case "close" => null // void
+          case other => CompletableFuture
+              .failedFuture[Object](new UnsupportedOperationException(
+                s"Stub does not implement: $other",
+              )),
+    ).asInstanceOf[DynamoDbAsyncClient]

@@ -230,11 +230,11 @@ decoded before use.
 | `key` | string | The key as you sent it |
 | `tokensRemaining` | integer | Tokens in the bucket now |
 | `limit` | integer | Your tier's capacity |
-| `resetAt` | string (ISO-8601) | Now plus the seconds to refill to capacity at your tier's rate |
+| `resetAt` | string (ISO-8601) | When the bucket would be full again, per the configured algorithm: the same value a check on it would report |
 
 Status always uses your tier's profile, even if checks on this key named a
-narrower one. A key never seen reads as full, with `resetAt` 60 seconds from
-now. No `X-RateLimit-*` headers.
+narrower one. A key never seen reads as full, with `resetAt` the current time:
+there is nothing to wait for. No `X-RateLimit-*` headers.
 
 **503:** the store could not be read. The service does not guess "full":
 

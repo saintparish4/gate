@@ -127,28 +127,26 @@ class RateLimitApi[F[_]: Async: Tracer](
       maybeStatus <- store.getStatus(TenantKey(client.clientId, key), profile)
       nowMs <- Clock[F].realTime.map(_.toMillis)
       response <- maybeStatus match
-        case Some(state) =>
-          // Calculate reset time based on current state
-          val resetAt = Instant.ofEpochMilli(nowMs).plusSeconds(
-            ((profile.capacity - state.tokensRemaining) /
-              profile.refillRatePerSecond).ceil.toLong,
-          )
-          Ok(
+        // The store's own resetAt. It was recomputed here with the token-bucket
+        // formula whatever the algorithm, so a leaky bucket or a sliding
+        // window reported a reset its check would not honor.
+        case Some(state) => Ok(
             RateLimitStatusResponse(
               key = key,
               tokensRemaining = state.tokensRemaining,
               limit = profile.capacity,
-              resetAt = resetAt.toString,
+              resetAt = state.resetAt.toString,
             ).asJson,
           )
-        case None =>
-          // No state means full capacity (never seen this key)
-          Ok(
+        // Never seen means full under every algorithm, so there is nothing to
+        // wait for: it resets now. It said 60 s from `Instant.now()`, a clock
+        // no test could control.
+        case None => Ok(
             RateLimitStatusResponse(
               key = key,
               tokensRemaining = profile.capacity,
               limit = profile.capacity,
-              resetAt = Instant.now().plusSeconds(60).toString,
+              resetAt = Instant.ofEpochMilli(nowMs).toString,
             ).asJson,
           )
     yield response).handleErrorWith(error =>
