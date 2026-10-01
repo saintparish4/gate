@@ -221,7 +221,7 @@ class IdempotencyApi[F[_]: Async: Tracer](
 
   private def buildCheckResponse(result: IdempotencyResult): F[Response[F]] =
     result match
-      case IdempotencyResult.New(key, _) => Ok(
+      case IdempotencyResult.New(key, _, _) => Ok(
           IdempotencyCheckResponse(
             status = "new",
             idempotencyKey = key,
@@ -282,7 +282,7 @@ class IdempotencyApi[F[_]: Async: Tracer](
       traceId: Option[String],
   ): F[Unit] =
     val event = result match
-      case IdempotencyResult.New(key, _) => RateLimitEvent.IdempotencyNew(
+      case IdempotencyResult.New(key, _, _) => RateLimitEvent.IdempotencyNew(
           timestamp = timestamp,
           idempotencyKey = key,
           clientId = client.apiKeyId,

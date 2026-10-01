@@ -46,17 +46,22 @@ class IdempotencyApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
                 requestHash: Option[String] = None,
             ): IO[IdempotencyResult] = capturedTtl.set(Some(ttlSeconds)) *>
               Clock[IO].realTime.map(d =>
-                IdempotencyResult
-                  .New(idempotencyKey, Instant.ofEpochMilli(d.toMillis)),
+                IdempotencyResult.New(
+                  idempotencyKey,
+                  Instant.ofEpochMilli(d.toMillis),
+                  "claim-1",
+                ),
               )
             override def storeResponse(
                 idempotencyKey: String,
                 clientId: String,
                 response: StoredResponse,
+                claimId: Option[String],
             ): IO[Boolean] = IO.pure(false)
             override def markFailed(
                 idempotencyKey: String,
                 clientId: String,
+                claimId: Option[String],
             ): IO[Boolean] = IO.pure(false)
             override def get(
                 idempotencyKey: String,
@@ -145,16 +150,18 @@ class IdempotencyApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
                 requestHash: Option[String] = None,
             ): IO[IdempotencyResult] = Clock[IO].realTime.map(d =>
               IdempotencyResult
-                .New(idempotencyKey, Instant.ofEpochMilli(d.toMillis)),
+                .New(idempotencyKey, Instant.ofEpochMilli(d.toMillis), "claim-1"),
             )
             override def storeResponse(
                 idempotencyKey: String,
                 clientId: String,
                 response: StoredResponse,
+                claimId: Option[String],
             ): IO[Boolean] = IO.pure(false)
             override def markFailed(
                 idempotencyKey: String,
                 clientId: String,
+                claimId: Option[String],
             ): IO[Boolean] = IO.pure(false)
             override def get(
                 idempotencyKey: String,
@@ -202,10 +209,12 @@ class IdempotencyApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
               idempotencyKey: String,
               clientId: String,
               response: StoredResponse,
+              claimId: Option[String],
           ): IO[Boolean] = IO.raiseError(ex)
           override def markFailed(
               idempotencyKey: String,
               clientId: String,
+              claimId: Option[String],
           ): IO[Boolean] = IO.raiseError(ex)
           override def get(
               idempotencyKey: String,

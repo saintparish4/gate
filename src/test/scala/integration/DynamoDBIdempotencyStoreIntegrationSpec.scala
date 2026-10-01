@@ -34,6 +34,12 @@ class DynamoDBIdempotencyStoreIntegrationSpec
     testDynamoDBConfig.idempotencyTable,
   )
 
+  private def claimIdOf(result: IdempotencyResult): Option[String] =
+    result match {
+      case IdempotencyResult.New(_, _, claimId) => Some(claimId)
+      case _ => None
+    }
+
   override protected def beforeEach(): Unit = {
     super.beforeEach()
     clearTable(testDynamoDBConfig.idempotencyTable)
@@ -270,17 +276,76 @@ class DynamoDBIdempotencyStoreIntegrationSpec
       }
     }
 
-    // What the ttl condition cannot do. A reclaim is by the same client, so
-    // the first run's late complete matches the new claim; telling them apart
-    // needs a claim token the API does not have.
-    "a live record still completes, including one reclaimed after expiry" in {
+    // The ttl condition alone cannot do this. A reclaim is by the same client,
+    // so the first run's late call matches the new claim: live, Pending, and
+    // its client's. The claim ID is what tells the two runs apart (ADR-006).
+    "a late complete or fail naming the first claim is refused on a reclaimed key" in {
+      val late = StoredResponse(200, "first run", Map.empty, Instant.EPOCH)
+      val test = for {
+        first <- store
+          .check("reclaimed", clientId = "client-1", ttlSeconds = -60)
+        second <- store
+          .check("reclaimed", clientId = "client-1", ttlSeconds = 3600)
+        firstId = claimIdOf(first)
+        secondId = claimIdOf(second)
+        completed <- store.storeResponse("reclaimed", "client-1", late, firstId)
+        failed <- store.markFailed("reclaimed", "client-1", firstId)
+        record <- store.get("reclaimed")
+        stillClaimed <- store
+          .check("reclaimed", clientId = "client-1", ttlSeconds = 3600)
+        own <- store.storeResponse("reclaimed", "client-1", late, secondId)
+      } yield (firstId, secondId, completed, failed, record, stillClaimed, own)
+
+      test.asserting {
+        case (
+              firstId,
+              secondId,
+              completed,
+              failed,
+              record,
+              stillClaimed,
+              own,
+            ) =>
+          firstId shouldBe defined
+          secondId shouldBe defined
+          firstId should not be secondId
+          completed shouldBe false
+          failed shouldBe false
+          record.map(_.status) shouldBe Some(IdempotencyStatus.Pending)
+          record.flatMap(_.response) shouldBe None
+          record.flatMap(_.claimId) shouldBe secondId
+          stillClaimed shouldBe a[IdempotencyResult.InProgress]
+          own shouldBe true
+      }
+    }
+
+    "a key claimed again after a failure gets a new claim ID, and the old one is refused" in {
       val done = StoredResponse(200, "ok", Map.empty, Instant.EPOCH)
       val test = for {
-        _ <- store.check("reclaimed", clientId = "client-1", ttlSeconds = -60)
-        _ <- store.check("reclaimed", clientId = "client-1", ttlSeconds = 3600)
-        completed <- store.storeResponse("reclaimed", "client-1", done)
+        first <- store
+          .check("refailed", clientId = "client-1", ttlSeconds = 3600)
+        _ <- store.markFailed("refailed", "client-1", claimIdOf(first))
+        second <- store
+          .check("refailed", clientId = "client-1", ttlSeconds = 3600)
+        stale <- store
+          .storeResponse("refailed", "client-1", done, claimIdOf(first))
+        current <- store
+          .storeResponse("refailed", "client-1", done, claimIdOf(second))
+      } yield (stale, current)
+
+      test.asserting(_ shouldBe (false, true))
+    }
+
+    // The token is optional (ADR-006), so a caller that sends none keeps the
+    // old behavior, gap included: its late complete lands on the new claim.
+    "without a claim ID a live record still completes, including a reclaimed one" in {
+      val done = StoredResponse(200, "ok", Map.empty, Instant.EPOCH)
+      val test = for {
+        _ <- store.check("unfenced", clientId = "client-1", ttlSeconds = -60)
+        _ <- store.check("unfenced", clientId = "client-1", ttlSeconds = 3600)
+        completed <- store.storeResponse("unfenced", "client-1", done)
         replay <- store
-          .check("reclaimed", clientId = "client-1", ttlSeconds = 3600)
+          .check("unfenced", clientId = "client-1", ttlSeconds = 3600)
       } yield (completed, replay)
 
       test.asserting { case (completed, replay) =>

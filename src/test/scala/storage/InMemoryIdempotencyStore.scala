@@ -6,12 +6,13 @@ import core.{
   IdempotencyRecord, IdempotencyResult, IdempotencyStatus, IdempotencyStore,
   StoredResponse,
 }
+import cats.effect.std.UUIDGen
 import cats.effect.{Clock, Ref, Temporal}
 import cats.syntax.all.*
 
 /** In-memory idempotency store for testing purposes.
   */
-class InMemoryIdempotencyStore[F[_]: Temporal](
+class InMemoryIdempotencyStore[F[_]: Temporal: UUIDGen](
     stateRef: Ref[F, Map[String, IdempotencyRecord]],
 ) extends IdempotencyStore[F]:
 
@@ -23,6 +24,7 @@ class InMemoryIdempotencyStore[F[_]: Temporal](
   ): F[IdempotencyResult] =
     for
       now <- Clock[F].realTime.map(d => Instant.ofEpochMilli(d.toMillis))
+      claimId <- UUIDGen[F].randomUUID.map(_.toString)
       result <- stateRef.modify { stateMap =>
         stateMap.get(idempotencyKey) match
           case Some(record) => record.status match
@@ -81,10 +83,11 @@ class InMemoryIdempotencyStore[F[_]: Temporal](
                   ttl = now.getEpochSecond + ttlSeconds,
                   version = record.version + 1,
                   requestHash = requestHash,
+                  claimId = Some(claimId),
                 )
                 (
                   stateMap.updated(idempotencyKey, newRecord),
-                  IdempotencyResult.New(idempotencyKey, now),
+                  IdempotencyResult.New(idempotencyKey, now, claimId),
                 )
           case None =>
             // Key doesn't exist - create with pending status
@@ -98,10 +101,11 @@ class InMemoryIdempotencyStore[F[_]: Temporal](
               ttl = now.getEpochSecond + ttlSeconds,
               version = 1,
               requestHash = requestHash,
+              claimId = Some(claimId),
             )
             (
               stateMap.updated(idempotencyKey, newRecord),
-              IdempotencyResult.New(idempotencyKey, now),
+              IdempotencyResult.New(idempotencyKey, now, claimId),
             )
       }
     yield result
@@ -110,40 +114,44 @@ class InMemoryIdempotencyStore[F[_]: Temporal](
       idempotencyKey: String,
       clientId: String,
       response: StoredResponse,
+      claimId: Option[String] = None,
   ): F[Boolean] =
     for
       now <- Clock[F].realTime.map(d => Instant.ofEpochMilli(d.toMillis))
-      result <- stateRef.modify(stateMap =>
+      result <- stateRef.modify { stateMap =>
         stateMap.get(idempotencyKey) match
           case Some(record)
               if record.status == IdempotencyStatus.Pending &&
-                record.clientId == clientId && !record.expired(now) =>
+                record.clientId == clientId && !record.expired(now) &&
+                claimId.forall(record.claimId.contains) =>
             val updated = record.copy(
               status = IdempotencyStatus.Completed,
               response = Some(response),
               updatedAt = now,
             )
             (stateMap.updated(idempotencyKey, updated), true)
-          case _ => (stateMap, false),
-      )
+          case _ => (stateMap, false)
+      }
     yield result
 
   override def markFailed(
       idempotencyKey: String,
       clientId: String,
+      claimId: Option[String] = None,
   ): F[Boolean] =
     for
       now <- Clock[F].realTime.map(d => Instant.ofEpochMilli(d.toMillis))
-      result <- stateRef.modify(stateMap =>
+      result <- stateRef.modify { stateMap =>
         stateMap.get(idempotencyKey) match
           case Some(record)
               if record.status == IdempotencyStatus.Pending &&
-                record.clientId == clientId && !record.expired(now) =>
+                record.clientId == clientId && !record.expired(now) &&
+                claimId.forall(record.claimId.contains) =>
             val updated = record
               .copy(status = IdempotencyStatus.Failed, updatedAt = now)
             (stateMap.updated(idempotencyKey, updated), true)
-          case _ => (stateMap, false),
-      )
+          case _ => (stateMap, false)
+      }
     yield result
 
   override def get(idempotencyKey: String): F[Option[IdempotencyRecord]] =
@@ -152,6 +160,6 @@ class InMemoryIdempotencyStore[F[_]: Temporal](
   override def healthCheck: F[Either[String, Unit]] = Temporal[F].pure(Right(()))
 
 object InMemoryIdempotencyStore:
-  def create[F[_]: Temporal]: F[InMemoryIdempotencyStore[F]] = Ref
+  def create[F[_]: Temporal: UUIDGen]: F[InMemoryIdempotencyStore[F]] = Ref
     .of[F, Map[String, IdempotencyRecord]](Map.empty)
     .map(new InMemoryIdempotencyStore[F](_))
