@@ -732,6 +732,10 @@ Each point follows from the behavior above.
 - **Idempotency:** run the operation only on `new`, and finish every claimed
   key with `complete` or `fail`, or it answers `in_progress` until its TTL
   passes. A 503 means the state is unknown: do not run the operation.
+  Choose a TTL longer than the operation can take. Once it passes, `complete`
+  and `fail` answer 409 and the next check answers `new`; and if that check
+  has already reclaimed the key, a late `complete` from the first run is
+  accepted as the second's, because both come from the same client.
 - **Quota:** keep the check's `reservationId` and reconcile with it. After a
   503 on reconcile, send the same request again after `Retry-After`; a repeat
   with the same usage is safe. A 503 on check means you were not admitted.
