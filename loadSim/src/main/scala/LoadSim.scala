@@ -356,24 +356,24 @@ object Scenarios:
    * INCONCLUSIVE (see Verdict); the run exits 0, 1 or 2 for the worst of them.
    *
    * Invariant A — token-bucket non-over-issue:
-   *   Server must never issue more tokens than capacity + refillRate * duration.
+   *   Server must never issue more tokens than capacity + refillRate * window.
    *   Uses free-api-key (Free tier): capacity=20 tokens, refillRate=2 tokens/s.
-   *   N=50 parallel clients target a single unique key for T=30s.
-   *   Assert: allowed_count <= capacity + refillRate * (measured_elapsed + 5s).
-   *   The 5s is a clock-correction allowance, not slack for the algorithm: the
-   *   server refills on its wall clock and this bound uses the client's monotonic
-   *   window, so a forward wall-clock correction on the server (a WSL2/Docker
-   *   step, a chrony slew on Fargate) is refill for time the client never saw.
-   *   Excess is printed in seconds -- a correction is a bounded one-off, an
-   *   algorithmic over-issue grows with duration. Measured 2.9s on both real
-   *   DynamoDB and LocalStack; see issue #10. The elapsed window is measured
-   *   rather than assumed:
-   *   the server refills on its own clock, and the run always outlives the nominal
-   *   30s by however long it takes to cancel 50 in-flight requests. A ceiling pinned
-   *   to the nominal duration failed correct limiters on slow or cold hosts.
-   *   allowed_count >= a quarter of that budget (a limiter that goes dark also fails),
-   *   at least one request was blocked (otherwise the run proved nothing), and
-   *   no HTTP errors.
+   *   N=20 parallel clients target a single unique key for T=30s.
+   *   The bucket refills on the server's wall clock, so the window is read from
+   *   the server: the span of the `Date` headers on its answers. That header
+   *   has one-second resolution, which costs a second of allowance, and a
+   *   second more covers the first request's latency:
+   *     allowed_count <= capacity + refillRate * (date_span + 2s)
+   *   The window used to be this machine's monotonic clock plus a 5 s
+   *   allowance (10 tokens of 80), added when runs showed 2-3 s of refill the
+   *   client had not seen (issue #10) and blamed on clock corrections on the
+   *   server. On 1 October 2026 the same excess appeared on every run driven
+   *   from one laptop, against a local server and against AWS, and on no CI
+   *   run; that laptop's monotonic clock measured 3.2-3.5% slow against an
+   *   outside clock. The load generator had under-measured its own window.
+   *   Also: allowed_count >= a quarter of the nominal budget (a limiter that
+   *   goes dark is broken too), at least one request blocked (otherwise the
+   *   run proved nothing), no errors, and no answer from degradation mode.
    *
    * Invariant B — idempotency exactly-one-Created:
    *   For K=10 shared keys, N=50 parallel clients must never observe more than
@@ -431,6 +431,65 @@ object Scenarios:
                  |""".stripMargin
             )
     yield overall.exitCode
+
+  /** The arithmetic of invariant A, kept apart from the driving so it can be
+    * tested on its own.
+    */
+  object InvariantA:
+
+    /** Seconds added to a client-measured window: the tail of requests still
+      * answered after the workers were told to stop.
+      */
+    val ClientAllowanceSecs = 1
+
+    /** Seconds added to a server-measured window: one because a `Date` header
+      * has one-second resolution, one because the bucket is created by the
+      * first request, a little before its answer is dated.
+      */
+    val ServerAllowanceSecs = 2
+
+    /** How far this machine's two clocks may disagree before a window measured
+      * with them is not trusted.
+      */
+    val MaxClockGapPct = 1.0
+
+    /** How long the workers ran.
+      *
+      * @param serverSecs
+      *   Last `Date` header minus the first, when every answer carried one
+      */
+    final case class Window(monotonicSecs: Double, wallSecs: Double, serverSecs: Option[Long]):
+      /** How far apart this machine's two clocks put the same window. */
+      def clientGapPct: Double =
+        val longer = math.max(monotonicSecs, wallSecs)
+        if longer <= 0 then 0.0 else math.abs(monotonicSecs - wallSecs) / longer * 100.0
+
+      def clientClocksAgree: Boolean = clientGapPct <= MaxClockGapPct
+
+      def describe: String =
+        val server = serverSecs.fold("server=unknown (no Date header)")(s => s"server=${s}s")
+        val gap    = if clientClocksAgree then "" else f", THIS MACHINE'S CLOCKS DISAGREE BY $clientGapPct%.1f%%"
+        f"window: $server, client monotonic=$monotonicSecs%.1fs wall=$wallSecs%.1fs$gap"
+
+    final case class Ceiling(maxAllowed: Long, windowSecs: Double, source: String)
+
+    /** The most a correct bucket can have issued over `window`, or why that
+      * cannot be said.
+      *
+      * The server's clock is used when it is known: it is the clock the bucket
+      * refills on, and it does not depend on the machine running the load.
+      * Failing that, this machine's clocks are used only while they agree with
+      * each other; a window they disagree on has no ceiling worth asserting.
+      */
+    def ceiling(capacity: Int, refillPerSec: Int, window: Window): Either[String, Ceiling] =
+      def over(secs: Double, source: String): Ceiling =
+        Ceiling(capacity + math.ceil(refillPerSec * secs).toLong, secs, source)
+      window.serverSecs match
+        case Some(span) => Right(over(span.toDouble + ServerAllowanceSecs, "server"))
+        case None if window.clientClocksAgree =>
+          Right(over(math.max(window.monotonicSecs, window.wallSecs) + ClientAllowanceSecs, "client"))
+        case None =>
+          Left("CLOCKS DISAGREE: the answers carried no Date header, and this machine's monotonic and wall clocks put the window more than 1% apart, so there is no window to compute a ceiling from")
 
   /**
    * What one invariant's run showed.
@@ -502,15 +561,8 @@ object Scenarios:
     val apiKey        = freeKey
     val capacity      = 20
     val refillPerSec  = 2
-    // The server refills on its wall clock; this bound uses the client's
-    // monotonic window. A wall-clock correction on the server -- WSL2/Docker
-    // clocks step, Fargate's chrony slews -- shows up as refill for time the
-    // client never saw, at rate * seconds corrected. Allow a few seconds of
-    // that. A real algorithmic over-issue grows with duration and blows
-    // through any fixed allowance; a clock correction is a bounded one-off.
-    // Excess is reported in seconds so the two stay distinguishable.
-    val clockSkewAllowanceSec = 5
-    // maxAllowed is computed after the run, from the measured window (see below).
+    // maxAllowed is computed after the run, from the measured window (see
+    // InvariantA.ceiling).
     val minAllowed    = (capacity + (refillPerSec * durationSecs)) / 4
     val key           = s"correctness:A:$runId"  // fresh key so prior state doesn't bias
 
@@ -524,11 +576,16 @@ object Scenarios:
     // answers, so with two tasks the before and after came from different
     // counters and the difference meant nothing.
     val degraded = new AtomicLong(0)
+    // The server's clock, as its Date headers show it: earliest and latest
+    // second seen, and how many answers carried none.
+    val firstDate = new AtomicLong(Long.MaxValue)
+    val lastDate  = new AtomicLong(Long.MinValue)
+    val undated   = new AtomicLong(0)
     val sampler = new ErrorSampler(5)
 
-    // Returns how long the workers ran.
-    def drive: IO[FiniteDuration] =
-      IO.monotonic.flatMap { startedAt =>
+    // Returns the window the workers ran for, by each clock.
+    def drive: IO[InvariantA.Window] =
+      (IO.monotonic, IO.realTime).tupled.flatMap { (monoStart, wallStart) =>
         IO.race(
           progressTicker("invariantA", durationSecs, total, allowed, blocked, errors),
           (0 until concurrency).toList.parTraverse_ { _ =>
@@ -537,31 +594,35 @@ object Scenarios:
                   total.incrementAndGet()
                   if answer.degraded then degraded.incrementAndGet()
                   if answer.allowed then allowed.incrementAndGet() else blocked.incrementAndGet()
+                  answer.serverEpochSec match
+                    case Some(sec) =>
+                      firstDate.accumulateAndGet(sec, math.min(_, _))
+                      lastDate.accumulateAndGet(sec, math.max(_, _))
+                    case None => undated.incrementAndGet()
                 }
               case Left(msg)    => IO { total.incrementAndGet(); errors.incrementAndGet(); sampler.record(msg) }
             }.loop
           }
-        ) *> IO.monotonic.map(_ - startedAt)
+        ) *> (IO.monotonic, IO.realTime).mapN { (monoEnd, wallEnd) =>
+          InvariantA.Window(
+            monotonicSecs = (monoEnd - monoStart).toMillis / 1000.0,
+            wallSecs      = (wallEnd - wallStart).toMillis / 1000.0,
+            serverSecs    =
+              if undated.get == 0 && lastDate.get >= firstDate.get then Some(lastDate.get - firstDate.get)
+              else None,
+          )
+        }
       }
 
-    def verdict(elapsed: FiniteDuration): IO[InvariantResult] =
+    def verdict(window: InvariantA.Window): IO[InvariantResult] =
       val d = degraded.get
       val a = allowed.get
       val b = blocked.get
       val t = total.get
       val e = errors.get
-      // The bucket refills on the server's real clock, so the ceiling has to be
-      // measured. This window is wider than durationSecs on purpose: the ticker's
-      // IO.sleep calls only promise a lower bound, and losing the race cancels 50
-      // in-flight requests whose responses are still counted. At 2 tokens/s that
-      // tail is worth more than the old epsilon=2 could absorb, so a correct
-      // limiter reported OVER-ISSUE whenever the host was slow enough to stretch it.
-      val elapsedSecs = elapsed.toMillis / 1000.0
-      val maxAllowed  = capacity + math.ceil(refillPerSec * (elapsedSecs + clockSkewAllowanceSec)).toLong
-      // How many seconds of refill the server saw beyond the client's window.
-      // Positive and small: clock correction. Growing with duration: a bug.
-      val excessSecs  = (a - capacity) / refillPerSec.toDouble - elapsedSecs
-      val window      = f"elapsed=$elapsedSecs%.1fs, server-excess=$excessSecs%+.1fs"
+      val ceiling     = InvariantA.ceiling(capacity, refillPerSec, window)
+      val maxAllowed  = ceiling.map(_.maxAllowed).getOrElse(Long.MaxValue)
+      val windowText  = window.describe
       val result =
         // Degradation mode answers without consulting the bucket, so allowed/
         // blocked stop describing the limiter. Reject-all pins allowed and
@@ -569,11 +630,13 @@ object Scenarios:
         // the line; allow-all admits past the ceiling by design. Either way
         // the counts measure nothing, so this is checked before the ceiling.
         if d > 0 then InvariantResult(Verdict.Inconclusive, s"DEGRADED: $d answer(s) carried X-Gate-Degraded: they came from degradation mode, not the token bucket (circuit breaker open, bulkhead full, or store errors) — allowed=$a measures nothing. Check gate_degraded_total and gate_circuit_breaker_state.")
-        else if a > maxAllowed then InvariantResult(Verdict.Violation, s"OVER-ISSUE: allowed=$a > maxAllowed=$maxAllowed ($window, total=$t, blocked=$b, errors=$e)")
+        // Without a window there is no ceiling to compare against.
+        else if ceiling.isLeft then InvariantResult(Verdict.Inconclusive, s"${ceiling.left.getOrElse("")} ($windowText, allowed=$a, total=$t, blocked=$b, errors=$e)")
+        else if a > maxAllowed then InvariantResult(Verdict.Violation, s"OVER-ISSUE: allowed=$a > maxAllowed=$maxAllowed ($windowText, total=$t, blocked=$b, errors=$e)")
         else if e > 0 then InvariantResult(Verdict.Inconclusive, s"errors=$e (total=$t, allowed=$a, blocked=$b)\n     Sample errors:\n${sampler.render}")
         else if b == 0 then InvariantResult(Verdict.Inconclusive, s"VACUOUS: never blocked (total=$t, allowed=$a) — the bucket was never exhausted")
         else if a < minAllowed then InvariantResult(Verdict.Violation, s"UNDER-ISSUE: allowed=$a < minAllowed=$minAllowed (total=$t, blocked=$b) — the limiter went dark")
-        else InvariantResult(Verdict.Pass, s"minAllowed=$minAllowed <= allowed=$a <= maxAllowed=$maxAllowed ($window, total=$t, blocked=$b, errors=$e)")
+        else InvariantResult(Verdict.Pass, s"minAllowed=$minAllowed <= allowed=$a <= maxAllowed=$maxAllowed ($windowText, total=$t, blocked=$b, errors=$e)")
       IO.pure(result)
 
     Console[IO].println(
@@ -584,7 +647,7 @@ object Scenarios:
          |  duration      = ${durationSecs}s
          |  capacity      = $capacity
          |  refillPerSec  = $refillPerSec
-         |  maxAllowed    = capacity + refill*(elapsed + ${clockSkewAllowanceSec}s)  (elapsed is measured, reported below)
+         |  maxAllowed    = capacity + refill*(window + allowance)  (the window is measured, by the server's clock; reported below)
          |  minAllowed    = $minAllowed  (a quarter of the nominal budget; catches a limiter that rejects everything)
          |""".stripMargin
     ) *>
@@ -1084,7 +1147,7 @@ object Http:
     * The service marks those with `X-Gate-Degraded: true`, on a 200 and a 429
     * alike.
     */
-  case class RateLimitAnswer(allowed: Boolean, degraded: Boolean)
+  case class RateLimitAnswer(allowed: Boolean, degraded: Boolean, serverEpochSec: Option[Long] = None)
 
   private val DegradedHeader = org.typelevel.ci.CIString("X-Gate-Degraded")
 
@@ -1117,7 +1180,11 @@ object Http:
         if resp.status.code == 200 || resp.status.code == 429 then
           io.circe.parser.parse(body)
             .flatMap(_.hcursor.get[Boolean]("allowed"))
-            .map(RateLimitAnswer(_, resp.headers.get(DegradedHeader).exists(_.head.value == "true")))
+            .map(RateLimitAnswer(
+              _,
+              resp.headers.get(DegradedHeader).exists(_.head.value == "true"),
+              resp.headers.get[org.http4s.headers.Date].map(_.date.epochSecond),
+            ))
             .left.map(_.getMessage)
         else
           Left(s"HTTP ${resp.status.code}: $body")

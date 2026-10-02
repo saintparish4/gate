@@ -36,9 +36,10 @@ import java.time.Instant
   * both halves: nothing is deducted, and nothing is owed.
   *
   * A forward correction mints rate × step tokens, once. That is unavoidable on
-  * a shared wall clock and bounded by the size of the step. Measured on real
-  * DynamoDB and on LocalStack at 2-3 s of extra refill per 30 s run; see issue
-  * #10.
+  * a shared wall clock and bounded by the size of the step. None has been
+  * observed: the 2-3 s of extra refill per 30 s run in issue #10 was first read
+  * as one, and on 1 October 2026 the same excess was traced to the load
+  * generator, whose monotonic clock ran 3% slow and under-measured its window.
   *
   * @see
   *   [[storage.DynamoDBRateLimitStore]] for OCC write semantics built on top of

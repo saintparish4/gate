@@ -472,7 +472,7 @@ invariants:
 
 | Invariant | Load | Assertion |
 |---|---|---|
-| **A** — token bucket never over-issues | 20 workers on one `free-api-key` bucket for 30 s | `allowed <= capacity + refill x (measured elapsed + 5 s)`, `errors = 0`, no answer marked `X-Gate-Degraded`. Reports `server-excess`, the refill the server saw beyond the client's window; the 5 s allowance exists because a wall-clock correction on the server can mint that much once. |
+| **A** — token bucket never over-issues | 20 workers on one `free-api-key` bucket for 30 s | `allowed <= capacity + refill x (window + 2 s)`, `errors = 0`, no answer marked `X-Gate-Degraded`. The window is the span of the server's `Date` headers, because the bucket refills on the server's clock; the 2 s is that header's one-second resolution plus the first request's latency. Without `Date` headers it falls back to this machine's clocks, and is inconclusive if they disagree by more than 1%. |
 | **B** — idempotency creates exactly once | 50 workers over 10 shared keys for 30 s | exactly 10 `new` responses, 0 conflicts, 0 errors |
 | **C** — token quota never over-admits | 50 workers spending 25,000 tokens each against a 1,000,000 limit for 20 s | `admitted x 25,000 <= 1,000,000`, some rejections, 0 errors |
 | **D** — tenants never share state | Two clients (`API_KEY` and `FREE_API_KEY`) racing for 20 s on the same 10 idempotency keys and the same quota user, while the second reconciles every reservation the first is granted | each client creates its own 10 records; each is held to 40 quota admissions and together they pass 40; every stolen reconcile answers 404; 0 conflicts, 0 errors |
@@ -528,8 +528,14 @@ bucket.
 | C — token quota never over-admits | **PASS** | `admitted=40 x 25,000 = 1,000,000`, the limit, not a token over. 7,541 rejected, 0 errors. | ~379 RPS |
 
 Invariant A measured `server-excess = -0.0 s` on this run. An earlier run
-measured `+2.9 s` from a wall-clock correction on the task, which is why the
-invariant carries a time allowance rather than a token epsilon.
+measured `+2.9 s`. That was read as a wall-clock correction on the task, and
+the invariant was given a 5 s allowance to absorb it, which is 10 tokens on a
+budget of 80. On 1 October 2026 every run driven from one laptop showed 1.0 to
+1.5 s of the same excess, against a local server and against AWS, and 14 CI
+runs showed none; that laptop's monotonic clock measured 3.2-3.5% slow against
+an outside clock. The load generator had under-measured its own window. The
+invariant now reads the window from the server's `Date` headers, with a 2 s
+allowance. The September figures above stand as that version printed them.
 
 The properties hold on real DynamoDB under contention, not just on the
 emulator. Throughput here is bounded by the client and the WAN, not the
