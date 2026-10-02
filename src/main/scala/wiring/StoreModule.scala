@@ -11,11 +11,19 @@ import events.EventPublisher
 import storage.*
 import resilience.*
 
+/** The stores, as the routes use them and as they are underneath.
+  *
+  * The raw ones have no breaker, bulkhead or timeout. `/ready` probes them, and
+  * the warm-up runs on them: a cold call can take longer than a request may,
+  * and must not count against the breaker or cancel itself half-way.
+  */
 case class StoreModule[F[_]](
     rateLimitStore: RateLimitStore[F],
     resilientStore: RateLimitStore[F],
     idempotencyStore: IdempotencyStore[F],
     tokenQuotaStore: Option[TokenQuotaStore[F]],
+    rawIdempotencyStore: IdempotencyStore[F],
+    rawTokenQuotaStore: Option[TokenQuotaStore[F]],
 )
 
 object StoreModule:
@@ -111,4 +119,6 @@ object StoreModule:
       resilientStore,
       idempotencyStore,
       rawTokenQuotaStore.map(StoreGuard.tokenQuota(_, quotaGuard)),
+      rawIdempotencyStore,
+      rawTokenQuotaStore,
     )

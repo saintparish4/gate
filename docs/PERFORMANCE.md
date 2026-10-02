@@ -132,5 +132,7 @@ costs roughly twice the above.
 - LocalStack is a DynamoDB *emulator*, not DynamoDB. Use these numbers to
   compare changes against each other, not as a stand-in for production.
 - All scenarios are reproducible from source. No hand-tuned JVM flags, no warm
-  caches pre-loaded. The only server-side warm-up is the first request in each
-  run (which hits the JIT cold).
+  caches pre-loaded. These numbers were taken before the server warmed its
+  request paths at start-up ([Architecture](ARCHITECTURE.md#startup)); then, the
+  only server-side warm-up was the first request in each run, which hit the
+  JIT cold.

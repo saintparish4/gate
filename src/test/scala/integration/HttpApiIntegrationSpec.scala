@@ -1364,6 +1364,27 @@ class HttpApiIntegrationSpec
       }
   }
 
+  "Warm-up" - {
+    // What Main runs before the server binds, against real tables: every path
+    // has to complete, or a task would open its port with one of them cold.
+    "runs every path against DynamoDB with no failed round" in
+      wiring.Warmup.run[IO](
+        rateLimitStore,
+        idempotencyStore,
+        Some(DynamoDBTokenQuotaStore[IO](
+          dynamoDbClient,
+          tokenQuotaTableName,
+          logger,
+          metricsPublisher,
+        )),
+        testRateLimitConfig,
+        testIdempotencyConfig,
+        testTokenQuotaConfig,
+        logger,
+        wiring.Warmup.Settings(rounds = 12, parallelism = 4),
+      ).asserting(report => (report.completed, report.failed) shouldBe (12, 0))
+  }
+
   "Degraded answers" - {
     // When the store cannot answer, the degradation mode does. A reject-all
     // 429 used to be indistinguishable from an empty bucket, and an allow-all

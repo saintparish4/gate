@@ -62,14 +62,6 @@ object Main extends IOApp:
       stores <- StoreModule
         .resource[IO](config, obs.metricsPublisher, eventPublisher)
       _ <- Resource.eval(summon[Logger[IO]].info("Stores initialized"))
-      _ <- Resource.eval(wiring.Warmup.rateLimitPath[IO](
-        stores.rateLimitStore,
-        core.RateLimitProfile(
-          config.rateLimit.defaultCapacity,
-          config.rateLimit.defaultRefillRatePerSecond,
-          config.rateLimit.defaultTtlSeconds,
-        ),
-      ))
 
       given Tracer[IO] <- config.tracing.enabled match
         case true =>
@@ -148,6 +140,19 @@ object Main extends IOApp:
         summon[Logger[IO]],
         CorrelationIdMiddleware.middleware(correlationLocal),
       )
+
+      // Last before the port opens, so a task that answers has run every path.
+      _ <- Resource.eval(wiring.Warmup.run[IO](
+        stores.rateLimitStore,
+        stores.rawIdempotencyStore,
+        stores.rawTokenQuotaStore,
+        config.rateLimit,
+        config.idempotency,
+        config.tokenQuota,
+        summon[Logger[IO]],
+        if config.aws.localstack then wiring.Warmup.Settings.localStack
+        else wiring.Warmup.Settings(),
+      ))
 
       _ <- Resource.make(Async[IO].unit)(_ =>
         summon[Logger[IO]]
