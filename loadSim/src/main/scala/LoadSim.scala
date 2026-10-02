@@ -46,6 +46,8 @@ import org.HdrHistogram.ConcurrentHistogram
  *   --url http://localhost:8080   base URL (default)
  *   --rps N                       target RPS for latency scenario (default 1000)
  *   --duration N                  duration in seconds for latency scenario (default 60)
+ *   --results-dir DIR             where the correctness scenario writes its results
+ *                                 file (default loadsim-results)
  *   --concurrency N               workers for the correctness scenario; scales all
  *                                 three invariants (defaults A=20, B=50, C=50).
  *                                 Lower it to match a small target -- a deployment
@@ -84,6 +86,7 @@ object LoadSim extends IOApp:
     val concurrency = Args.intOpt(args, "--concurrency")
     val apiKey      = Args.string(args, "--api-key", defaultApiKey)
     val freeKey     = Args.string(args, "--free-key", defaultFreeKey)
+    val resultsDir  = Args.string(args, "--results-dir", "loadsim-results")
 
     // Larger connection pool so workers don't queue waiting for a connection
     // at high RPS, and an explicit per-request timeout so a hung server fails
@@ -96,10 +99,10 @@ object LoadSim extends IOApp:
       .build
 
     clientR.use { client =>
-      def withPreflight(action: IO[ExitCode]): IO[ExitCode] =
+      def withPreflight(action: Http.ServerInfo => IO[ExitCode]): IO[ExitCode] =
         Http.healthCheck(client, baseUrl).flatMap {
-          case Right(_) =>
-            Console[IO].println(s"Preflight OK: $baseUrl/health responded 200.") *> action
+          case Right(server) =>
+            Console[IO].println(s"Preflight OK: $baseUrl/health responded 200 (version ${server.version}, commit ${server.commit}).") *> action(server)
           case Left(msg) =>
             Console[IO].errorln(
               s"""Preflight failed: GET $baseUrl/health -> $msg
@@ -113,13 +116,13 @@ object LoadSim extends IOApp:
         }
 
       scenario match
-        case "normal"         => withPreflight(Scenarios.normal(client, baseUrl).as(ExitCode.Success))
-        case "burst"          => withPreflight(Scenarios.burst(client, baseUrl).as(ExitCode.Success))
-        case "idempotency"    => withPreflight(Scenarios.idempotency(client, baseUrl).as(ExitCode.Success))
-        case "realistic"      => withPreflight(Scenarios.realistic(client, baseUrl).as(ExitCode.Success))
-        case "highContention" => withPreflight(Scenarios.highContention(client, baseUrl).as(ExitCode.Success))
-        case "correctness"    => withPreflight(Scenarios.correctness(client, baseUrl, concurrency, apiKey, freeKey))
-        case "latency"        => withPreflight(Scenarios.latency(client, baseUrl, rps.getOrElse(1000), duration.getOrElse(60)))
+        case "normal"         => withPreflight(_ => Scenarios.normal(client, baseUrl).as(ExitCode.Success))
+        case "burst"          => withPreflight(_ => Scenarios.burst(client, baseUrl).as(ExitCode.Success))
+        case "idempotency"    => withPreflight(_ => Scenarios.idempotency(client, baseUrl).as(ExitCode.Success))
+        case "realistic"      => withPreflight(_ => Scenarios.realistic(client, baseUrl).as(ExitCode.Success))
+        case "highContention" => withPreflight(_ => Scenarios.highContention(client, baseUrl).as(ExitCode.Success))
+        case "correctness"    => withPreflight(server => Scenarios.correctness(client, baseUrl, concurrency, apiKey, freeKey, server, Some(resultsDir)))
+        case "latency"        => withPreflight(_ => Scenarios.latency(client, baseUrl, rps.getOrElse(1000), duration.getOrElse(60)))
         case unknown =>
           Console[IO].errorln(
             s"Unknown scenario: $unknown. Valid: normal, burst, idempotency, realistic, highContention, correctness, latency"
@@ -141,16 +144,29 @@ final class ErrorSampler(maxDistinct: Int = 5):
   private val seen  = new ConcurrentHashMap[String, java.lang.Boolean]()
   private val order = new ConcurrentLinkedQueue[String]()
   private val count = new AtomicLong(0)
+  // Every error by class, with the first message seen for it. A results file
+  // keeps these apart from the scores: a timeout is not a wrong answer.
+  private val byClass      = new ConcurrentHashMap[String, AtomicLong]()
+  private val firstOfClass = new ConcurrentHashMap[String, String]()
 
   def record(msg: String): Unit =
     count.incrementAndGet()
     val key = normalize(msg)
+    val cls = ErrorSampler.classify(key)
+    byClass.computeIfAbsent(cls, _ => new AtomicLong(0)).incrementAndGet()
+    firstOfClass.putIfAbsent(cls, key)
     // putIfAbsent returns null when the key is new; only then append to order.
     if seen.size < maxDistinct && seen.putIfAbsent(key, java.lang.Boolean.TRUE) == null then
       order.offer(key)
     ()
 
   def total: Long = count.get
+
+  /** (class, how many, first message), most frequent first. */
+  def classes: List[(String, Long, String)] =
+    val out = List.newBuilder[(String, Long, String)]
+    byClass.forEach((cls, n) => out += ((cls, n.get, firstOfClass.getOrDefault(cls, ""))))
+    out.result().sortBy(-_._2)
 
   def render: String =
     if order.isEmpty then "(no errors recorded)"
@@ -167,6 +183,20 @@ final class ErrorSampler(maxDistinct: Int = 5):
   private def normalize(msg: String): String =
     val trimmed = if msg == null then "(null error)" else msg
     trimmed.take(200).replaceAll("\\s+", " ").trim
+
+object ErrorSampler:
+  /** What kind of failure a message describes. The Http helpers put the status
+    * first ("HTTP 503: ..."); anything else is the client's own exception text.
+    */
+  def classify(msg: String): String =
+    val m = msg.toLowerCase
+    if m.startsWith("http 429") then "http_429"
+    else if m.startsWith("http 5") then "http_5xx"
+    else if m.startsWith("http 4") then "http_4xx"
+    else if m.startsWith("unexpected") then "unexpected_answer"
+    else if m.contains("timed out") || m.contains("timeout") then "timeout"
+    else if m.contains("connect") || m.contains("closed") || m.contains("eof") || m.contains("reset") then "connection"
+    else "other"
 
 object Scenarios:
   import Http.*
@@ -418,17 +448,22 @@ object Scenarios:
     concurrency: Option[Int] = None,
     apiKey:      String = LoadSim.defaultApiKey,
     freeKey:     String = LoadSim.defaultFreeKey,
+    server:      ServerInfo = ServerInfo.unknown,
+    resultsDir:  Option[String] = None,
+    durations:   Durations = Durations(),
   ): IO[ExitCode] =
     val runId = System.currentTimeMillis.toString
     // One --concurrency scales all three invariants. Absent, each keeps its own
     // default: B and C need more contention than A to prove anything.
     for
+      startedAt <- IO.realTimeInstant
       _  <- Console[IO].println(s"=== correctness — run $runId ===")
-      _  <- warmUp(client, baseUrl, runId, apiKey)
-      a  <- invariantA_tokenBucketNonOverIssue(client, baseUrl, runId, concurrency.getOrElse(20), freeKey)
-      b  <- invariantB_idempotencyExactlyOneCreated(client, baseUrl, runId, concurrency.getOrElse(50), apiKey)
-      c  <- invariantC_quotaNonOverAdmission(client, baseUrl, runId, concurrency.getOrElse(50), apiKey)
-      d  <- invariantD_crossTenantIsolation(client, baseUrl, runId, concurrency.getOrElse(10), apiKey, freeKey)
+      _  <- warmUp(client, baseUrl, runId, apiKey, durations.warmupStageSecs)
+      a  <- invariantA_tokenBucketNonOverIssue(client, baseUrl, runId, concurrency.getOrElse(20), freeKey, durations.a)
+      b  <- invariantB_idempotencyExactlyOneCreated(client, baseUrl, runId, concurrency.getOrElse(50), apiKey, durations.b)
+      c  <- invariantC_quotaNonOverAdmission(client, baseUrl, runId, concurrency.getOrElse(50), apiKey, durations.c)
+      d  <- invariantD_crossTenantIsolation(client, baseUrl, runId, concurrency.getOrElse(10), apiKey, freeKey, durations.d)
+      finishedAt <- IO.realTimeInstant
       overall = Verdict.overall(List(a, b, c, d).map(_.verdict))
       _  <- Console[IO].println(
               s"""
@@ -445,7 +480,83 @@ object Scenarios:
                  |Overall: ${overall.label}
                  |""".stripMargin
             )
+      _  <- resultsDir.traverse_(dir =>
+              Results.write(
+                dir, runId, baseUrl, server, startedAt, finishedAt, overall,
+                List("A" -> a, "B" -> b, "C" -> c, "D" -> d),
+              ).flatMap(path => Console[IO].println(s"Results written to $path"))
+                // The verdict stands whether or not it could be saved.
+                .handleErrorWith(err => Console[IO].errorln(s"Could not write the results file: ${err.getMessage}"))
+            )
     yield overall.exitCode
+
+  /** One file per run, so a figure quoted from a run can be checked later.
+    *
+    * The README cited run IDs whose output existed nowhere: the numbers lived
+    * in a terminal, and `/health` did not say which commit had answered. The
+    * file records what was tested (the server's version and commit, read from
+    * the run itself), what tested it, each invariant's verdict and raw counts,
+    * and the requests that errored, by class and apart from the counts.
+    */
+  object Results:
+    private val titles = Map(
+      "A" -> "token bucket never over-issues",
+      "B" -> "idempotency creates exactly once",
+      "C" -> "token quota never over-admits",
+      "D" -> "tenants never share state",
+    )
+
+    def json(
+      runId:      String,
+      target:     String,
+      server:     ServerInfo,
+      startedAt:  java.time.Instant,
+      finishedAt: java.time.Instant,
+      overall:    Verdict,
+      invariants: List[(String, InvariantResult)],
+    ): Json = Json.obj(
+      "scenario"   := "correctness",
+      "runId"      := runId,
+      "startedAt"  := startedAt.toString,
+      "finishedAt" := finishedAt.toString,
+      "target"     := target,
+      "server"     := Json.obj("version" := server.version, "commit" := server.commit),
+      "loadSim"    := Json.obj("commit" := loadSimCommit),
+      "overall"    := overall.label,
+      "invariants" := invariants.map { (name, r) =>
+        Json.obj(
+          "name"    := name,
+          "title"   := titles.getOrElse(name, name),
+          "verdict" := r.verdict.label,
+          "details" := r.details,
+          // In key order, so two runs' files diff cleanly.
+          "counts"  := Json.fromFields(r.counts.toList.sortBy(_._1).map((k, v) => k -> Json.fromLong(v))),
+          "errors"  := r.errors.map((cls, n, sample) => Json.obj("class" := cls, "count" := n, "sample" := sample)),
+        )
+      },
+    )
+
+    def write(
+      dir:        String,
+      runId:      String,
+      target:     String,
+      server:     ServerInfo,
+      startedAt:  java.time.Instant,
+      finishedAt: java.time.Instant,
+      overall:    Verdict,
+      invariants: List[(String, InvariantResult)],
+    ): IO[java.nio.file.Path] = IO.blocking {
+      val folder = java.nio.file.Paths.get(dir)
+      java.nio.file.Files.createDirectories(folder)
+      val path = folder.resolve(s"correctness-$runId.json")
+      java.nio.file.Files.writeString(path, json(runId, target, server, startedAt, finishedAt, overall, invariants).spaces2 + "\n")
+      path.toAbsolutePath
+    }
+
+    /** The commit of the checkout the simulator was run from. */
+    private def loadSimCommit: String =
+      scala.util.Try(scala.sys.process.Process(Seq("git", "describe", "--always", "--dirty")).!!(scala.sys.process.ProcessLogger(_ => ())).trim)
+        .toOption.filter(_.nonEmpty).getOrElse("unknown")
 
   /** The arithmetic of invariant A, kept apart from the driving so it can be
     * tested on its own.
@@ -536,7 +647,22 @@ object Scenarios:
       else if verdicts.contains(Inconclusive) then Inconclusive
       else Pass
 
-  case class InvariantResult(verdict: Verdict, details: String)
+  /** @param counts
+    *   The raw numbers the verdict was computed from, for the results file
+    * @param errors
+    *   Requests that could not be answered, by class: (class, count, first message)
+    */
+  case class InvariantResult(
+    verdict: Verdict,
+    details: String,
+    counts:  Map[String, Long] = Map.empty,
+    errors:  List[(String, Long, String)] = Nil,
+  )
+
+  /** How long each part of the correctness scenario runs. The defaults are
+    * what CI and the README's figures use; the tests shorten them.
+    */
+  final case class Durations(warmupStageSecs: Int = 5, a: Int = 30, b: Int = 30, c: Int = 20, d: Int = 20)
 
   /**
    * Ramps 1 -> 5 -> 20 workers over ~15 s on throwaway keys before any invariant
@@ -545,8 +671,8 @@ object Scenarios:
    * invariants are about correctness, not cold-start latency, so I warm the hot
    * path first the way real traffic would.
    */
-  private def warmUp(client: Client[IO], baseUrl: String, runId: String, apiKey: String): IO[Unit] =
-    val stages = List((1, 5), (5, 5), (20, 5)) // (workers, seconds)
+  private def warmUp(client: Client[IO], baseUrl: String, runId: String, apiKey: String, stageSecs: Int = 5): IO[Unit] =
+    val stages = List(1, 5, 20).map(_ -> stageSecs).filter(_._2 > 0) // (workers, seconds)
     Console[IO].println("-- Warm-up — ramping 1 -> 5 -> 20 workers on throwaway keys --") *>
     stages.zipWithIndex.traverse_ { case ((workers, secs), stage) =>
       val ok  = new AtomicLong(0)
@@ -652,7 +778,15 @@ object Scenarios:
         else if b == 0 then InvariantResult(Verdict.Inconclusive, s"VACUOUS: never blocked (total=$t, allowed=$a) — the bucket was never exhausted")
         else if a < minAllowed then InvariantResult(Verdict.Violation, s"UNDER-ISSUE: allowed=$a < minAllowed=$minAllowed (total=$t, blocked=$b) — the limiter went dark")
         else InvariantResult(Verdict.Pass, s"minAllowed=$minAllowed <= allowed=$a <= maxAllowed=$maxAllowed ($windowText, total=$t, blocked=$b, errors=$e)")
-      IO.pure(result)
+      IO.pure(result.copy(
+        counts = Map(
+          "total" -> t, "allowed" -> a, "blocked" -> b, "degraded" -> d, "errors" -> e,
+          "minAllowed" -> minAllowed.toLong,
+          "clientMonotonicMillis" -> (window.monotonicSecs * 1000).toLong,
+          "clientWallMillis" -> (window.wallSecs * 1000).toLong,
+        ) ++ ceiling.toOption.map(c => "maxAllowed" -> c.maxAllowed) ++ window.serverSecs.map("serverWindowSecs" -> _),
+        errors = sampler.classes,
+      ))
 
     Console[IO].println(
       s"""-- Invariant A — token-bucket non-over-issue --
@@ -766,7 +900,14 @@ object Scenarios:
         else if unclaimed.nonEmpty then InvariantResult(Verdict.Violation, s"NEVER CLAIMED: ${unclaimed.size} key(s) were answered, but never 'new' (${some(unclaimed)}) — $counts")
         else if tally.keys < MinClaimRaces then InvariantResult(Verdict.Inconclusive, s"VACUOUS: only ${tally.keys} key(s) were raced (need $MinClaimRaces) — the stack is too slow to show anything — $counts")
         else InvariantResult(Verdict.Pass, s"each of ${tally.keys} keys was answered 'new' exactly once — $counts")
-      IO.pure(result)
+      IO.pure(result.copy(
+        counts = Map(
+          "total" -> total.get, "keys" -> tally.keys.toLong, "created" -> tally.created,
+          "doubleClaimed" -> doubles.size.toLong, "neverClaimed" -> unclaimed.size.toLong,
+          "duplicates" -> duplicate.get, "conflicts" -> cf, "errors" -> e,
+        ),
+        errors = sampler.classes,
+      ))
     }
 
   /** Fewer first-claim races than this in a run shows too little to pass on. */
@@ -843,7 +984,14 @@ object Scenarios:
         else if e > 0 then InvariantResult(Verdict.Inconclusive, s"$counts\n     Sample errors:\n${sampler.render}")
         else if filled == 0 then InvariantResult(Verdict.Inconclusive, s"VACUOUS: no user reached its limit — quotas disabled or stack too slow — $counts")
         else InvariantResult(Verdict.Pass, s"no user admitted past $userLimit tokens — $counts")
-      IO.pure(result)
+      IO.pure(result.copy(
+        counts = Map(
+          "total" -> total.get, "usersUsed" -> perUser.size.toLong, "usersFilled" -> filled.toLong,
+          "usersOverLimit" -> over.size.toLong, "admitted" -> admittedAll.get, "rejected" -> rejectedAll.get,
+          "contended" -> con, "errors" -> e,
+        ),
+        errors = sampler.classes,
+      ))
     }
 
   def invariantD_crossTenantIsolation(
@@ -976,7 +1124,15 @@ object Scenarios:
           else if t == 0 then because(Verdict.Inconclusive, "VACUOUS: A was never granted a reservation to steal")
           else if a.claims.keys < MinClaimRaces || b.claims.keys < MinClaimRaces then because(Verdict.Inconclusive, s"VACUOUS: fewer than $MinClaimRaces idempotency keys were raced")
           else InvariantResult(Verdict.Pass, summary)
-        IO.pure(result)
+        IO.pure(result.copy(
+          counts = Map(
+            "total" -> total.get, "keysA" -> a.claims.keys.toLong, "keysB" -> b.claims.keys.toLong,
+            "doubleClaimed" -> doubles.toLong, "neverClaimed" -> unclaimed.toLong,
+            "admittedA" -> aa, "admittedB" -> ab, "rejected" -> rejected,
+            "thefts" -> t, "theftsLanded" -> landed, "conflicts" -> conflicts, "errors" -> e,
+          ),
+          errors = sampler.classes,
+        ))
       }
 
   // ------------------------------------------------------------------
@@ -1209,13 +1365,20 @@ object Http:
   case class IdempotencyRequest(idempotencyKey: String, ttl: Int = 3600)
   case class IdempotencyResponse(status: String)
 
+  /** What `/health` says is running: the build's version and commit. "unknown"
+    * for a server too old to report its commit.
+    */
+  case class ServerInfo(version: String, commit: String)
+  object ServerInfo:
+    val unknown: ServerInfo = ServerInfo("unknown", "unknown")
+
   /**
-   * Preflight liveness probe. Returns Right(()) iff /health returns 200.
+   * Preflight liveness probe. Returns what is running iff /health returns 200.
    * Every load scenario calls this before doing real work so that a dead or
    * misconfigured service fails loudly up front instead of producing a
    * histogram full of "connection refused" measurements.
    */
-  def healthCheck(client: Client[IO], baseUrl: String): IO[Either[String, Unit]] =
+  def healthCheck(client: Client[IO], baseUrl: String): IO[Either[String, ServerInfo]] =
     val req = Request[IO](
       method = Method.GET,
       uri    = Uri.unsafeFromString(s"$baseUrl/health"),
@@ -1225,9 +1388,10 @@ object Http:
       .use { resp =>
         resp.as[String].map { body =>
           // Any web app answers 200 on /health; only Gate answers with this body.
-          val isGate = io.circe.parser.parse(body)
-            .flatMap(_.hcursor.get[String]("status")).toOption.contains("healthy")
-          if resp.status.code == 200 && isGate then Right(())
+          val health = io.circe.parser.parse(body).toOption.map(_.hcursor)
+          val isGate = health.flatMap(_.get[String]("status").toOption).contains("healthy")
+          def field(name: String) = health.flatMap(_.get[String](name).toOption).getOrElse("unknown")
+          if resp.status.code == 200 && isGate then Right(ServerInfo(field("version"), field("commit")))
           else Left(s"HTTP ${resp.status.code}: ${body.take(200)}")
         }
       }

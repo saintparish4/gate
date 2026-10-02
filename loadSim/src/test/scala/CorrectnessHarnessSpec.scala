@@ -114,6 +114,74 @@ class CorrectnessHarnessSpec extends AsyncFreeSpec with AsyncIOSpec with Matcher
     }
   }
 
+  "the results file" - {
+    // A whole run, shortened, against a fake, written where a temp folder is.
+    def run(faults: Fault*): IO[(ExitCode, io.circe.Json)] =
+      for
+        dir    <- IO(java.nio.file.Files.createTempDirectory("loadsim-results"))
+        app    <- FakeGate.app(faults*)
+        client  = Client.fromHttpApp(app)
+        // A fake that only errors has no /health to read; the run still happens.
+        server <- Http.healthCheck(client, url).map(_.getOrElse(Http.ServerInfo.unknown))
+        code   <- Scenarios.correctness(
+          client,
+          url,
+          concurrency = Some(6),
+          apiKey = keyA,
+          freeKey = keyB,
+          server = server,
+          resultsDir = Some(dir.toString),
+          durations = Scenarios.Durations(warmupStageSecs = 0, a = quick, b = quick, c = quick, d = quick),
+        )
+        files  <- IO(java.nio.file.Files.list(dir).toArray.toList.map(_.toString))
+        text   <- IO(java.nio.file.Files.readString(java.nio.file.Paths.get(files.head)))
+        json   <- IO.fromEither(io.circe.parser.parse(text))
+      yield (code, json)
+
+    "records a passing run: what was tested, each verdict, and the counts behind it" in
+      run().asserting { case (code, json) =>
+        val c = json.hcursor
+        code shouldBe ExitCode.Success
+        c.get[String]("overall") shouldBe Right("PASS")
+        c.downField("server").get[String]("commit") shouldBe Right("fake123")
+        c.downField("server").get[String]("version") shouldBe Right("0.0.0-fake")
+        c.downField("loadSim").get[String]("commit").exists(_.nonEmpty) shouldBe true
+        val invariants = c.downField("invariants").values.get.toList
+        invariants.map(_.hcursor.get[String]("name").toOption.get) shouldBe List("A", "B", "C", "D")
+        invariants.map(_.hcursor.get[String]("verdict").toOption.get).distinct shouldBe List("PASS")
+        invariants.head.hcursor.downField("counts").get[Long]("allowed").exists(_ > 0) shouldBe true
+        invariants.head.hcursor.downField("counts").get[Long]("maxAllowed").isRight shouldBe true
+      }
+
+    "records a violation with exit code 1" in
+      run(Fault.AlwaysAllow).asserting { case (code, json) =>
+        code.code shouldBe 1
+        json.hcursor.get[String]("overall") shouldBe Right("VIOLATION")
+      }
+
+    "keeps errors apart from the counts, by class, and exits 2" in
+      run(Fault.AlwaysError).asserting { case (code, json) =>
+        code.code shouldBe 2
+        json.hcursor.get[String]("overall") shouldBe Right("INCONCLUSIVE")
+        val a = json.hcursor.downField("invariants").values.get.head.hcursor
+        a.downField("counts").get[Long]("allowed") shouldBe Right(0L)
+        a.downField("errors").values.get.head.hcursor.get[String]("class") shouldBe Right("http_5xx")
+        a.downField("errors").values.get.head.hcursor.get[Long]("count").exists(_ > 0) shouldBe true
+      }
+  }
+
+  "error classes" - {
+    "tell a status from a timeout from a dropped connection" in IO {
+      ErrorSampler.classify("HTTP 503: {\"error\":\"storage_unavailable\"}") shouldBe "http_5xx"
+      ErrorSampler.classify("HTTP 429: {\"error\":\"rate_limited\"}") shouldBe "http_429"
+      ErrorSampler.classify("HTTP 401: {}") shouldBe "http_4xx"
+      ErrorSampler.classify("Request to fake.gate timed out after 30 seconds") shouldBe "timeout"
+      ErrorSampler.classify("Connection refused") shouldBe "connection"
+      ErrorSampler.classify("unexpected status: gone") shouldBe "unexpected_answer"
+      ErrorSampler.classify("boom") shouldBe "other"
+    }
+  }
+
   "invariant A's ceiling" - {
     "uses the server's window when the answers were dated" in IO {
       // 30 s by the server; this machine's own clocks are not consulted.

@@ -477,6 +477,13 @@ invariants:
 | **C** — token quota never over-admits | 50 workers spending 25,000 tokens each against one user's 1,000,000 limit for 20 s, moving to a fresh user once it has refused 50 checks (up to 10 users) | for every user `admitted x 25,000 <= 1,000,000`; at least one user reached its limit; 0 errors |
 | **D** — tenants never share state | Two clients (`API_KEY` and `FREE_API_KEY`) racing for 20 s on the same idempotency key, which changes every 250 ms, and the same quota user, while the second reconciles every reservation the first is granted | each client is answered `new` exactly once for every key; each is held to 40 quota admissions and together they pass 40; every stolen reconcile answers 404; 0 conflicts, 0 errors |
 
+Every run writes `loadsim-results/correctness-<run id>.json`: the server's
+version and commit as `/health` reported them, the commit of the load simulator,
+each invariant's verdict and the raw counts behind it, and the requests that
+errored, by class and apart from the counts. The folder is ignored by git; a
+run this README cites is copied into `docs/evidence/`. Runs from before 2
+October 2026 have no file: their numbers were read off a terminal.
+
 The invariants are themselves tested: `sbt loadSim/test` runs each one against
 a small fake server that is correct, and against fakes with one bug each (a
 limiter that admits everything, a server that says `new` to everyone, a quota

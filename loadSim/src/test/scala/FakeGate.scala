@@ -144,7 +144,7 @@ object FakeGate:
         if on(Fault.AlwaysError) then IO.pure(json(Status.InternalServerError, "error" -> Json.fromString("internal_error")))
         else
           request match
-            case GET -> Root / "health"                         => IO.pure(json(Status.Ok, "status" -> Json.fromString("healthy")))
+            case GET -> Root / "health"                         => IO.pure(json(Status.Ok, "status" -> Json.fromString("healthy"), "version" -> Json.fromString("0.0.0-fake"), "commit" -> Json.fromString("fake123")))
             case POST -> Root / "v1" / "ratelimit" / "check"    => rateLimit(request)
             case POST -> Root / "v1" / "idempotency" / "check"  => idempotency(request)
             case POST -> Root / "v1" / "quota" / "check"        => quotaCheck(request)

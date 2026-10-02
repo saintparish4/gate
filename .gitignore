@@ -98,6 +98,10 @@ docs/DEPLOYMENT.md
 docs/RUNBOOK.md
 TESTING_DASHBOARD.md
 
+# Results files written by the load simulator. A run the README cites is
+# copied into docs/evidence/.
+loadsim-results/
+
 # Local-only tooling and notes
 CLAUDE.md
 .claude/
