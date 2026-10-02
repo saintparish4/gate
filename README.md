@@ -473,9 +473,15 @@ invariants:
 | Invariant | Load | Assertion |
 |---|---|---|
 | **A** — token bucket never over-issues | 20 workers on one `free-api-key` bucket for 30 s | `allowed <= capacity + refill x (window + 2 s)`, `errors = 0`, no answer marked `X-Gate-Degraded`. The window is the span of the server's `Date` headers, because the bucket refills on the server's clock; the 2 s is that header's one-second resolution plus the first request's latency. Without `Date` headers it falls back to this machine's clocks, and is inconclusive if they disagree by more than 1%. |
-| **B** — idempotency creates exactly once | 50 workers over 10 shared keys for 30 s | exactly 10 `new` responses, 0 conflicts, 0 errors |
-| **C** — token quota never over-admits | 50 workers spending 25,000 tokens each against a 1,000,000 limit for 20 s | `admitted x 25,000 <= 1,000,000`, some rejections, 0 errors |
-| **D** — tenants never share state | Two clients (`API_KEY` and `FREE_API_KEY`) racing for 20 s on the same 10 idempotency keys and the same quota user, while the second reconciles every reservation the first is granted | each client creates its own 10 records; each is held to 40 quota admissions and together they pass 40; every stolen reconcile answers 404; 0 conflicts, 0 errors |
+| **B** — idempotency creates exactly once | 50 workers all on one key for 30 s, and the key changes every 250 ms: about 120 first-claim races | every key answered `new` exactly once, 0 conflicts, 0 errors |
+| **C** — token quota never over-admits | 50 workers spending 25,000 tokens each against one user's 1,000,000 limit for 20 s, moving to a fresh user once it has refused 50 checks (up to 10 users) | for every user `admitted x 25,000 <= 1,000,000`; at least one user reached its limit; 0 errors |
+| **D** — tenants never share state | Two clients (`API_KEY` and `FREE_API_KEY`) racing for 20 s on the same idempotency key, which changes every 250 ms, and the same quota user, while the second reconciles every reservation the first is granted | each client is answered `new` exactly once for every key; each is held to 40 quota admissions and together they pass 40; every stolen reconcile answers 404; 0 conflicts, 0 errors |
+
+B and D used to hold 10 keys for the whole run, which is ten races in the first
+instant and duplicates after that, and C used one user, which crosses its limit
+once. B also compared the total of `new` answers with the number of keys, which
+one key claimed twice and one never claimed would have satisfied. The AWS
+tables below were measured with that earlier load.
 
 Each invariant ends in one of three verdicts, and the run exits with the worst
 of them:

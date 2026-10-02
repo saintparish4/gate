@@ -376,21 +376,29 @@ object Scenarios:
    *   run proved nothing), no errors, and no answer from degradation mode.
    *
    * Invariant B — idempotency exactly-one-Created:
-   *   For K=10 shared keys, N=50 parallel clients must never observe more than
-   *   one "new" response per key. No HTTP errors, no 409 conflicts (same body).
-   *   Assert: created_count == K and error_count == 0 and conflict_count == 0.
+   *   N=50 parallel clients all check the same key, and the key changes every
+   *   250 ms, so each run races about 120 first claims. Every key must be
+   *   answered "new" exactly once. No HTTP errors, no 409 conflicts (same body).
+   *   It used to hold 10 keys for the whole 30 s: ten races in the first
+   *   instant, then duplicates. It also compared the total of "new" answers
+   *   with the number of keys, which one key claimed twice and one never
+   *   claimed would have satisfied.
    *
    * Invariant C — token-quota non-over-admission:
-   *   N=50 parallel clients each ask for 25,000 tokens against one user whose
+   *   N=50 parallel clients each ask for 25,000 tokens against a user whose
    *   limit is 1,000,000 (the default), so at most 40 checks may be admitted.
+   *   Once a user has refused 50 checks the clients move to a fresh user, up to
+   *   10 users, so the race at the limit is run more than once.
    *   Requires TOKEN_QUOTA_ENABLED=true on the server.
-   *   Assert: admitted * 25,000 <= 1,000,000, at least one 429, no HTTP errors.
+   *   Assert: for every user admitted * 25,000 <= 1,000,000; at least one user
+   *   reached its limit; no HTTP errors.
    *
    * Invariant D — cross-tenant isolation (ADR-005):
    *   Two clients, --api-key (A) and --free-key (B), race for 20 s on the same
    *   visible identifiers. Each is its own tenant.
-   *     D1: both drive the same K=10 idempotency keys; each must create exactly
-   *         K records of its own. Shared keys would give K between them.
+   *     D1: both check the same idempotency key, which changes every 250 ms;
+   *         each must be answered "new" exactly once for every key. Shared keys
+   *         would give one "new" between them.
    *     D2: both fill the same quota user; each is held to 40 admissions, and
    *         together they must pass 40, which one shared counter cannot.
    *     D3: while D2 runs, B reconciles every reservation A is granted, with
@@ -653,17 +661,56 @@ object Scenarios:
     ) *>
     drive.flatMap(verdict)
 
-  private def invariantB_idempotencyExactlyOneCreated(
-    client:      Client[IO],
-    baseUrl:     String,
-    runId:       String,
-    concurrency: Int,
-    apiKey:      String,
-  ): IO[InvariantResult] =
-    val K             = 10
-    val durationSecs  = 30
-    val keys          = (0 until K).map(i => s"correctness:B:$runId:key-$i").toVector
+  /** How long one idempotency key is raced for before the next takes over. */
+  private val ClaimRoundMillis = 250
 
+  /** `new` answers per key, and every key that was answered at all. */
+  final class ClaimTally:
+    private val news = new ConcurrentHashMap[String, AtomicInteger]()
+
+    /** An answer for `key` arrived; `isNew` when it was "new". */
+    def record(key: String, isNew: Boolean): Unit =
+      val count = news.computeIfAbsent(key, _ => new AtomicInteger(0))
+      if isNew then count.incrementAndGet()
+      ()
+
+    def keys: Int = news.size
+    def created: Long =
+      var sum = 0L
+      news.values.forEach(c => sum += c.get)
+      sum
+
+    /** Keys answered "new" more than once, and keys never answered "new". */
+    def doubleClaimed: List[String] = matching(_ > 1)
+    def neverClaimed: List[String]  = matching(_ == 0)
+
+    private def matching(p: Int => Boolean): List[String] =
+      val out = List.newBuilder[String]
+      news.forEach((k, c) => if p(c.get) then out += k)
+      out.result().sorted
+
+  /** Run `step` again and again until the monotonic clock passes `deadline`.
+    * A request in flight at the deadline is answered and counted, where
+    * cancelling the workers would have dropped its answer: with one "new" per
+    * key, a dropped "new" reads as a key nobody claimed.
+    */
+  private def untilDeadline(deadline: FiniteDuration)(step: IO[Unit]): IO[Unit] =
+    IO.monotonic.flatMap(now => if now >= deadline then IO.unit else step >> untilDeadline(deadline)(step))
+
+  /** The key being raced at this instant. */
+  private def claimKey(prefix: String, startedAt: FiniteDuration): IO[String] =
+    IO.monotonic.map(now => s"$prefix:r${(now - startedAt).toMillis / ClaimRoundMillis}")
+
+  def invariantB_idempotencyExactlyOneCreated(
+    client:       Client[IO],
+    baseUrl:      String,
+    runId:        String,
+    concurrency:  Int,
+    apiKey:       String,
+    durationSecs: Int = 30,
+  ): IO[InvariantResult] =
+    val prefix    = s"correctness:B:$runId"
+    val tally     = new ClaimTally
     val total     = new AtomicLong(0)
     val created   = new AtomicLong(0)
     val duplicate = new AtomicLong(0)
@@ -671,118 +718,144 @@ object Scenarios:
     val errors    = new AtomicLong(0)
     val sampler   = new ErrorSampler(5)
 
+    def worker(startedAt: FiniteDuration): IO[Unit] =
+      untilDeadline(startedAt + durationSecs.seconds) {
+        claimKey(prefix, startedAt).flatMap { key =>
+          sendIdempotencyCheck(client, baseUrl, key, apiKey).flatMap {
+            case Right("new")                       => IO { total.incrementAndGet(); created.incrementAndGet(); tally.record(key, isNew = true) }
+            case Right("in_progress" | "duplicate") => IO { total.incrementAndGet(); duplicate.incrementAndGet(); tally.record(key, isNew = false) }
+            case Right("conflict")                  => IO { total.incrementAndGet(); conflict.incrementAndGet() }
+            case Right(other)                       => IO { total.incrementAndGet(); errors.incrementAndGet(); sampler.record(s"unexpected status: $other") }
+            case Left(msg)                          => IO { total.incrementAndGet(); errors.incrementAndGet(); sampler.record(msg) }
+          }.void
+        }
+      }
+
     Console[IO].println(
       s"""-- Invariant B — idempotency exactly-one-Created --
-         |  K (shared keys) = $K
-         |  concurrency     = $concurrency
+         |  keys            = one at a time, a new one every ${ClaimRoundMillis} ms
+         |  concurrency     = $concurrency (all on the current key)
          |  duration        = ${durationSecs}s
          |""".stripMargin
     ) *>
-    IO.race(
-      progressTicker("invariantB", durationSecs, total, created, duplicate, errors, okLabel = "created", nokLabel = "duplicate"),
-      (0 until concurrency).toList.parTraverse_ { vuid =>
-        // Each worker cycles through all K keys so every key is hit multiple times.
-        def step(i: Int): IO[Unit] =
-          val key = keys((vuid + i) % K)
-          sendIdempotencyCheck(client, baseUrl, key, apiKey).flatMap {
-            case Right("new")         => IO { total.incrementAndGet(); created.incrementAndGet() }
-            case Right("in_progress") => IO { total.incrementAndGet(); duplicate.incrementAndGet() }
-            case Right("duplicate")   => IO { total.incrementAndGet(); duplicate.incrementAndGet() }
-            case Right("conflict")    => IO { total.incrementAndGet(); conflict.incrementAndGet() }
-            case Right(other)         => IO { total.incrementAndGet(); errors.incrementAndGet(); sampler.record(s"unexpected status: $other") }
-            case Left(msg)            => IO { total.incrementAndGet(); errors.incrementAndGet(); sampler.record(msg) }
-          } >> step(i + 1)
-        step(0)
-      }
-    ) *> IO.defer {
-      val c    = created.get
-      val e    = errors.get
-      val cf   = conflict.get
-      val counts     = s"created=$c (K=$K), conflicts=$cf, errors=$e, duplicates=${duplicate.get}"
+    IO.monotonic.flatMap { startedAt =>
+      (
+        progressTicker("invariantB", durationSecs, total, created, duplicate, errors, okLabel = "created", nokLabel = "duplicate"),
+        (0 until concurrency).toList.parTraverse_(_ => worker(startedAt)),
+      ).parTupled
+    } *> IO.defer {
+      val e          = errors.get
+      val cf         = conflict.get
+      val doubles    = tally.doubleClaimed
+      val unclaimed  = tally.neverClaimed
+      val counts     = s"keys=${tally.keys}, created=${tally.created}, conflicts=$cf, errors=$e, duplicates=${duplicate.get}"
       val errSection = if e > 0 then s"\n     Sample errors:\n${sampler.render}" else ""
+      def some(keys: List[String]): String = keys.take(3).mkString(", ")
       val result =
-        if c > K then InvariantResult(Verdict.Violation, s"DOUBLE CLAIM: more than one 'new' for a key — $counts$errSection")
+        if doubles.nonEmpty then InvariantResult(Verdict.Violation, s"DOUBLE CLAIM: ${doubles.size} key(s) were answered 'new' more than once (${some(doubles)}) — $counts$errSection")
         else if cf > 0 then InvariantResult(Verdict.Violation, s"CONFLICT: a 409 for an identical request — $counts$errSection")
-        // A missing 'new' with errors may be a claim whose answer was lost.
+        // A key with no 'new' may be one whose 'new' answer was lost to an error.
         else if e > 0 then InvariantResult(Verdict.Inconclusive, s"$counts$errSection")
-        else if c < K then InvariantResult(Verdict.Violation, s"NEVER CLAIMED: a key was never answered 'new' — $counts")
-        else InvariantResult(Verdict.Pass, counts)
+        else if unclaimed.nonEmpty then InvariantResult(Verdict.Violation, s"NEVER CLAIMED: ${unclaimed.size} key(s) were answered, but never 'new' (${some(unclaimed)}) — $counts")
+        else if tally.keys < MinClaimRaces then InvariantResult(Verdict.Inconclusive, s"VACUOUS: only ${tally.keys} key(s) were raced (need $MinClaimRaces) — the stack is too slow to show anything — $counts")
+        else InvariantResult(Verdict.Pass, s"each of ${tally.keys} keys was answered 'new' exactly once — $counts")
       IO.pure(result)
     }
 
-  private def invariantC_quotaNonOverAdmission(
-    client:      Client[IO],
-    baseUrl:     String,
-    runId:       String,
-    concurrency: Int,
-    apiKey:      String,
+  /** Fewer first-claim races than this in a run shows too little to pass on. */
+  private val MinClaimRaces = 5
+
+  def invariantC_quotaNonOverAdmission(
+    client:       Client[IO],
+    baseUrl:      String,
+    runId:        String,
+    concurrency:  Int,
+    apiKey:       String,
+    durationSecs: Int = 20,
   ): IO[InvariantResult] =
-    val durationSecs = 20
     val userLimit    = 1_000_000L   // TOKEN_QUOTA_USER_LIMIT default
     val perRequest   = 25_000L      // 40 admissions fill the window exactly
     val maxAdmitted  = userLimit / perRequest
-    val userId       = s"correctness:C:$runId"
+    // The race this invariant is about happens once per user, as it crosses its
+    // limit. One user gave one race per run; the clients now move on to a
+    // fresh user once the current one has plainly reached its limit.
+    val maxUsers     = 10
+    val moveOnAfter  = 50L          // refusals from a user before leaving it
+    def userId(i: Int) = s"correctness:C:$runId:u$i"
 
+    val current   = new AtomicInteger(0)
+    val admitted  = Vector.fill(maxUsers)(new AtomicLong(0))
+    val rejected  = Vector.fill(maxUsers)(new AtomicLong(0))
     val total     = new AtomicLong(0)
-    val admitted  = new AtomicLong(0)
-    val rejected  = new AtomicLong(0)
+    val admittedAll = new AtomicLong(0)
+    val rejectedAll = new AtomicLong(0)
     val contended = new AtomicLong(0)
     val errors    = new AtomicLong(0)
     val sampler   = new ErrorSampler(5)
 
+    def worker(deadline: FiniteDuration): IO[Unit] =
+      untilDeadline(deadline) {
+        IO(current.get).flatMap { u =>
+          sendQuotaCheck(client, baseUrl, userId(u), perRequest, apiKey).flatMap {
+            case Right("allowed")   => IO { total.incrementAndGet(); admittedAll.incrementAndGet(); admitted(u).incrementAndGet() }
+            case Right("exceeded")  => IO {
+                total.incrementAndGet(); rejectedAll.incrementAndGet()
+                if rejected(u).incrementAndGet() >= moveOnAfter && u + 1 < maxUsers then current.compareAndSet(u, u + 1)
+              }
+            case Right("contended") => IO { total.incrementAndGet(); contended.incrementAndGet() }
+            case Right(other)       => IO { total.incrementAndGet(); errors.incrementAndGet(); sampler.record(s"unexpected outcome: $other") }
+            case Left(msg)          => IO { total.incrementAndGet(); errors.incrementAndGet(); sampler.record(msg) }
+          }.void
+        }
+      }
+
     Console[IO].println(
       s"""-- Invariant C — token-quota non-over-admission --
-         |  userId        = $userId
-         |  concurrency   = $concurrency
+         |  users         = up to $maxUsers, one at a time (${userId(0)} ...)
+         |  concurrency   = $concurrency (all on the current user)
          |  duration      = ${durationSecs}s
          |  userLimit     = $userLimit
          |  perRequest    = $perRequest
-         |  maxAdmitted   = $maxAdmitted
+         |  maxAdmitted   = $maxAdmitted per user
          |""".stripMargin
     ) *>
-    IO.race(
-      progressTicker("invariantC", durationSecs, total, admitted, rejected, errors, okLabel = "admitted", nokLabel = "rejected"),
-      (0 until concurrency).toList.parTraverse_ { _ =>
-        sendQuotaCheck(client, baseUrl, userId, perRequest, apiKey).flatMap {
-          case Right("allowed")   => IO { total.incrementAndGet(); admitted.incrementAndGet() }
-          case Right("exceeded")  => IO { total.incrementAndGet(); rejected.incrementAndGet() }
-          case Right("contended") => IO { total.incrementAndGet(); contended.incrementAndGet() }
-          case Right(other)       => IO { total.incrementAndGet(); errors.incrementAndGet(); sampler.record(s"unexpected outcome: $other") }
-          case Left(msg)          => IO { total.incrementAndGet(); errors.incrementAndGet(); sampler.record(msg) }
-        }.loop
-      }
-    ) *> IO.defer {
-      val adm    = admitted.get
-      val rej    = rejected.get
-      val con    = contended.get
-      val e      = errors.get
-      val tokens = adm * perRequest
+    IO.monotonic.flatMap { startedAt =>
+      (
+        progressTicker("invariantC", durationSecs, total, admittedAll, rejectedAll, errors, okLabel = "admitted", nokLabel = "rejected"),
+        (0 until concurrency).toList.parTraverse_(_ => worker(startedAt + durationSecs.seconds)),
+      ).parTupled
+    } *> IO.defer {
+      val perUser = (0 until maxUsers).map(u => (u, admitted(u).get, rejected(u).get)).filter((_, adm, rej) => adm + rej > 0)
+      val over    = perUser.filter((_, adm, _) => adm * perRequest > userLimit)
+      val filled  = perUser.count((_, _, rej) => rej > 0)
+      val con     = contended.get
+      val e       = errors.get
+      val counts  = s"users filled=$filled of ${perUser.size} used, admitted per user=${perUser.map(_._2).mkString("/")} (max $maxAdmitted), rejected=${rejectedAll.get}, contended=$con, errors=$e"
       val result =
-        if tokens > userLimit then InvariantResult(Verdict.Violation, s"OVER-ADMISSION: admitted=$adm ($tokens tokens) > userLimit=$userLimit (rejected=$rej, contended=$con, errors=$e)")
-        else if e > 0 then InvariantResult(Verdict.Inconclusive, s"errors=$e (admitted=$adm, rejected=$rej, contended=$con)\n     Sample errors:\n${sampler.render}")
-        else if rej == 0 then InvariantResult(Verdict.Inconclusive, s"VACUOUS: limit never reached (admitted=$adm, contended=$con) — quotas disabled or stack too slow")
-        else InvariantResult(Verdict.Pass, s"admitted=$adm ($tokens tokens) <= userLimit=$userLimit, rejected=$rej, contended=$con, errors=$e")
+        if over.nonEmpty then InvariantResult(Verdict.Violation, s"OVER-ADMISSION: ${over.map((u, adm, _) => s"${userId(u)} admitted $adm (${adm * perRequest} tokens)").mkString("; ")} > userLimit=$userLimit — $counts")
+        else if e > 0 then InvariantResult(Verdict.Inconclusive, s"$counts\n     Sample errors:\n${sampler.render}")
+        else if filled == 0 then InvariantResult(Verdict.Inconclusive, s"VACUOUS: no user reached its limit — quotas disabled or stack too slow — $counts")
+        else InvariantResult(Verdict.Pass, s"no user admitted past $userLimit tokens — $counts")
       IO.pure(result)
     }
 
-  private def invariantD_crossTenantIsolation(
-    client:      Client[IO],
-    baseUrl:     String,
-    runId:       String,
-    concurrency: Int,
-    keyA:        String,
-    keyB:        String,
+  def invariantD_crossTenantIsolation(
+    client:       Client[IO],
+    baseUrl:      String,
+    runId:        String,
+    concurrency:  Int,
+    keyA:         String,
+    keyB:         String,
+    durationSecs: Int = 20,
   ): IO[InvariantResult] =
-    val durationSecs = 20
-    val K            = 10
-    val idemKeys     = (0 until K).map(i => s"correctness:D:$runId:key-$i").toVector
+    val idemPrefix   = s"correctness:D:$runId"
     val userId       = s"correctness:D:$runId"
     val userLimit    = 1_000_000L   // TOKEN_QUOTA_USER_LIMIT default
     val perRequest   = 25_000L
     val maxAdmitted  = userLimit / perRequest
 
     final class Tenant(val key: String):
-      val created   = new AtomicLong(0)
+      val claims    = new ClaimTally
       val conflicts = new AtomicLong(0)
       val admitted  = new AtomicLong(0)
 
@@ -801,16 +874,16 @@ object Scenarios:
     def fail(msg: String): IO[Unit] =
       IO { total.incrementAndGet(); errors.incrementAndGet(); sampler.record(msg) }
 
-    def idempotency(t: Tenant, worker: Int): IO[Unit] =
-      def step(i: Int): IO[Unit] =
-        sendIdempotencyCheck(client, baseUrl, idemKeys((worker + i) % K), t.key).flatMap {
-          case Right("new")                       => IO { total.incrementAndGet(); t.created.incrementAndGet() }
-          case Right("in_progress" | "duplicate") => IO(total.incrementAndGet()).void
-          case Right("conflict")                  => IO { total.incrementAndGet(); t.conflicts.incrementAndGet() }
+    def idempotency(t: Tenant, startedAt: FiniteDuration): IO[Unit] =
+      claimKey(idemPrefix, startedAt).flatMap { key =>
+        sendIdempotencyCheck(client, baseUrl, key, t.key).flatMap {
+          case Right("new")                       => IO { total.incrementAndGet(); t.claims.record(key, isNew = true) }
+          case Right("in_progress" | "duplicate") => IO { total.incrementAndGet(); t.claims.record(key, isNew = false) }
+          case Right("conflict")                  => IO { total.incrementAndGet(); t.conflicts.incrementAndGet() }.void
           case Right(other)                       => fail(s"unexpected idempotency status: $other")
           case Left(msg)                          => fail(msg)
-        } >> step(i + 1)
-      step(0)
+        }
+      }
 
     def quota(t: Tenant): IO[Unit] =
       sendQuotaCheckReserving(client, baseUrl, userId, perRequest, t.key).flatMap {
@@ -822,7 +895,7 @@ object Scenarios:
         case Right(("contended", _)) => IO(total.incrementAndGet()).void
         case Right((other, _))       => fail(s"unexpected quota outcome: $other")
         case Left(msg)               => fail(msg)
-      }.loop
+      }
 
     def steal(id: String): IO[Unit] =
       sendQuotaReconcile(client, baseUrl, id, 0L, b.key).flatMap {
@@ -838,7 +911,7 @@ object Scenarios:
       val n = grantedToA.size
       if n == 0 then IO.sleep(20.millis)
       else steal(grantedToA.get(java.util.concurrent.ThreadLocalRandom.current().nextInt(n)))
-    }.loop
+    }
 
     if keyA == keyB then
       IO.pure(InvariantResult(Verdict.Inconclusive, "D needs two different keys: --api-key and --free-key are the same, so there is only one tenant"))
@@ -848,45 +921,53 @@ object Scenarios:
            |  clients       = A (--api-key) and B (--free-key), same identifiers
            |  concurrency   = $concurrency per client per race
            |  duration      = ${durationSecs}s
-           |  K (idem keys) = $K
+           |  idem keys     = one at a time, a new one every ${ClaimRoundMillis} ms, the same for both clients
            |  userId        = $userId  (limit $userLimit, $perRequest per check, $maxAdmitted each)
            |""".stripMargin
       ) *>
-      IO.race(
-        progressTicker("invariantD", durationSecs, total, admittedAll, rejectedAll, errors, okLabel = "admitted", nokLabel = "rejected"),
-        List(
-          (0 until concurrency).toList.parTraverse_(idempotency(a, _)),
-          (0 until concurrency).toList.parTraverse_(idempotency(b, _)),
-          List.fill(concurrency)(a).parTraverse_(quota),
-          List.fill(concurrency)(b).parTraverse_(quota),
-          List.fill(math.max(1, concurrency / 2))(thief).parSequence_,
-        ).parSequence_,
-      ) *>
+      IO.monotonic.flatMap { startedAt =>
+        val deadline = startedAt + durationSecs.seconds
+        def workers(n: Int)(step: IO[Unit]): IO[Unit] = List.fill(n)(untilDeadline(deadline)(step)).parSequence_
+        (
+          progressTicker("invariantD", durationSecs, total, admittedAll, rejectedAll, errors, okLabel = "admitted", nokLabel = "rejected"),
+          List(
+            workers(concurrency)(idempotency(a, startedAt)),
+            workers(concurrency)(idempotency(b, startedAt)),
+            workers(concurrency)(quota(a)),
+            workers(concurrency)(quota(b)),
+            workers(math.max(1, concurrency / 2))(thief),
+          ).parSequence_,
+        ).parTupled
+      } *>
       // Every reservation A holds gets one more attempt after the race.
       IO(grantedToA.toArray(Array.empty[String]).toList).flatMap(_.traverse_(steal)) *>
       IO.defer {
-        val (ca, cb)   = (a.created.get, b.created.get)
         val (aa, ab)   = (a.admitted.get, b.admitted.get)
         val conflicts  = a.conflicts.get + b.conflicts.get
         val (t, landed) = (thefts.get, theftsLanded.get)
         val e          = errors.get
         val rejected   = rejectedAll.get
+        val doubles    = a.claims.doubleClaimed.size + b.claims.doubleClaimed.size
+        val unclaimed  = a.claims.neverClaimed.size + b.claims.neverClaimed.size
         val summary =
-          s"created A=$ca B=$cb (K=$K each), admitted A=$aa B=$ab (max $maxAdmitted each, ${aa + ab} together), stolen reconciles refused=${t - landed}/$t, conflicts=$conflicts, errors=$e"
+          s"idempotency keys A=${a.claims.keys} B=${b.claims.keys} (created A=${a.claims.created} B=${b.claims.created}), admitted A=$aa B=$ab (max $maxAdmitted each, ${aa + ab} together), stolen reconciles refused=${t - landed}/$t, conflicts=$conflicts, errors=$e"
         def because(verdict: Verdict, cause: String): InvariantResult =
           InvariantResult(verdict, s"$cause — $summary\n     Sample errors:\n${sampler.render}")
         val result =
           if landed > 0 then because(Verdict.Violation, "CROSS-TENANT RECONCILE: B changed A's reservation")
-          else if ca > K || cb > K then because(Verdict.Violation, "DOUBLE CLAIM: a client was answered 'new' twice for a key")
+          else if doubles > 0 then because(Verdict.Violation, s"DOUBLE CLAIM: a client was answered 'new' twice for $doubles key(s)")
           else if aa > maxAdmitted || ab > maxAdmitted then because(Verdict.Violation, "OVER-ADMISSION")
           else if conflicts > 0 then because(Verdict.Violation, "CONFLICT: a 409 for an identical request")
           // From here on a shortfall may be an answer that was lost.
           else if e > 0 then because(Verdict.Inconclusive, "errors")
-          else if ca < K || cb < K then because(Verdict.Violation, "SHARED IDEMPOTENCY: each client must create its own K records")
+          // A client that was answered for a key, and never 'new', met the
+          // other client's record.
+          else if unclaimed > 0 then because(Verdict.Violation, s"SHARED IDEMPOTENCY: $unclaimed key(s) were never 'new' for one of the clients, so the two share records")
           // The limit was reached, and the two clients reached it together.
           else if aa + ab <= maxAdmitted && rejected > 0 then because(Verdict.Violation, "SHARED QUOTA: together the clients were held to one limit")
           else if aa + ab <= maxAdmitted then because(Verdict.Inconclusive, "VACUOUS: together the clients never reached a limit")
           else if t == 0 then because(Verdict.Inconclusive, "VACUOUS: A was never granted a reservation to steal")
+          else if a.claims.keys < MinClaimRaces || b.claims.keys < MinClaimRaces then because(Verdict.Inconclusive, s"VACUOUS: fewer than $MinClaimRaces idempotency keys were raced")
           else InvariantResult(Verdict.Pass, summary)
         IO.pure(result)
       }
