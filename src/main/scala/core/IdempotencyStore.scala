@@ -3,7 +3,6 @@ package core
 import java.time.Instant
 
 import cats.effect.*
-import cats.effect.std.UUIDGen
 import cats.syntax.all.*
 
 /** Result of an idempotency check.
@@ -205,9 +204,19 @@ trait IdempotencyStore[F[_]]:
   def healthCheck: F[Either[String, Unit]]
 
 object IdempotencyStore:
+
+  /** A new claim's ID (ADR-006): unique per claim, and not a secret.
+    *
+    * `UUIDGen[F]`, summoned from `Sync`, runs `UUID.randomUUID` on the blocking
+    * pool, so every idempotency check paid a thread hop for it. The JVM is
+    * started on `/dev/urandom`, where the call does not block.
+    */
+  def newClaimId[F[_]: Sync]: F[String] = Sync[F]
+    .delay(java.util.UUID.randomUUID().toString)
+
   /** Create an in-memory store for testing.
     */
-  def inMemory[F[_]: Temporal: UUIDGen]: F[IdempotencyStore[F]] =
+  def inMemory[F[_]: Sync]: F[IdempotencyStore[F]] =
     import cats.effect.Ref
     import cats.effect.Clock
 
@@ -222,7 +231,7 @@ object IdempotencyStore:
           for
             now <- Clock[F].realTime.map(d => Instant.ofEpochMilli(d.toMillis))
             // Used only if this check claims the key.
-            claimId <- UUIDGen[F].randomUUID.map(_.toString)
+            claimId <- IdempotencyStore.newClaimId[F]
             result <- stateRef.modify { records =>
               records.get(idempotencyKey).filterNot(_.expired(now)) match
                 case Some(existing) => existing.status match
@@ -358,6 +367,5 @@ object IdempotencyStore:
             records <- stateRef.get
           yield records.get(idempotencyKey).filterNot(_.expired(now))
 
-        override def healthCheck: F[Either[String, Unit]] = Temporal[F]
-          .pure(Right(()))
+        override def healthCheck: F[Either[String, Unit]] = Sync[F].pure(Right(()))
     }

@@ -6,13 +6,12 @@ import core.{
   IdempotencyRecord, IdempotencyResult, IdempotencyStatus, IdempotencyStore,
   StoredResponse,
 }
-import cats.effect.std.UUIDGen
-import cats.effect.{Clock, Ref, Temporal}
+import cats.effect.{Clock, Ref, Sync}
 import cats.syntax.all.*
 
 /** In-memory idempotency store for testing purposes.
   */
-class InMemoryIdempotencyStore[F[_]: Temporal: UUIDGen](
+class InMemoryIdempotencyStore[F[_]: Sync](
     stateRef: Ref[F, Map[String, IdempotencyRecord]],
 ) extends IdempotencyStore[F]:
 
@@ -24,7 +23,7 @@ class InMemoryIdempotencyStore[F[_]: Temporal: UUIDGen](
   ): F[IdempotencyResult] =
     for
       now <- Clock[F].realTime.map(d => Instant.ofEpochMilli(d.toMillis))
-      claimId <- UUIDGen[F].randomUUID.map(_.toString)
+      claimId <- IdempotencyStore.newClaimId[F]
       result <- stateRef.modify { stateMap =>
         stateMap.get(idempotencyKey) match
           case Some(record) => record.status match
@@ -157,9 +156,9 @@ class InMemoryIdempotencyStore[F[_]: Temporal: UUIDGen](
   override def get(idempotencyKey: String): F[Option[IdempotencyRecord]] =
     stateRef.get.map(_.get(idempotencyKey))
 
-  override def healthCheck: F[Either[String, Unit]] = Temporal[F].pure(Right(()))
+  override def healthCheck: F[Either[String, Unit]] = Sync[F].pure(Right(()))
 
 object InMemoryIdempotencyStore:
-  def create[F[_]: Temporal: UUIDGen]: F[InMemoryIdempotencyStore[F]] = Ref
+  def create[F[_]: Sync]: F[InMemoryIdempotencyStore[F]] = Ref
     .of[F, Map[String, IdempotencyRecord]](Map.empty)
     .map(new InMemoryIdempotencyStore[F](_))

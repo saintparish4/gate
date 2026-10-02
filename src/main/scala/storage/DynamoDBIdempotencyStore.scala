@@ -6,7 +6,6 @@ import scala.jdk.CollectionConverters.*
 import scala.jdk.FutureConverters.*
 
 import cats.effect.*
-import cats.effect.std.UUIDGen
 import cats.syntax.all.*
 import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient
 import software.amazon.awssdk.services.dynamodb.model.*
@@ -81,7 +80,7 @@ class DynamoDBIdempotencyStore[F[_]: Async](
     for
       now <- Clock[F].realTime.map(d => Instant.ofEpochMilli(d.toMillis))
       // A new ID per attempt: it is stored only if this attempt's claim wins.
-      claimId <- UUIDGen[F].randomUUID.map(_.toString)
+      claimId <- IdempotencyStore.newClaimId[F]
       result <- tryCreatePending(
         idempotencyKey,
         clientId,
