@@ -99,5 +99,9 @@ lazy val loadSim = project.in(file("loadSim")).settings(
     "io.circe" %% "circe-parser" % CirceVersion,
     "ch.qos.logback" % "logback-classic" % "1.5.19" % Runtime,
     "org.hdrhistogram" % "HdrHistogram" % "2.2.2",
+    // The invariants are run against fake servers, to show each can fail.
+    "org.http4s" %% "http4s-dsl" % Http4sVersion % Test,
+    "org.scalatest" %% "scalatest" % "3.2.19" % Test,
+    "org.typelevel" %% "cats-effect-testing-scalatest" % "1.7.0" % Test,
   ),
 )

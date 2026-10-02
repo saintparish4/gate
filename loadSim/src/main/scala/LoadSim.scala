@@ -562,14 +562,14 @@ object Scenarios:
       ).flatMap(_ => Console[IO].println(f"  [warmup] stage ${stage + 1} — $workers%2d workers x ${secs}s  |  ok=${ok.get}  errors=${bad.get}"))
     }
 
-  private def invariantA_tokenBucketNonOverIssue(
-    client:      Client[IO],
-    baseUrl:     String,
-    runId:       String,
-    concurrency: Int,
-    freeKey:     String,
+  def invariantA_tokenBucketNonOverIssue(
+    client:       Client[IO],
+    baseUrl:      String,
+    runId:        String,
+    concurrency:  Int,
+    freeKey:      String,
+    durationSecs: Int = 30,
   ): IO[InvariantResult] =
-    val durationSecs  = 30
     // A Free-tier key (20 tokens, 2 tokens/s in application.conf). Premium
     // refills faster than this driver can send against LocalStack, so it would
     // never block and prove nothing.
@@ -1141,9 +1141,11 @@ object Scenarios:
     def tick(elapsed: Int): IO[Unit] =
       if elapsed >= duration then IO.unit
       else
-        IO.sleep(ProgressIntervalSecs.seconds) *>
+        // Never past the end: a 3 s run used to take 5.
+        val step = math.min(ProgressIntervalSecs, duration - elapsed)
+        IO.sleep(step.seconds) *>
           IO.defer {
-            val e   = elapsed + ProgressIntervalSecs
+            val e   = elapsed + step
             val t   = total.get
             val rps = if e > 0 then t / e else 0
             Console[IO].println(

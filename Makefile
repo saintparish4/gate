@@ -87,9 +87,10 @@ fmt: ## Format all Scala sources (CI fails on unformatted code)
 	$(NEED_SBT)
 	sbt scalafmtAll
 
-test: ## Run unit tests
+test: ## Run unit tests, and the load simulator's own tests
 	$(NEED_SBT)
 	sbt unitTest
+	sbt loadSim/test
 
 test-it: ## Run integration tests (TestContainers — needs Docker, not LocalStack)
 	$(NEED_SBT)

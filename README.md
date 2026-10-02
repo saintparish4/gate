@@ -477,6 +477,13 @@ invariants:
 | **C** — token quota never over-admits | 50 workers spending 25,000 tokens each against one user's 1,000,000 limit for 20 s, moving to a fresh user once it has refused 50 checks (up to 10 users) | for every user `admitted x 25,000 <= 1,000,000`; at least one user reached its limit; 0 errors |
 | **D** — tenants never share state | Two clients (`API_KEY` and `FREE_API_KEY`) racing for 20 s on the same idempotency key, which changes every 250 ms, and the same quota user, while the second reconciles every reservation the first is granted | each client is answered `new` exactly once for every key; each is held to 40 quota admissions and together they pass 40; every stolen reconcile answers 404; 0 conflicts, 0 errors |
 
+The invariants are themselves tested: `sbt loadSim/test` runs each one against
+a small fake server that is correct, and against fakes with one bug each (a
+limiter that admits everything, a server that says `new` to everyone, a quota
+with no limit, state shared between clients). The correct one must pass, each
+bug must be a `VIOLATION`, and a server that only errors must be
+`INCONCLUSIVE`. Until then the scenario had only ever failed on errors.
+
 B and D used to hold 10 keys for the whole run, which is ten races in the first
 instant and duplicates after that, and C used one user, which crosses its limit
 once. B also compared the total of `new` answers with the number of keys, which
