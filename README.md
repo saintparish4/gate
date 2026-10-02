@@ -41,6 +41,7 @@ DynamoDB, zero errors. See [Correctness](#correctness).
 | **DynamoDB slow or partially down** | The rate-limit store is wrapped in a bulkhead (100 concurrent calls, 500 ms max wait), a process-wide circuit breaker (20 failures to open, 30 s reset, 3 half-open calls), a retry policy for SDK and I/O errors (3 retries, 100 ms base, 2x backoff, 10 s cap), and a 2 s timeout per check. A timed-out check is not retried: the bound covers the whole check. When a check reaches no decision (the breaker is open, the bulkhead is full, or the store times out or fails after retries), `DEGRADATION_MODE` decides: `reject-all` (default, safe for payments) or `allow-all` (for AI infrastructure where availability wins). Every degraded decision carries `X-Gate-Degraded: true` and increments `gate_degraded_total`. `GET /v1/ratelimit/status` answers `503` when the store cannot be read, rather than reporting a full bucket. |
 | **A corrupt limiter or quota item** | It fails closed and self-heals. The store replaces the item, conditioned on its raw stored version, with the most conservative valid state: an empty token bucket, a full leaky bucket or sliding window, an exhausted quota window starting now. The key refuses until it refills, drains, or the window ends. Each read counts `CorruptStateRead`, which has an alarm. A corrupt idempotency record answers `503`, since whether its operation ran is unknowable. |
 | **Instance crash** | No in-process state. The next instance reads current DynamoDB state and continues correctly. |
+| **A task that has just started** | Before it opens its port, the service runs every request path in process for up to 20 seconds (rate limit, idempotency, quota), so the first real burst does not pay class loading, SDK start-up and TLS handshakes at once. The ALB target group then ramps a new task up to its full share over 60 seconds (`alb_slow_start_seconds`), which applies when another task is already serving. Before this, a task given full load 27 seconds after starting missed its 2-second store timeout on eight calls. |
 | **Kinesis failure** | Events go into a bounded in-memory queue (10,000, drop-oldest) that a background fiber drains to Kinesis. A failed publish is retried once, then dropped. Both an eviction from a full queue and a failed publish are counted, as `gate_events_dropped_total` and CloudWatch `DroppedKinesisEvent{reason=queue_full\|publish_failed}`. The request path never waits on Kinesis, and `/ready` reports a Kinesis fault as `degraded` without taking the task out of service. |
 | **OCC exhaustion on a hot key** | After 10 failed conditional writes the request is rejected with 429 instead of over-issuing. |
 | **Idempotency TOCTOU race** | If the conditional create fails and the follow-up read finds nothing (TTL deleted the item in between) or a `Failed` record (released in between), the check claims again, up to 3 times, instead of returning a `new` it does not own. |
@@ -490,9 +491,33 @@ different clients. Against a deployed stack all three come from
 
 ### On AWS
 
-Two runs, each from a laptop over the internet against the Terraform-deployed
-demo stack: one Fargate task (1024 CPU units / 2048 MB), DynamoDB on-demand,
-us-east-1. Two passing runs are evidence, not a reliability history.
+Runs from a laptop over the internet against the Terraform-deployed demo
+stack: Fargate tasks of 1024 CPU units / 2048 MB, DynamoDB on-demand,
+us-east-1. A handful of passing runs is evidence, not a reliability history,
+and one run failed; it is recorded below.
+
+**2026-10-01, image `a5be8aa`, all four invariants, three runs, zero errors.**
+These were aimed at a cold task:
+- run `1790901878160` started 6 seconds after the only task opened its port;
+- runs `1790902202519` and `1790902332955` ran while the service scaled from
+  one task to two. The ALB gave the new task 10% of requests at first and an
+  even share 60 seconds later.
+
+| Run | Tasks | A | B | C | D |
+|-----|-------|---|---|---|---|
+| `1790901878160`, 6 s after start | 1 | **PASS**, ~146 RPS | **PASS**, ~190 RPS | **PASS**, ~224 RPS | **PASS**, ~223 RPS |
+| `1790902202519`, during scale-out | 1 to 2 | **PASS**, ~408 RPS | **PASS**, ~483 RPS | **PASS**, ~599 RPS | **PASS**, ~537 RPS |
+| `1790902332955`, after it | 2 | **PASS**, ~612 RPS | **PASS**, ~747 RPS | **PASS**, ~1,090 RPS | **PASS**, ~804 RPS |
+
+**The run that failed.** Earlier the same day, run `1790899146855` on the
+previous image (`93ad6f3`) started 27 seconds after its task did and failed A
+and B: eight calls missed the 2-second store timeout, so three rate-limit
+checks were answered by the degradation mode and five idempotency checks
+answered 503. DynamoDB answered in under 60 ms throughout; the task was at 100%
+CPU on a cold JVM. The same task passed all four invariants four minutes
+later (run `1790899403499`). That failure is why the service now warms every
+request path before it opens its port, and why the target group uses slow
+start.
 
 **2026-09-27, run `1790555564135`, all four invariants.** This demo:
 - loaded its keys from Secrets Manager, written by `deploy-demo.sh`, and
@@ -524,9 +549,10 @@ measured `+2.9 s` from a wall-clock correction on the task, which is why the
 invariant carries a time allowance rather than a token epsilon.
 
 The properties hold on real DynamoDB under contention, not just on the
-emulator. Throughput here is bounded by the client and the WAN, not the
-service; treat it as a floor. This is a correctness run, not a latency
-benchmark.
+emulator. The September throughput was read as bounded by the client and the
+WAN. The October runs show the service was the bound: one task sat at 100% CPU
+at about 450 RPS once warm, and two tasks served up to about 1,090. These are
+correctness runs, not a latency benchmark.
 
 ## Performance
 
