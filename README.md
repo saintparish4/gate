@@ -499,7 +499,9 @@ deployment. A counts the answers that carry `X-Gate-Degraded`, so a decision
 made by degradation mode is seen whichever task made it. It used to compare
 `gate_degraded_total` before and after, which meant nothing behind two tasks. A
 drains `FREE_API_KEY`'s bucket, B and C use `API_KEY`, and D needs both, as two
-different clients. Against a deployed stack both come from `.demo-keys.env`. Source:
+different clients. Against a deployed stack both come from `.demo-keys.env`,
+and they reach the load simulator through the environment: as command-line
+flags they were echoed by `make` and by sbt, so a run printed them. Source:
 [`LoadSim.scala`](loadSim/src/main/scala/LoadSim.scala).
 
 ### On AWS

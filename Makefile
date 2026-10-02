@@ -97,9 +97,13 @@ test-it: ## Run integration tests (TestContainers — needs Docker, not LocalSta
 
 test-all: test test-it ## Run unit and integration tests
 
+# The keys go to the load simulator through the environment, and the line that
+# sets them is silent. As flags they were echoed here and again by sbt, so a
+# run against a deployed stack printed its keys into the terminal and any log.
 correctness: ## Check the correctness invariants (APP_URL=... to target a deployed stack)
 	$(NEED_SBT)
-	sbt "loadSim/run --scenario correctness --url $(APP_URL) --api-key $(API_KEY) --free-key $(FREE_API_KEY)"
+	@echo "Correctness invariants against $(APP_URL) (keys from API_KEY and FREE_API_KEY; not printed)"
+	@API_KEY='$(API_KEY)' FREE_API_KEY='$(FREE_API_KEY)' sbt "loadSim/run --scenario correctness --url $(APP_URL)"
 
 ##@ Probes
 

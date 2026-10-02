@@ -50,21 +50,28 @@ import org.HdrHistogram.ConcurrentHistogram
  *                                 three invariants (defaults A=20, B=50, C=50).
  *                                 Lower it to match a small target -- a deployment
  *                                 that cannot serve the load measures nothing.
- *   --api-key KEY                 key for the warm-up and invariants B and C
- *                                 (default test-api-key)
- *   --free-key KEY                Free-tier key whose 20-token bucket invariant A
- *                                 drains (default free-api-key)
+ *
+ * Keys come from the environment:
+ *   API_KEY        key for every scenario, the warm-up, and invariants B and C
+ *                  (default test-api-key)
+ *   FREE_API_KEY   Free-tier key whose 20-token bucket invariant A drains, and
+ *                  the second client of invariant D (default free-api-key)
  *
  * The defaults are the built-in development keys, which only docker-compose
- * serves. A deployed stack loads its keys from Secrets Manager, so pass its
- * keys with the two --*-key flags (`make correctness` does, from API_KEY and
- * FREE_API_KEY).
+ * serves. A deployed stack loads its keys from Secrets Manager; `source
+ * .demo-keys.env` exports them under these names. They were flags, and a flag
+ * is echoed by make and by sbt and shows in `ps`, so every run against a deploy
+ * printed its keys. --api-key and --free-key still work, for a one-off.
  */
 object LoadSim extends IOApp:
 
   val defaultBaseUrl = "http://localhost:8080"
-  val defaultApiKey  = "test-api-key"
-  val defaultFreeKey  = "free-api-key"
+  /** The public development keys, which only docker-compose serves. */
+  val builtInApiKey  = "test-api-key"
+  val builtInFreeKey = "free-api-key"
+
+  val defaultApiKey  = sys.env.get("API_KEY").filter(_.nonEmpty).getOrElse(builtInApiKey)
+  val defaultFreeKey = sys.env.get("FREE_API_KEY").filter(_.nonEmpty).getOrElse(builtInFreeKey)
 
   override def run(args: List[String]): IO[ExitCode] =
     val scenario = Args.string(args, "--scenario", "normal")
@@ -394,7 +401,7 @@ object Scenarios:
    *   reached its limit; no HTTP errors.
    *
    * Invariant D — cross-tenant isolation (ADR-005):
-   *   Two clients, --api-key (A) and --free-key (B), race for 20 s on the same
+   *   Two clients, API_KEY (A) and FREE_API_KEY (B), race for 20 s on the same
    *   visible identifiers. Each is its own tenant.
    *     D1: both check the same idempotency key, which changes every 250 ms;
    *         each must be answered "new" exactly once for every key. Shared keys
@@ -650,7 +657,7 @@ object Scenarios:
     Console[IO].println(
       s"""-- Invariant A — token-bucket non-over-issue --
          |  key           = $key
-         |  apiKey        = ${if apiKey == LoadSim.defaultFreeKey then apiKey else "from --free-key (not printed)"} (Free tier)
+         |  apiKey        = ${if apiKey == LoadSim.builtInFreeKey then apiKey else "FREE_API_KEY (not printed)"} (Free tier)
          |  concurrency   = $concurrency
          |  duration      = ${durationSecs}s
          |  capacity      = $capacity
@@ -914,11 +921,11 @@ object Scenarios:
     }
 
     if keyA == keyB then
-      IO.pure(InvariantResult(Verdict.Inconclusive, "D needs two different keys: --api-key and --free-key are the same, so there is only one tenant"))
+      IO.pure(InvariantResult(Verdict.Inconclusive, "D needs two different keys: API_KEY and FREE_API_KEY are the same, so there is only one tenant"))
     else
       Console[IO].println(
         s"""-- Invariant D — cross-tenant isolation --
-           |  clients       = A (--api-key) and B (--free-key), same identifiers
+           |  clients       = A (API_KEY) and B (FREE_API_KEY), same identifiers
            |  concurrency   = $concurrency per client per race
            |  duration      = ${durationSecs}s
            |  idem keys     = one at a time, a new one every ${ClaimRoundMillis} ms, the same for both clients
