@@ -1,0 +1,129 @@
+name: AWS correctness
+
+# The correctness invariants against a real deploy, on a schedule.
+#
+# CI runs them against LocalStack with 10 s store timeouts and a raised auth
+# limit. Production uses 2 s. The one failure seen on AWS was a 2 s timeout on
+# a task that had just started, which the CI configuration cannot produce.
+#
+# This workflow is inert until the repository variable AWS_CORRECTNESS_ROLE_ARN
+# is set. The role it names is created by terraform/bootstrap, off by default:
+#   TF_VAR_github_actions_role=true ./scripts/bootstrap.sh
+# Each run costs about $0.20 (roughly 40 minutes of the demo stack) and leaves
+# nothing behind; the last steps fail the run if anything billable survives.
+
+on:
+  schedule:
+    # Mondays, 06:17 UTC.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      settle_seconds:
+        description: "Seconds to wait after the deploy is ready before the run"
+        default: "180"
+
+# One at a time: two runs would fight over the demo's Terraform state.
+concurrency:
+  group: aws-correctness
+  cancel-in-progress: false
+
+permissions:
+  id-token: write # to assume the role through OIDC
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  correctness:
+    name: Deploy, run the invariants, tear down
+    # Skipped, not failed, until the owner has opted in.
+    if: ${{ vars.AWS_CORRECTNESS_ROLE_ARN != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v5
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+        cache: 'sbt'
+
+    - name: Set up SBT
+      uses: sbt/setup-sbt@v1
+
+    # The S3 backend's lockfile locking needs 1.10 or later.
+    - name: Set up Terraform
+      uses: hashicorp/setup-terraform@v4
+      with:
+        terraform_version: "~1.14"
+        terraform_wrapper: false
+
+    # Short-lived credentials from the role; nothing is stored in the
+    # repository. An hour covers the whole job, where the deploy scripts'
+    # `aws login` snapshot on a laptop lasts about 15 minutes.
+    - name: Assume the correctness role
+      uses: aws-actions/configure-aws-credentials@v5
+      with:
+        role-to-assume: ${{ vars.AWS_CORRECTNESS_ROLE_ARN }}
+        aws-region: ${{ env.AWS_REGION }}
+        role-duration-seconds: 3600
+
+    # Idempotent: the state bucket and the image repository already exist. It
+    # also writes terraform/backend.hcl, which is not in the repository.
+    - name: Bootstrap (state bucket, image repository)
+      run: ./scripts/bootstrap.sh
+
+    - name: Build and push the image for this commit
+      run: echo "ECR_IMAGE=$(./scripts/publish-image.sh)" >> "$GITHUB_ENV"
+
+    - name: Deploy the demo stack
+      run: ./scripts/deploy-demo.sh
+
+    # A task that has just started serves its first minute slowly. That is a
+    # separate question from whether the invariants hold, and it is measured
+    # separately; here the task is given time to settle first.
+    - name: Let the task settle
+      run: sleep "${{ github.event.inputs.settle_seconds || '180' }}"
+
+    - name: Run the correctness invariants
+      run: |
+        set -a; source .demo-keys.env; set +a
+        API=$(cd terraform && terraform output -raw api_endpoint)
+        make APP_URL="$API" correctness
+
+    - name: Keep the results file
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: correctness-results
+        path: loadsim-results/
+        if-no-files-found: warn
+
+    - name: Tear the demo down
+      if: always()
+      run: ./scripts/teardown-demo.sh
+
+    # The teardown script already fails on surviving Terraform state. This looks
+    # at the account itself, for what bills by the hour.
+    - name: Confirm nothing billable is left
+      if: always()
+      run: |
+        left=""
+        nat=$(aws ec2 describe-nat-gateways --filter Name=state,Values=available,pending --query 'NatGateways[].NatGatewayId' --output text)
+        alb=$(aws elbv2 describe-load-balancers --query 'LoadBalancers[?starts_with(LoadBalancerName, `rate-limiter-demo`)].LoadBalancerName' --output text)
+        ecs=$(aws ecs list-clusters --query 'clusterArns[?contains(@, `rate-limiter-demo`)]' --output text)
+        ddb=$(aws dynamodb list-tables --query 'TableNames[?starts_with(@, `rate-limiter-demo`)]' --output text)
+        kin=$(aws kinesis list-streams --query 'StreamNames[?starts_with(@, `rate-limiter-demo`)]' --output text)
+        for found in "NAT gateways: $nat" "load balancers: $alb" "ECS clusters: $ecs" "tables: $ddb" "streams: $kin"; do
+          case "$found" in *": ") ;; *) left="$left\n  $found" ;; esac
+        done
+        if [ -n "$left" ]; then
+          printf 'Still in the account after teardown:%b\n' "$left"
+          exit 1
+        fi
+        echo "Nothing billable is left."

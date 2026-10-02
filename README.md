@@ -467,6 +467,18 @@ and pull request:
    runs `sbt "loadSim/run --scenario correctness"`. Anything but a pass fails the
    build.
 
+CI runs against LocalStack with 10 s store timeouts and a raised auth limit,
+which is not how production is configured: the service's own timeouts are 2 s,
+and the one failure seen on AWS was a 2 s timeout that CI cannot produce. A
+second workflow, [`aws-correctness.yml`](.github/workflows/aws-correctness.yml),
+deploys the demo stack to AWS on Mondays, lets the task settle, runs the same
+invariants, tears the stack down, and fails if anything billable is left. It is
+**off until the account owner turns it on**: it needs a role in the AWS account
+(`TF_VAR_github_actions_role=true ./scripts/bootstrap.sh` creates one that only
+this repository's `master` can assume, with no permissions until some are
+attached) and the repository variable `AWS_CORRECTNESS_ROLE_ARN`. Each run
+costs about $0.20.
+
 The correctness scenario warms the server for about 15 s, then asserts four
 invariants:
 
