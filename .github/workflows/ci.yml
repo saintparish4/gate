@@ -81,6 +81,12 @@ jobs:
     - name: Run unit tests
       run: sbt unitTest
 
+    # The correctness job below trusts the load simulator's verdicts. This runs
+    # each invariant against fake servers with one bug each, so an invariant
+    # that could no longer fail would be caught here.
+    - name: Prove the correctness invariants can fail
+      run: sbt loadSim/test
+
   # Separate from `unit` so a formatting or unit failure reports in about two
   # minutes instead of waiting behind TestContainers.
   integration:
@@ -161,6 +167,8 @@ jobs:
         context: .
         tags: ${{ env.COMPOSE_PROJECT_NAME }}-rate-limiter
         load: true
+        build-args: |
+          GIT_COMMIT=${{ github.sha }}
         cache-from: type=gha,scope=rate-limiter
         cache-to: type=gha,mode=max,scope=rate-limiter
       env:

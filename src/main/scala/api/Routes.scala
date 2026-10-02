@@ -73,7 +73,7 @@ class Routes[F[_]: Async: Tracer](
   private val publicRoutes: HttpRoutes[F] = HttpRoutes.of[F] {
     // Liveness probe - always returns 200 if service is running
     case GET -> Root / "health" =>
-      Ok(HealthResponse("healthy", BuildInfo.version).asJson)
+      Ok(HealthResponse("healthy", BuildInfo.version, BuildInfo.commit).asJson)
 
     // Readiness probe: 503 only when a component needed to serve decisions is
     // down. A failing optional one (Kinesis) reads "degraded" with a 200, so
@@ -178,7 +178,7 @@ class Routes[F[_]: Async: Tracer](
   def httpApp: HttpApp[F] = Routes.toHttpApp(routes, logger)
 
 // API models
-case class HealthResponse(status: String, version: String)
+case class HealthResponse(status: String, version: String, commit: String)
 case class ReadyResponse(
     status: String,
     checks: Map[String, Boolean],
@@ -187,6 +187,9 @@ case class ReadyResponse(
 
 object BuildInfo:
   val version = buildinfo.BuildInfo.version
+
+  /** The commit this build was made from, or "unknown". */
+  val commit = buildinfo.BuildInfo.commit
 
 object Routes:
 

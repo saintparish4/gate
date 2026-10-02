@@ -49,7 +49,8 @@ aws ecr get-login-password --region "$REGION" \
 # Fargate runs linux/amd64. Building on any other host architecture without
 # --platform produces an image the task will fail to start.
 log "Building $URI for linux/amd64..."
-docker build --platform linux/amd64 -t "$URI" . >&2
+# The tag is the commit (or commit-dirty-timestamp), and /health reports it.
+docker build --platform linux/amd64 --build-arg GIT_COMMIT="$TAG" -t "$URI" . >&2
 
 log "Pushing..."
 docker push "$URI" >&2

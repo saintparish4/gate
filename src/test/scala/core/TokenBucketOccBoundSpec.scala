@@ -1,197 +1,218 @@
 package core
 
+import java.lang.reflect.{InvocationHandler, Proxy}
+import java.util.concurrent.CompletableFuture
+
 import scala.concurrent.duration.*
 
 import org.scalatest.freespec.AsyncFreeSpec
 import org.scalatest.matchers.should.Matchers
+import org.typelevel.log4cats.Logger
+import org.typelevel.log4cats.noop.NoOpLogger
 
 import cats.effect.*
+import cats.effect.std.Dispatcher
 import cats.effect.testing.scalatest.AsyncIOSpec
 import cats.effect.testkit.TestControl
 import cats.syntax.all.*
+import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient
+import software.amazon.awssdk.services.dynamodb.model.{
+  AttributeValue, ConditionalCheckFailedException, GetItemResponse,
+  PutItemRequest, PutItemResponse,
+}
+import observability.MetricsPublisher
+import storage.DynamoDBRateLimitStore
 
-/** Deterministic reproduction attempt for issue #10.
+/** The token bucket's ceiling, under a virtual clock and adversarial latency.
   *
-  * Against real DynamoDB a clean run (zero errors, no degradation) admitted 86
-  * tokens in a 30.1s window where capacity + rate * elapsed = 80.2. Every
-  * remote measurement of the refill rate was confounded by network and clock
-  * domains, so this pins the OCC + token-bucket logic under a virtual clock
-  * where nothing is.
+  * Written as a reproduction attempt for issue #10: against real DynamoDB a
+  * clean run admitted 86 tokens in a window the load simulator measured as 30.1
+  * s, where capacity + rate * elapsed is 80.2. This pins the OCC and
+  * token-bucket logic where no network or second clock is involved. It did not
+  * reproduce the excess, and on 1 October 2026 the same kind of excess was
+  * traced to the load simulator's own clock running slow.
   *
-  * The store below mirrors DynamoDBRateLimitStore.singleAttempt exactly -- now
-  * captured BEFORE the read, refill, consume, conditional put keyed on version
-  * (attribute_not_exists for the first write) -- and adds the one thing an
-  * in-memory store never models: latency between capturing now and reading, and
-  * between deciding and writing. Those gaps are where a stale now can commit
-  * behind a newer writer, which is the only interleaving I could not rule out
-  * on paper.
+  * It drives the real `DynamoDBRateLimitStore`. It used to drive a copy: a
+  * `singleAttempt` written out again in this file, "mirroring" the store's. A
+  * copy keeps passing when the store changes, so the bound was proven for code
+  * that does not ship. The store now runs over a DynamoDB stub that keeps one
+  * item, honours the two conditions the store writes with, and delays each read
+  * and write, because the gaps between capturing now, reading, and writing are
+  * where a stale now could commit behind a newer writer.
   */
 class TokenBucketOccBoundSpec
     extends AsyncFreeSpec with AsyncIOSpec with Matchers:
 
+  given Logger[IO] = NoOpLogger[IO]
+
   private val profile =
     RateLimitProfile(capacity = 20, refillRatePerSecond = 2.0, ttlSeconds = 3600)
 
-  /** One DynamoDB item with conditional-put semantics, atomic via Ref.modify.
+  /** What the stub saw: the item as it stands, and the `lastRefillMs` of the
+    * first and the latest write that was accepted.
     */
-  private final class OccItem(
-      ref: Ref[IO, Option[TokenBucketState]],
-      createdAt: Ref[IO, Option[Long]],
-      lastGrantNow: Ref[IO, Long],
-  ):
-    def read: IO[Option[TokenBucketState]] = ref.get
+  private final class Table:
+    private var item: Option[java.util.Map[String, AttributeValue]] = None
+    private var created: Option[Long] = None
+    private var lastGrant: Long = Long.MinValue
+    private var calls: Int = 0
 
-    /** (first successful write's now, latest successful write's now). */
-    def grantWindow: IO[(Option[Long], Long)] =
-      (createdAt.get, lastGrantNow.get).tupled
+    private def number(name: String): Option[Long] = item
+      .map(_.get(name).n().toDouble.toLong)
 
-    def conditionalPut(
-        expectedVersion: Long,
-        next: TokenBucketState,
-    ): IO[Boolean] = ref.modify {
-      case None if expectedVersion == 0L => (Some(next), true)
-      case Some(cur) if cur.version == expectedVersion => (Some(next), true)
-      case cur => (cur, false)
-    }.flatTap(ok =>
-      IO.whenA(ok)(
-        createdAt.update(_.orElse(Some(next.lastRefillMs))) *>
-          lastGrantNow.update(_.max(next.lastRefillMs)),
-      ),
-    )
+    def version: Option[Long] = synchronized(number("version"))
+    def grantWindow: (Option[Long], Long) = synchronized((created, lastGrant))
 
-  private object OccItem:
-    def make: IO[OccItem] = (
-      Ref.of[IO, Option[TokenBucketState]](None),
-      Ref.of[IO, Option[Long]](None),
-      Ref.of[IO, Long](Long.MinValue),
-    ).mapN(new OccItem(_, _, _))
+    /** The next call's place in the latency pattern. */
+    def nextCall(): Int = synchronized { calls += 1; calls }
 
-  private final case class Counts(allowed: Long, blocked: Long, conflicts: Long)
+    def read(): GetItemResponse =
+      synchronized(item.fold(GetItemResponse.builder().build())(
+        GetItemResponse.builder().item(_).build(),
+      ))
 
-  /** Mirrors singleAttempt, with explicit latency in the two gaps. */
-  private def singleAttempt(
-      item: OccItem,
-      cost: Int,
-      readLatency: FiniteDuration,
-      writeLatency: FiniteDuration,
-  ): IO[Either[Unit, Boolean]] =
-    for
-      now <- IO.realTime.map(_.toMillis)
-      _ <- IO.sleep(readLatency)
-      cur <- item.read
-        .map(_.getOrElse(TokenBucketState(profile.capacity.toDouble, now, 0L)))
-      refilled = TokenBucket.refill(cur, now, profile)
-      out <- TokenBucket.consume(refilled, cost, now) match
-        case Some(next) => IO.sleep(writeLatency) *>
-            item.conditionalPut(cur.version, next)
-              .map(ok => if ok then Right(true) else Left(()))
-        case None => IO.pure(Right(false))
-    yield out
-
-  /** occRetry: 10 retries, ~1ms base. Deterministic 1ms here. */
-  private def checkAndConsume(
-      item: OccItem,
-      cost: Int,
-      readLatency: FiniteDuration,
-      writeLatency: FiniteDuration,
-      counts: Ref[IO, Counts],
-  ): IO[Unit] =
-    def go(attempt: Int): IO[Unit] =
-      singleAttempt(item, cost, readLatency, writeLatency).flatMap {
-        case Right(true) => counts.update(c => c.copy(allowed = c.allowed + 1))
-        case Right(false) => counts.update(c => c.copy(blocked = c.blocked + 1))
-        case Left(()) if attempt < 11 =>
-          counts.update(c => c.copy(conflicts = c.conflicts + 1)) *>
-            IO.sleep(1.millis) *> go(attempt + 1)
-        case Left(()) => counts.update(c => c.copy(blocked = c.blocked + 1))
-      }
-    go(1)
-
-  "token bucket under OCC" - {
-
-    "never admits more than capacity + rate * elapsed, under adversarial latency" in {
-      val workers = 20
-      val window = 30.seconds
-
-      val test =
-        for
-          item <- OccItem.make
-          counts <- Ref.of[IO, Counts](Counts(0, 0, 0))
-          t0 <- IO.monotonic
-          _ <- IO.race(
-            IO.sleep(window),
-            (0 until workers).toList.parTraverse_ { i =>
-              // Spread latencies so fibers commit in orders that differ from
-              // the order they captured now. Worker i's read gap ranges 0-12ms
-              // and its write gap 0-4ms, on a 20-44ms cadence.
-              val readLat = (i % 5 * 3).millis
-              val writeLat = (i % 3 * 2).millis
-              val cadence = (20 + i % 7 * 4).millis
-              checkAndConsume(item, 1, readLat, writeLat, counts)
-                .*>(IO.sleep(cadence)).foreverM
-            },
-          )
-          t1 <- IO.monotonic
-          c <- counts.get
-          (created, lastGrant) <- item.grantWindow
-        yield (c, (t1 - t0).toMillis, created, lastGrant)
-
-      TestControl.executeEmbed(test)
-        .asserting { case (c, elapsedMs, created, lastGrant) =>
-          val elapsedSec = elapsedMs / 1000.0
-          // The bound loadSim asserts: the client's window, zero epsilon because
-          // virtual time is exact.
-          val clientCeiling = profile.capacity +
-            profile.refillRatePerSecond * elapsedSec
-          // The tight bound from the server's own clock: refill can only have
-          // accrued between the first and last committed write.
-          val createdMs = created.getOrElse(fail("bucket was never created"))
-          val serverCeiling = profile.capacity +
-            profile.refillRatePerSecond * (lastGrant - createdMs) / 1000.0
-
-          withClue(s"counts=$c elapsed=${elapsedSec}s client=$clientCeiling server=$serverCeiling: ") {
-            // Not vacuous: the bucket was drained and refusals happened.
-            c.blocked should be > 0L
-            c.allowed should be >= profile.capacity.toLong
-            c.allowed.toDouble should be <= serverCeiling
-            c.allowed.toDouble should be <= clientCeiling
-          }
-        }
-    }
-
-    "telescoping holds exactly: admissions equal capacity plus refill minus what is left" in {
-      // The tight server-side statement behind the ceiling above. If the core
-      // is sound this is an equality up to clamp loss, so it must hold with no
-      // slack at all; if it fails, the hole is in TokenBucket or the OCC path.
-      val workers = 20
-      val window = 30.seconds
-
-      val test =
-        for
-          item <- OccItem.make
-          counts <- Ref.of[IO, Counts](Counts(0, 0, 0))
-          _ <- IO.race(
-            IO.sleep(window),
-            (0 until workers).toList.parTraverse_ { i =>
-              val readLat = (i % 5 * 3).millis
-              val writeLat = (i % 3 * 2).millis
-              val cadence = (20 + i % 7 * 4).millis
-              checkAndConsume(item, 1, readLat, writeLat, counts)
-                .*>(IO.sleep(cadence)).foreverM
-            },
-          )
-          c <- counts.get
-          st <- item.read
-        yield (c, st)
-
-      TestControl.executeEmbed(test).asserting { case (c, st) =>
-        val state = st.getOrElse(fail("bucket was never created"))
-        withClue(s"counts=$c state=$state: ")(
-          // Every admission was a committed conditional write, so the version
-          // counts them exactly. If allowed != version, something admitted
-          // without writing -- the only way to over-issue.
-          c.allowed shouldBe state.version,
+    /** Applies a conditional put the way DynamoDB does: atomically, or not at
+      * all. Only the two conditions the store uses are understood; anything
+      * else is refused loudly, so a change to the store's condition cannot pass
+      * here by being ignored.
+      */
+    def put(request: PutItemRequest): Either[Throwable, PutItemResponse] =
+      synchronized {
+        val holds = request.conditionExpression() match
+          case "attribute_not_exists(pk)" => Right(item.isEmpty)
+          case "version = :expectedVersion" => Right(number("version").contains(
+              request.expressionAttributeValues().get(":expectedVersion").n()
+                .toLong,
+            ))
+          case other => Left(new UnsupportedOperationException(
+              s"The stub does not understand the condition: $other",
+            ))
+        holds.flatMap(ok =>
+          if ok then
+            item = Some(request.item())
+            val mark = request.item().get("lastRefillMs").n().toLong
+            created = created.orElse(Some(mark))
+            lastGrant = math.max(lastGrant, mark)
+            Right(PutItemResponse.builder().build())
+          else
+            Left(
+              ConditionalCheckFailedException.builder()
+                .message("The conditional request failed").build(),
+            ),
         )
       }
+
+  /** A DynamoDB client over `table`. A read completes 0 to 12 ms after it is
+    * asked for and a write 0 to 4 ms after, in a rotating pattern, so requests
+    * commit in an order that differs from the order they captured now.
+    */
+  private def client(
+      table: Table,
+      dispatcher: Dispatcher[IO],
+  ): DynamoDbAsyncClient =
+    def later[A](delay: FiniteDuration)(
+        result: => Either[Throwable, A],
+    ): CompletableFuture[A] =
+      val future = new CompletableFuture[A]()
+      dispatcher.unsafeRunAndForget(
+        IO.sleep(delay) *>
+          IO(result.fold(future.completeExceptionally, future.complete)),
+      )
+      future
+    Proxy.newProxyInstance(
+      classOf[DynamoDbAsyncClient].getClassLoader,
+      Array(classOf[DynamoDbAsyncClient]),
+      new InvocationHandler:
+        override def invoke(
+            proxy: Object,
+            method: java.lang.reflect.Method,
+            args: Array[Object],
+        ): Object = method.getName match
+          case "getItem" =>
+            later((table.nextCall() % 5 * 3).millis)(Right(table.read()))
+          case "putItem" =>
+            val request = args(0).asInstanceOf[PutItemRequest]
+            later((table.nextCall() % 3 * 2).millis)(table.put(request))
+          case "serviceName" => "DynamoDB"
+          case "close" => null // void
+          case other => CompletableFuture
+              .failedFuture[Object](new UnsupportedOperationException(
+                s"Stub does not implement: $other",
+              )),
+    ).asInstanceOf[DynamoDbAsyncClient]
+
+  private final case class Counts(allowed: Long, blocked: Long)
+
+  /** Twenty workers on one key for thirty virtual seconds, each on its own
+    * cadence of 20 to 44 ms, through the real store.
+    */
+  private def drive: IO[(Counts, Long, Table)] = Dispatcher.parallel[IO]
+    .use { dispatcher =>
+      val table = new Table
+      val store = DynamoDBRateLimitStore[IO](
+        client(table, dispatcher),
+        "rate-limits",
+        MetricsPublisher.noop[IO],
+      )
+      val workers = 20
+      val window = 30.seconds
+      for
+        counts <- Ref.of[IO, Counts](Counts(0, 0))
+        t0 <- IO.monotonic
+        _ <- IO.race(
+          IO.sleep(window),
+          (0 until workers).toList.parTraverse_ { i =>
+            val cadence = (20 + i % 7 * 4).millis
+            store.checkAndConsume("hot-key", 1, profile).flatMap {
+              case _: RateLimitDecision.Allowed => counts
+                  .update(c => c.copy(allowed = c.allowed + 1))
+              case _: RateLimitDecision.Rejected => counts
+                  .update(c => c.copy(blocked = c.blocked + 1))
+            }.*>(IO.sleep(cadence)).foreverM
+          },
+        )
+        t1 <- IO.monotonic
+        c <- counts.get
+      yield (c, (t1 - t0).toMillis, table)
     }
+
+  "token bucket under OCC, through the real store" - {
+
+    "never admits more than capacity + rate * elapsed, under adversarial latency" in
+      TestControl.executeEmbed(drive).asserting { case (c, elapsedMs, table) =>
+        val elapsedSec = elapsedMs / 1000.0
+        // The bound the load simulator asserts on the client's window, with no
+        // allowance, because virtual time is exact.
+        val clientCeiling = profile.capacity +
+          profile.refillRatePerSecond * elapsedSec
+        // The tight bound from the server's own clock: refill can only have
+        // accrued between the first and last committed write.
+        val (created, lastGrant) = table.grantWindow
+        val createdMs = created.getOrElse(fail("bucket was never created"))
+        val serverCeiling = profile.capacity +
+          profile.refillRatePerSecond * (lastGrant - createdMs) / 1000.0
+
+        withClue(s"counts=$c elapsed=${elapsedSec}s client=$clientCeiling server=$serverCeiling: ") {
+          // Not vacuous: the bucket was drained and refusals happened.
+          c.blocked should be > 0L
+          c.allowed should be >= profile.capacity.toLong
+          c.allowed.toDouble should be <= serverCeiling
+          c.allowed.toDouble should be <= clientCeiling
+        }
+      }
+
+    "telescoping holds exactly: every admission is one committed write" in
+      // If the core is sound, admissions and committed writes are the same
+      // events, so the item's version counts them with no slack at all. If
+      // allowed != version, something was admitted without writing, which is
+      // the only way to over-issue. A check cancelled when the window closed
+      // may have written without being counted, so the version may lead by the
+      // number of workers at most, never trail.
+      TestControl.executeEmbed(drive).asserting { case (c, _, table) =>
+        val version = table.version.getOrElse(fail("bucket was never created"))
+        withClue(s"counts=$c version=$version: ") {
+          c.allowed should be <= version
+          version - c.allowed should be <= 20L
+        }
+      }
   }

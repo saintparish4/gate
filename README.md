@@ -150,7 +150,7 @@ of HTTP 500s.
 
 ```bash
 curl -s http://localhost:8080/health
-# {"status":"healthy","version":"0.1.0"}
+# {"status":"healthy","version":"0.1.0","commit":"23fb85b"}
 curl -s http://localhost:8080/ready
 # {"status":"ok","components":[{"name":"dynamodb_ratelimit","status":"ok","required":true,"details":null}, ...]}
 ```
@@ -464,28 +464,70 @@ and pull request:
 2. **integration** — the integration suite against TestContainers LocalStack.
 3. **correctness** — brings the compose stack up and waits for `/ready`. It
    smoke-tests `/health`, one rate-limit call, and one idempotency call, then
-   runs `sbt "loadSim/run --scenario correctness"`. A violation fails the build.
+   runs `sbt "loadSim/run --scenario correctness"`. Anything but a pass fails the
+   build.
+
+CI runs against LocalStack with 10 s store timeouts and a raised auth limit,
+which is not how production is configured: the service's own timeouts are 2 s,
+and the one failure seen on AWS was a 2 s timeout that CI cannot produce. A
+second workflow, [`aws-correctness.yml`](.github/workflows/aws-correctness.yml),
+deploys the demo stack to AWS on Mondays, lets the task settle, runs the same
+invariants, tears the stack down, and fails if anything billable is left. It is
+**off until the account owner turns it on**: it needs a role in the AWS account
+(`TF_VAR_github_actions_role=true ./scripts/bootstrap.sh` creates one that only
+this repository's `master` can assume, with no permissions until some are
+attached) and the repository variable `AWS_CORRECTNESS_ROLE_ARN`. Each run
+costs about $0.20.
 
 The correctness scenario warms the server for about 15 s, then asserts four
 invariants:
 
 | Invariant | Load | Assertion |
 |---|---|---|
-| **A** — token bucket never over-issues | 20 workers on one `free-api-key` bucket for 30 s | `allowed <= capacity + refill x (measured elapsed + 5 s)`, `errors = 0`, no degraded decisions. Reports `server-excess`, the refill the server saw beyond the client's window; the 5 s allowance exists because a wall-clock correction on the server can mint that much once. |
-| **B** — idempotency creates exactly once | 50 workers over 10 shared keys for 30 s | exactly 10 `new` responses, 0 conflicts, 0 errors |
-| **C** — token quota never over-admits | 50 workers spending 25,000 tokens each against a 1,000,000 limit for 20 s | `admitted x 25,000 <= 1,000,000`, some rejections, 0 errors |
-| **D** — tenants never share state | Two clients (`API_KEY` and `FREE_API_KEY`) racing for 20 s on the same 10 idempotency keys and the same quota user, while the second reconciles every reservation the first is granted | each client creates its own 10 records; each is held to 40 quota admissions and together they pass 40; every stolen reconcile answers 404; 0 conflicts, 0 errors |
+| **A** — token bucket never over-issues | 20 workers on one `free-api-key` bucket for 30 s | `allowed <= capacity + refill x (window + 2 s)`, `errors = 0`, no answer marked `X-Gate-Degraded`. The window is the span of the server's `Date` headers, because the bucket refills on the server's clock; the 2 s is that header's one-second resolution plus the first request's latency. Without `Date` headers it falls back to this machine's clocks, and is inconclusive if they disagree by more than 1%. |
+| **B** — idempotency creates exactly once | 50 workers all on one key for 30 s, and the key changes every 250 ms: about 120 first-claim races | every key answered `new` exactly once, 0 conflicts, 0 errors |
+| **C** — token quota never over-admits | 50 workers spending 25,000 tokens each against one user's 1,000,000 limit for 20 s, moving to a fresh user once it has refused 50 checks (up to 10 users) | for every user `admitted x 25,000 <= 1,000,000`; at least one user reached its limit; 0 errors |
+| **D** — tenants never share state | Two clients (`API_KEY` and `FREE_API_KEY`) racing for 20 s on the same idempotency key, which changes every 250 ms, and the same quota user, while the second reconciles every reservation the first is granted | each client is answered `new` exactly once for every key; each is held to 40 quota admissions and together they pass 40; every stolen reconcile answers 404; 0 conflicts, 0 errors |
 
-Each invariant prints `PASS` or `FAIL` with a detail prefix (`OVER-ISSUE`,
-`UNDER-ISSUE`, `DEGRADED`, `VACUOUS`, `VIOLATION`, `OVER-ADMISSION`), then
-`Overall: PASS` or `Overall: FAIL` and a matching exit code. `make correctness`
+Every run writes `loadsim-results/correctness-<run id>.json`: the server's
+version and commit as `/health` reported them, the commit of the load simulator,
+each invariant's verdict and the raw counts behind it, and the requests that
+errored, by class and apart from the counts. The folder is ignored by git; a
+run this README cites is copied into `docs/evidence/`. Runs from before 2
+October 2026 have no file: their numbers were read off a terminal.
+
+The invariants are themselves tested: `sbt loadSim/test` runs each one against
+a small fake server that is correct, and against fakes with one bug each (a
+limiter that admits everything, a server that says `new` to everyone, a quota
+with no limit, state shared between clients). The correct one must pass, each
+bug must be a `VIOLATION`, and a server that only errors must be
+`INCONCLUSIVE`. Until then the scenario had only ever failed on errors.
+
+B and D used to hold 10 keys for the whole run, which is ten races in the first
+instant and duplicates after that, and C used one user, which crosses its limit
+once. B also compared the total of `new` answers with the number of keys, which
+one key claimed twice and one never claimed would have satisfied. The AWS
+tables below were measured with that earlier load.
+
+Each invariant ends in one of three verdicts, and the run exits with the worst
+of them:
+
+| Verdict | Exit | Meaning | Detail prefixes |
+|---|---|---|---|
+| `PASS` | 0 | The property held, and the run was able to show it | |
+| `VIOLATION` | 1 | The property was broken | `OVER-ISSUE`, `UNDER-ISSUE`, `DOUBLE CLAIM`, `NEVER CLAIMED`, `CONFLICT`, `OVER-ADMISSION`, `SHARED IDEMPOTENCY`, `SHARED QUOTA`, `CROSS-TENANT RECONCILE` |
+| `INCONCLUSIVE` | 2 | The run cannot say: requests errored, answers came from degradation mode, or a limit was never reached | `DEGRADED`, `VACUOUS`, or an error count |
+
+The two used to share one word, `FAIL`, so a run with eight timed-out requests
+and no broken invariant read as two failed invariants. `make correctness`
 runs it locally; `make APP_URL=http://<host> correctness` runs it against any
-deployment. A counts degraded decisions from `gate_degraded_total`, so it reads
-`/metrics` with `ADMIN_API_KEY` (default `admin-api-key`); if `/metrics` cannot
-be read, A fails with `METRICS UNREADABLE` rather than assuming zero. A drains
-`FREE_API_KEY`'s bucket, B and C use `API_KEY`, and D needs both, as two
-different clients. Against a deployed stack all three come from
-`.demo-keys.env`. Source:
+deployment. A counts the answers that carry `X-Gate-Degraded`, so a decision
+made by degradation mode is seen whichever task made it. It used to compare
+`gate_degraded_total` before and after, which meant nothing behind two tasks. A
+drains `FREE_API_KEY`'s bucket, B and C use `API_KEY`, and D needs both, as two
+different clients. Against a deployed stack both come from `.demo-keys.env`,
+and they reach the load simulator through the environment: as command-line
+flags they were echoed by `make` and by sbt, so a run printed them. Source:
 [`LoadSim.scala`](loadSim/src/main/scala/LoadSim.scala).
 
 ### On AWS
@@ -520,8 +562,14 @@ bucket.
 | C — token quota never over-admits | **PASS** | `admitted=40 x 25,000 = 1,000,000`, the limit, not a token over. 7,541 rejected, 0 errors. | ~379 RPS |
 
 Invariant A measured `server-excess = -0.0 s` on this run. An earlier run
-measured `+2.9 s` from a wall-clock correction on the task, which is why the
-invariant carries a time allowance rather than a token epsilon.
+measured `+2.9 s`. That was read as a wall-clock correction on the task, and
+the invariant was given a 5 s allowance to absorb it, which is 10 tokens on a
+budget of 80. On 1 October 2026 every run driven from one laptop showed 1.0 to
+1.5 s of the same excess, against a local server and against AWS, and 14 CI
+runs showed none; that laptop's monotonic clock measured 3.2-3.5% slow against
+an outside clock. The load generator had under-measured its own window. The
+invariant now reads the window from the server's `Date` headers, with a 2 s
+allowance. The September figures above stand as that version printed them.
 
 The properties hold on real DynamoDB under contention, not just on the
 emulator. Throughput here is bounded by the client and the WAN, not the
@@ -530,20 +578,25 @@ benchmark.
 
 ## Performance
 
-Fixed-RPS latency figures, measured with the `latency` load scenario against
-LocalStack on a laptop, are in [PERFORMANCE.md](docs/PERFORMANCE.md). The
-representative warm-path row is 1,000 target RPS: 948 achieved, p50 6.9 ms,
-p95 59.5 ms, p99 217.7 ms, 0% errors. Each decision costs exactly one
-strongly consistent read and one conditional write, about $1.50 per million
-checks on DynamoDB on-demand, rising toward $12.75 per million in the
-worst case of 10 conflict retries per check.
+There is no current latency benchmark. The only fixed-RPS figures are from
+April 2026, one run per rate against LocalStack on a laptop; they are kept in
+[PERFORMANCE.md](docs/PERFORMANCE.md) as history and should not be quoted. A
+benchmark with repetitions on AWS is planned.
 
-The cost of correctness without a lock shows up on a single hot key. With 50
-virtual users hammering one key, throughput drops from about 50 RPS to 4 to 8
-RPS and p99 latency reaches 13 s, because most conditional writes fail and
-re-read. The service stays safe, never over-issuing, and pays in throughput
-and tail latency on that one key. `RateLimitOCCAttempts` in CloudWatch shows
-it happening.
+Cost is derived from the code and current prices, not measured. An admitted
+rate-limit check is one strongly consistent read and one conditional write,
+about $0.75 per million on DynamoDB on-demand in us-east-1; a refused check
+only reads, about $0.125 per million. With all 10 conflict retries on every
+check it is about $8.25 per million. Idempotency and quota cost more per
+decision; PERFORMANCE.md says how.
+
+The cost of correctness without a lock shows up on a single hot key. In one
+LocalStack measurement with 50 virtual users on one key, throughput dropped
+from about 50 RPS to 4 to 8 RPS and p99 latency reached 13 s, because most
+conditional writes fail and re-read. The service stays safe, never
+over-issuing, and pays in throughput and tail latency on that one key.
+`RateLimitOCCAttempts` in CloudWatch shows it happening. That figure has not
+been repeated or measured on AWS.
 
 **Load tools**
 
@@ -717,7 +770,7 @@ terraform output api_endpoint
 
 - [API reference](docs/API.md) — request and response schemas for every route
 - [Architecture](docs/ARCHITECTURE.md) — what the code does on each path, and why
-- [Performance](docs/PERFORMANCE.md) — fixed-RPS latency and DynamoDB cost per decision
+- [Performance](docs/PERFORMANCE.md) — the April LocalStack latency figures (historical) and the derived DynamoDB cost per decision
 - [Compliance notes](docs/COMPLIANCE.md) — what the audit trail records today, and what is planned
 - ADRs: [DynamoDB over Redis](docs/adr/001-dynamodb-over-redis.md),
   [hand-rolled circuit breaker](docs/adr/002-hand-rolled-circuit-breaker.md),

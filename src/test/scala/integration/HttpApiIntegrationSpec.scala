@@ -474,6 +474,9 @@ class HttpApiIntegrationSpec
         body should include("healthy")
         // Asserted against the build so the literal cannot drift again.
         body should include(buildinfo.BuildInfo.version)
+        // The commit, so a run can be tied to the code that answered it.
+        body should include(s""""commit":"${buildinfo.BuildInfo.commit}"""")
+        buildinfo.BuildInfo.commit should not be empty
       }
     }
 

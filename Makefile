@@ -10,8 +10,9 @@ LOCALSTACK_URL ?= http://localhost:4566
 API_KEY ?= test-api-key
 # A Free-tier key; invariant A drains its 20-token bucket.
 FREE_API_KEY ?= free-api-key
-# Holds AdminMetrics; invariant A reads /metrics with it.
-ADMIN_API_KEY ?= admin-api-key
+
+# What a locally built image reports as its commit in /health.
+export GIT_COMMIT ?= $(shell git describe --always --dirty 2>/dev/null || echo unknown)
 
 # Unique-per-invocation suffix for the smoke test key, so repeat runs never
 # land on a bucket a previous run already drained. Falls back when the recipe
@@ -89,9 +90,10 @@ fmt: ## Format all Scala sources (CI fails on unformatted code)
 	$(NEED_SBT)
 	sbt scalafmtAll
 
-test: ## Run unit tests
+test: ## Run unit tests, and the load simulator's own tests
 	$(NEED_SBT)
 	sbt unitTest
+	sbt loadSim/test
 
 test-it: ## Run integration tests (TestContainers — needs Docker, not LocalStack)
 	$(NEED_SBT)
@@ -99,9 +101,13 @@ test-it: ## Run integration tests (TestContainers — needs Docker, not LocalSta
 
 test-all: test test-it ## Run unit and integration tests
 
+# The keys go to the load simulator through the environment, and the line that
+# sets them is silent. As flags they were echoed here and again by sbt, so a
+# run against a deployed stack printed its keys into the terminal and any log.
 correctness: ## Check the correctness invariants (APP_URL=... to target a deployed stack)
 	$(NEED_SBT)
-	sbt "loadSim/run --scenario correctness --url $(APP_URL) --api-key $(API_KEY) --free-key $(FREE_API_KEY) --admin-key $(ADMIN_API_KEY)"
+	@echo "Correctness invariants against $(APP_URL) (keys from API_KEY and FREE_API_KEY; not printed)"
+	@API_KEY='$(API_KEY)' FREE_API_KEY='$(FREE_API_KEY)' sbt "loadSim/run --scenario correctness --url $(APP_URL)"
 
 ##@ Probes
 
