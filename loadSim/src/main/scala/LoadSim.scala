@@ -1,4 +1,3 @@
-import cats.data.EitherT
 import cats.effect.*
 import cats.effect.std.Console
 import cats.syntax.all.*
@@ -51,8 +50,6 @@ import org.HdrHistogram.ConcurrentHistogram
  *                                 three invariants (defaults A=20, B=50, C=50).
  *                                 Lower it to match a small target -- a deployment
  *                                 that cannot serve the load measures nothing.
- *   --admin-key KEY               key holding AdminMetrics, used to read /metrics
- *                                 for invariant A (default admin-api-key)
  *   --api-key KEY                 key for the warm-up and invariants B and C
  *                                 (default test-api-key)
  *   --free-key KEY                Free-tier key whose 20-token bucket invariant A
@@ -60,15 +57,14 @@ import org.HdrHistogram.ConcurrentHistogram
  *
  * The defaults are the built-in development keys, which only docker-compose
  * serves. A deployed stack loads its keys from Secrets Manager, so pass its
- * keys with the three --*-key flags (`make correctness` does, from API_KEY,
- * FREE_API_KEY and ADMIN_API_KEY).
+ * keys with the two --*-key flags (`make correctness` does, from API_KEY and
+ * FREE_API_KEY).
  */
 object LoadSim extends IOApp:
 
   val defaultBaseUrl = "http://localhost:8080"
   val defaultApiKey  = "test-api-key"
   val defaultFreeKey  = "free-api-key"
-  val defaultAdminKey = "admin-api-key"
 
   override def run(args: List[String]): IO[ExitCode] =
     val scenario = Args.string(args, "--scenario", "normal")
@@ -79,7 +75,6 @@ object LoadSim extends IOApp:
     // actually answer, since a target that cannot serve the load degrades and
     // the invariant then measures degradation instead of the token bucket.
     val concurrency = Args.intOpt(args, "--concurrency")
-    val adminKey    = Args.string(args, "--admin-key", defaultAdminKey)
     val apiKey      = Args.string(args, "--api-key", defaultApiKey)
     val freeKey     = Args.string(args, "--free-key", defaultFreeKey)
 
@@ -116,7 +111,7 @@ object LoadSim extends IOApp:
         case "idempotency"    => withPreflight(Scenarios.idempotency(client, baseUrl).as(ExitCode.Success))
         case "realistic"      => withPreflight(Scenarios.realistic(client, baseUrl).as(ExitCode.Success))
         case "highContention" => withPreflight(Scenarios.highContention(client, baseUrl).as(ExitCode.Success))
-        case "correctness"    => withPreflight(Scenarios.correctness(client, baseUrl, concurrency, adminKey, apiKey, freeKey))
+        case "correctness"    => withPreflight(Scenarios.correctness(client, baseUrl, concurrency, apiKey, freeKey))
         case "latency"        => withPreflight(Scenarios.latency(client, baseUrl, rps.getOrElse(1000), duration.getOrElse(60)))
         case unknown =>
           Console[IO].errorln(
@@ -406,7 +401,6 @@ object Scenarios:
     client:      Client[IO],
     baseUrl:     String,
     concurrency: Option[Int] = None,
-    adminKey:    String = LoadSim.defaultAdminKey,
     apiKey:      String = LoadSim.defaultApiKey,
     freeKey:     String = LoadSim.defaultFreeKey,
   ): IO[ExitCode] =
@@ -416,7 +410,7 @@ object Scenarios:
     for
       _  <- Console[IO].println(s"=== correctness — run $runId ===")
       _  <- warmUp(client, baseUrl, runId, apiKey)
-      a  <- invariantA_tokenBucketNonOverIssue(client, baseUrl, runId, concurrency.getOrElse(20), adminKey, freeKey)
+      a  <- invariantA_tokenBucketNonOverIssue(client, baseUrl, runId, concurrency.getOrElse(20), freeKey)
       b  <- invariantB_idempotencyExactlyOneCreated(client, baseUrl, runId, concurrency.getOrElse(50), apiKey)
       c  <- invariantC_quotaNonOverAdmission(client, baseUrl, runId, concurrency.getOrElse(50), apiKey)
       d  <- invariantD_crossTenantIsolation(client, baseUrl, runId, concurrency.getOrElse(10), apiKey, freeKey)
@@ -499,7 +493,6 @@ object Scenarios:
     baseUrl:     String,
     runId:       String,
     concurrency: Int,
-    adminKey:    String,
     freeKey:     String,
   ): IO[InvariantResult] =
     val durationSecs  = 30
@@ -525,6 +518,12 @@ object Scenarios:
     val allowed = new AtomicLong(0)
     val blocked = new AtomicLong(0)
     val errors  = new AtomicLong(0)
+    // Answers that came from degradation mode, by their X-Gate-Degraded header.
+    // This used to be the change in gate_degraded_total across the run, read
+    // from /metrics. Behind a load balancer each read lands on whichever task
+    // answers, so with two tasks the before and after came from different
+    // counters and the difference meant nothing.
+    val degraded = new AtomicLong(0)
     val sampler = new ErrorSampler(5)
 
     // Returns how long the workers ran.
@@ -533,16 +532,20 @@ object Scenarios:
         IO.race(
           progressTicker("invariantA", durationSecs, total, allowed, blocked, errors),
           (0 until concurrency).toList.parTraverse_ { _ =>
-            sendRateLimitCheck(client, baseUrl, key, apiKey).flatMap {
-              case Right(true)  => IO { total.incrementAndGet(); allowed.incrementAndGet() }
-              case Right(false) => IO { total.incrementAndGet(); blocked.incrementAndGet() }
+            sendRateLimitCheckDetailed(client, baseUrl, key, apiKey).flatMap {
+              case Right(answer) => IO {
+                  total.incrementAndGet()
+                  if answer.degraded then degraded.incrementAndGet()
+                  if answer.allowed then allowed.incrementAndGet() else blocked.incrementAndGet()
+                }
               case Left(msg)    => IO { total.incrementAndGet(); errors.incrementAndGet(); sampler.record(msg) }
             }.loop
           }
         ) *> IO.monotonic.map(_ - startedAt)
       }
 
-    def verdict(elapsed: FiniteDuration, degraded: Double): IO[InvariantResult] =
+    def verdict(elapsed: FiniteDuration): IO[InvariantResult] =
+      val d = degraded.get
       val a = allowed.get
       val b = blocked.get
       val t = total.get
@@ -565,23 +568,13 @@ object Scenarios:
         // inflates blocked, which reads exactly like a healthy limiter holding
         // the line; allow-all admits past the ceiling by design. Either way
         // the counts measure nothing, so this is checked before the ceiling.
-        if degraded > 0.0 then InvariantResult(Verdict.Inconclusive, s"DEGRADED: ${degraded.toLong} decision(s) came from degradation mode, not the token bucket (circuit breaker open, bulkhead full, or store errors) — allowed=$a measures nothing. Check gate_degraded_total and gate_circuit_breaker_state.")
+        if d > 0 then InvariantResult(Verdict.Inconclusive, s"DEGRADED: $d answer(s) carried X-Gate-Degraded: they came from degradation mode, not the token bucket (circuit breaker open, bulkhead full, or store errors) — allowed=$a measures nothing. Check gate_degraded_total and gate_circuit_breaker_state.")
         else if a > maxAllowed then InvariantResult(Verdict.Violation, s"OVER-ISSUE: allowed=$a > maxAllowed=$maxAllowed ($window, total=$t, blocked=$b, errors=$e)")
         else if e > 0 then InvariantResult(Verdict.Inconclusive, s"errors=$e (total=$t, allowed=$a, blocked=$b)\n     Sample errors:\n${sampler.render}")
         else if b == 0 then InvariantResult(Verdict.Inconclusive, s"VACUOUS: never blocked (total=$t, allowed=$a) — the bucket was never exhausted")
         else if a < minAllowed then InvariantResult(Verdict.Violation, s"UNDER-ISSUE: allowed=$a < minAllowed=$minAllowed (total=$t, blocked=$b) — the limiter went dark")
         else InvariantResult(Verdict.Pass, s"minAllowed=$minAllowed <= allowed=$a <= maxAllowed=$maxAllowed ($window, total=$t, blocked=$b, errors=$e)")
       IO.pure(result)
-
-    // Without /metrics there is no telling a token-bucket decision from a
-    // degraded one, so the run is refused rather than trusted.
-    val run =
-      for
-        before  <- EitherT(readDegradedTotal(client, baseUrl, adminKey))
-        elapsed <- EitherT.liftF(drive)
-        after   <- EitherT(readDegradedTotal(client, baseUrl, adminKey))
-        res     <- EitherT.liftF(verdict(elapsed, after - before))
-      yield res
 
     Console[IO].println(
       s"""-- Invariant A — token-bucket non-over-issue --
@@ -595,10 +588,7 @@ object Scenarios:
          |  minAllowed    = $minAllowed  (a quarter of the nominal budget; catches a limiter that rejects everything)
          |""".stripMargin
     ) *>
-    run.valueOr(err => InvariantResult(Verdict.Inconclusive, metricsUnreadable(err)))
-
-  private def metricsUnreadable(err: String): String =
-    s"METRICS UNREADABLE: $err — without gate_degraded_total a degraded decision looks like a token-bucket one. Pass --admin-key with a key holding AdminMetrics."
+    drive.flatMap(verdict)
 
   private def invariantB_idempotencyExactlyOneCreated(
     client:      Client[IO],
@@ -871,6 +861,7 @@ object Scenarios:
     val total     = new AtomicLong(0)
     val successes = new AtomicLong(0)
     val rejected  = new AtomicLong(0)
+    val degraded  = new AtomicLong(0)
     val sampler   = new ErrorSampler(5)
 
     // Error budget: anything above 1% means the numbers are lying — the
@@ -894,20 +885,25 @@ object Scenarios:
           val key = s"$keyPrefix:${(wid * 1_000_003 + i) % keysetSize}"
           for
             t0   <- IO.monotonic
-            res  <- sendRateLimitCheck(client, baseUrl, key)
+            res  <- sendRateLimitCheckDetailed(client, baseUrl, key)
             t1   <- IO.monotonic
             micros = (t1 - t0).toMicros
             _ <- IO {
               total.incrementAndGet()
-              res match
-                case Right(true) =>
+              res.map(a => if a.degraded then None else Some(a.allowed)) match
+                // An answer from degradation mode never reached the store, so
+                // its latency is not the limiter's. It was recorded as an
+                // honest rejection.
+                case Right(None) =>
+                  degraded.incrementAndGet()
+                case Right(Some(true)) =>
                   successes.incrementAndGet()
                   // Only record honest server decisions in the histogram.
                   // Connection failures, 5xx, parse errors would otherwise
                   // skew the percentiles in either direction depending on
                   // where they fail, making p50/p99 meaningless.
                   histogram.recordValue(math.min(micros, 3_600_000_000L))
-                case Right(false) =>
+                case Right(Some(false)) =>
                   rejected.incrementAndGet()
                   histogram.recordValue(math.min(micros, 3_600_000_000L))
                 case Left(msg) =>
@@ -928,19 +924,23 @@ object Scenarios:
       val e         = errors.get
       val s         = successes.get
       val r         = rejected.get
+      val dg        = degraded.get
       val errorPct  = if t > 0 then (e.toDouble / t.toDouble) * 100.0 else 0.0
       val p50       = histogram.getValueAtPercentile(50.0) / 1000.0   // ms
       val p95       = histogram.getValueAtPercentile(95.0) / 1000.0
       val p99       = histogram.getValueAtPercentile(99.0) / 1000.0
       val p999      = histogram.getValueAtPercentile(99.9) / 1000.0
       val actualRps = t.toDouble / durationSecs.toDouble
-      val ok        = errorPct <= errorBudgetPct
+      // One degraded answer means the store was not answering for part of the
+      // run, so the percentiles describe an outage, not the limiter.
+      val ok        = errorPct <= errorBudgetPct && dg == 0
 
       val summary = f"""latency results ($durationSecs s window, target $rps RPS):
                        |  total requests  = $t
                        |  actual RPS      = $actualRps%.1f  (target $rps)
                        |  successes (200) = $s
                        |  rejected  (429) = $r
+                       |  degraded        = $dg  (answered by degradation mode; not in the histogram)
                        |  errors          = $e  ($errorPct%.2f%%)
                        |  p50 latency     = $p50%.2f ms      (successes+rejections only)
                        |  p95 latency     = $p95%.2f ms
@@ -964,7 +964,7 @@ object Scenarios:
         Console[IO].println(summary + errSection + mdRow).as(ExitCode.Success)
       else
         val failBanner = f"""|
-                             |FAIL: error rate $errorPct%.2f%% exceeds budget $errorBudgetPct%.2f%%.
+                             |FAIL: error rate $errorPct%.2f%% (budget $errorBudgetPct%.2f%%), degraded answers $dg (budget 0).
                              |No markdown row emitted — these numbers would mislead readers.
                              |Fix the errors above and re-run.
                              |""".stripMargin
@@ -1080,40 +1080,13 @@ object Http:
       }
       .handleError(e => Left(Option(e.getMessage).getOrElse(e.getClass.getSimpleName)))
 
-  /** Sum of gate_degraded_total across reasons. The counter is monotonic, so a
-    * before/after delta says whether the server served any decision from
-    * degradation mode -- circuit breaker open, bulkhead full, or store error --
-    * during a run.
-    *
-    * An unreadable /metrics is a Left, not 0.0. It used to be 0.0, which read
-    * as "never degraded"; once /metrics went behind AdminMetrics, a keyless
-    * scrape would have 401'd and quietly passed every run.
-    *
-    * Matching on the "{" excludes the gate_degraded_total_created line the
-    * Prometheus client also emits, whose value is a unix timestamp. The server
-    * creates one zero-valued series per reason at startup; with no matching
-    * line at all (an older server), the sum is a genuine zero too.
+  /** A rate-limit answer: the decision, and whether degradation mode made it.
+    * The service marks those with `X-Gate-Degraded: true`, on a 200 and a 429
+    * alike.
     */
-  def readDegradedTotal(
-    client:   Client[IO],
-    baseUrl:  String,
-    adminKey: String,
-  ): IO[Either[String, Double]] =
-    val req = Request[IO](
-      method  = Method.GET,
-      uri     = Uri.unsafeFromString(s"$baseUrl/metrics"),
-      headers = Headers("Authorization" -> s"Bearer $adminKey"),
-    )
-    client.run(req).use { resp =>
-      resp.as[String].map { body =>
-        if resp.status.code != 200 then Left(s"GET /metrics -> HTTP ${resp.status.code}")
-        else Right(
-          body.linesIterator.filter(_.startsWith("gate_degraded_total{")).flatMap {
-            line => line.split(' ').lastOption.flatMap(v => scala.util.Try(v.toDouble).toOption)
-          }.sum
-        )
-      }
-    }.handleError(e => Left(s"GET /metrics failed: ${Option(e.getMessage).getOrElse(e.getClass.getSimpleName)}"))
+  case class RateLimitAnswer(allowed: Boolean, degraded: Boolean)
+
+  private val DegradedHeader = org.typelevel.ci.CIString("X-Gate-Degraded")
 
   def sendRateLimitCheck(
     client:  Client[IO],
@@ -1121,6 +1094,14 @@ object Http:
     key:     String,
     apiKey:  String = LoadSim.defaultApiKey,
   ): IO[Either[String, Boolean]] =
+    sendRateLimitCheckDetailed(client, baseUrl, key, apiKey).map(_.map(_.allowed))
+
+  def sendRateLimitCheckDetailed(
+    client:  Client[IO],
+    baseUrl: String,
+    key:     String,
+    apiKey:  String = LoadSim.defaultApiKey,
+  ): IO[Either[String, RateLimitAnswer]] =
     val body = Json.obj("key" := key, "cost" := 1)
     val req  = Request[IO](
       method  = Method.POST,
@@ -1136,6 +1117,7 @@ object Http:
         if resp.status.code == 200 || resp.status.code == 429 then
           io.circe.parser.parse(body)
             .flatMap(_.hcursor.get[Boolean]("allowed"))
+            .map(RateLimitAnswer(_, resp.headers.get(DegradedHeader).exists(_.head.value == "true")))
             .left.map(_.getMessage)
         else
           Left(s"HTTP ${resp.status.code}: $body")

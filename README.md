@@ -472,7 +472,7 @@ invariants:
 
 | Invariant | Load | Assertion |
 |---|---|---|
-| **A** — token bucket never over-issues | 20 workers on one `free-api-key` bucket for 30 s | `allowed <= capacity + refill x (measured elapsed + 5 s)`, `errors = 0`, no degraded decisions. Reports `server-excess`, the refill the server saw beyond the client's window; the 5 s allowance exists because a wall-clock correction on the server can mint that much once. |
+| **A** — token bucket never over-issues | 20 workers on one `free-api-key` bucket for 30 s | `allowed <= capacity + refill x (measured elapsed + 5 s)`, `errors = 0`, no answer marked `X-Gate-Degraded`. Reports `server-excess`, the refill the server saw beyond the client's window; the 5 s allowance exists because a wall-clock correction on the server can mint that much once. |
 | **B** — idempotency creates exactly once | 50 workers over 10 shared keys for 30 s | exactly 10 `new` responses, 0 conflicts, 0 errors |
 | **C** — token quota never over-admits | 50 workers spending 25,000 tokens each against a 1,000,000 limit for 20 s | `admitted x 25,000 <= 1,000,000`, some rejections, 0 errors |
 | **D** — tenants never share state | Two clients (`API_KEY` and `FREE_API_KEY`) racing for 20 s on the same 10 idempotency keys and the same quota user, while the second reconciles every reservation the first is granted | each client creates its own 10 records; each is held to 40 quota admissions and together they pass 40; every stolen reconcile answers 404; 0 conflicts, 0 errors |
@@ -484,17 +484,16 @@ of them:
 |---|---|---|---|
 | `PASS` | 0 | The property held, and the run was able to show it | |
 | `VIOLATION` | 1 | The property was broken | `OVER-ISSUE`, `UNDER-ISSUE`, `DOUBLE CLAIM`, `NEVER CLAIMED`, `CONFLICT`, `OVER-ADMISSION`, `SHARED IDEMPOTENCY`, `SHARED QUOTA`, `CROSS-TENANT RECONCILE` |
-| `INCONCLUSIVE` | 2 | The run cannot say: requests errored, answers came from degradation mode, or a limit was never reached | `DEGRADED`, `VACUOUS`, `METRICS UNREADABLE`, or an error count |
+| `INCONCLUSIVE` | 2 | The run cannot say: requests errored, answers came from degradation mode, or a limit was never reached | `DEGRADED`, `VACUOUS`, or an error count |
 
 The two used to share one word, `FAIL`, so a run with eight timed-out requests
 and no broken invariant read as two failed invariants. `make correctness`
 runs it locally; `make APP_URL=http://<host> correctness` runs it against any
-deployment. A counts degraded decisions from `gate_degraded_total`, so it reads
-`/metrics` with `ADMIN_API_KEY` (default `admin-api-key`); if `/metrics` cannot
-be read, A fails with `METRICS UNREADABLE` rather than assuming zero. A drains
-`FREE_API_KEY`'s bucket, B and C use `API_KEY`, and D needs both, as two
-different clients. Against a deployed stack all three come from
-`.demo-keys.env`. Source:
+deployment. A counts the answers that carry `X-Gate-Degraded`, so a decision
+made by degradation mode is seen whichever task made it. It used to compare
+`gate_degraded_total` before and after, which meant nothing behind two tasks. A
+drains `FREE_API_KEY`'s bucket, B and C use `API_KEY`, and D needs both, as two
+different clients. Against a deployed stack both come from `.demo-keys.env`. Source:
 [`LoadSim.scala`](loadSim/src/main/scala/LoadSim.scala).
 
 ### On AWS

@@ -10,8 +10,6 @@ LOCALSTACK_URL ?= http://localhost:4566
 API_KEY ?= test-api-key
 # A Free-tier key; invariant A drains its 20-token bucket.
 FREE_API_KEY ?= free-api-key
-# Holds AdminMetrics; invariant A reads /metrics with it.
-ADMIN_API_KEY ?= admin-api-key
 
 # Unique-per-invocation suffix for the smoke test key, so repeat runs never
 # land on a bucket a previous run already drained. Falls back when the recipe
@@ -101,7 +99,7 @@ test-all: test test-it ## Run unit and integration tests
 
 correctness: ## Check the correctness invariants (APP_URL=... to target a deployed stack)
 	$(NEED_SBT)
-	sbt "loadSim/run --scenario correctness --url $(APP_URL) --api-key $(API_KEY) --free-key $(FREE_API_KEY) --admin-key $(ADMIN_API_KEY)"
+	sbt "loadSim/run --scenario correctness --url $(APP_URL) --api-key $(API_KEY) --free-key $(FREE_API_KEY)"
 
 ##@ Probes
 
