@@ -235,3 +235,9 @@ variable "allow_public_plaintext" {
   type        = bool
   default     = false
 }
+
+variable "alb_slow_start_seconds" {
+  description = "Seconds over which the ALB ramps a newly healthy task up to its full share of requests (30-900), or 0 to turn it off. It has no effect on a service's first or only task."
+  type        = number
+  default     = 60
+}

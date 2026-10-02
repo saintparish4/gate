@@ -119,6 +119,7 @@ module "ecs" {
   certificate_arn        = var.certificate_arn
   alb_ingress_cidrs      = var.alb_ingress_cidrs
   allow_public_plaintext = var.allow_public_plaintext
+  slow_start_seconds     = var.alb_slow_start_seconds
   desired_count   = var.ecs_desired_count
   cpu             = var.ecs_cpu
   memory          = var.ecs_memory

@@ -91,6 +91,17 @@ variable "health_check_grace_period_seconds" {
   default     = 180
 }
 
+variable "slow_start_seconds" {
+  description = "Seconds over which the ALB ramps a newly healthy task up to its full share of requests. 0 turns it off."
+  type        = number
+  default     = 60
+
+  validation {
+    condition     = var.slow_start_seconds == 0 || (var.slow_start_seconds >= 30 && var.slow_start_seconds <= 900)
+    error_message = "slow_start_seconds must be 0 (off) or between 30 and 900, which is what the ALB accepts."
+  }
+}
+
 variable "certificate_arn" {
   description = "ACM certificate for the HTTPS listener. Empty serves HTTP only, to alb_ingress_cidrs."
   type        = string

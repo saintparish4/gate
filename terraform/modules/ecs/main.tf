@@ -142,6 +142,16 @@ resource "aws_lb_target_group" "app" {
   vpc_id      = var.vpc_id
   target_type = "ip"
 
+  # A task that has just passed its health check still has a cold JVM: the app
+  # warms every request path before it binds, but JIT compilation goes on for
+  # a while after. A 27-second-old task given a full share of load missed its
+  # 2-second store timeout. The ALB ramps a new task up linearly instead.
+  #
+  # It only applies while another healthy task is already serving, so it covers
+  # a scale-out or a rolling deploy, not the first task of a service or a
+  # single-task one. It needs the round-robin algorithm, which is the default.
+  slow_start = var.slow_start_seconds
+
   # /ready, not /health. /health is a liveness probe that returns 200 as soon as
   # the process is accepting connections -- it stays "healthy" even when
   # DynamoDB is unreachable, so routing on it puts tasks into service that
