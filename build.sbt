@@ -72,7 +72,22 @@ lazy val root = project.in(file(".")).enablePlugins(BuildInfoPlugin).settings(
   semanticdbEnabled := true,
   // /health reports this. It used to be a literal in Routes.scala and had
   // already drifted to 0.2.0 while the build said 0.1.0-SNAPSHOT.
-  buildInfoKeys := Seq[BuildInfoKey](name, version),
+  //
+  // The commit too: every build says 0.1.0, so a run against a deployed stack
+  // could not be tied to the code that answered it. The image build has no
+  // .git, so it is handed GIT_COMMIT; a local build asks git.
+  buildInfoKeys := Seq[BuildInfoKey](
+    name,
+    version,
+    BuildInfoKey.action("commit") {
+      sys.env.get("GIT_COMMIT").filter(c => c.nonEmpty && c != "unknown").orElse(
+        scala.util.Try(
+          scala.sys.process.Process(Seq("git", "describe", "--always", "--dirty"))
+            .!!(scala.sys.process.ProcessLogger(_ => ())).trim,
+        ).toOption.filter(_.nonEmpty),
+      ).getOrElse("unknown")
+    },
+  ),
   buildInfoPackage := "buildinfo",
 )
 
@@ -90,6 +105,9 @@ lazy val loadSim = project.in(file("loadSim")).settings(
   // that reports ExitCode.Error still ends the task with [success], which
   // makes the CI correctness job green no matter what it measured.
   Compile / run / fork := true,
+  // Run from the repository root, so the results file lands in one place
+  // whether the simulator is started by make or by sbt.
+  Compile / run / baseDirectory := (LocalRootProject / baseDirectory).value,
   libraryDependencies ++= Seq(
     "org.typelevel" %% "cats-effect" % CatsEffectVersion,
     "org.typelevel" %% "cats-effect-std" % CatsEffectVersion,

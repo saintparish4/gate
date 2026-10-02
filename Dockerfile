@@ -31,6 +31,12 @@ RUN sbt update || true
 # Copy source code
 COPY src/ ./src/
 
+# The commit /health reports. There is no .git in the build context, so the
+# caller passes it. Declared here, after the dependency layer, so a new commit
+# does not throw that layer away.
+ARG GIT_COMMIT=unknown
+ENV GIT_COMMIT=${GIT_COMMIT}
+
 # Build the application using sbt-native-packager
 # Creates universal distribution in target/universal/stage
 RUN sbt universal:stage

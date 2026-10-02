@@ -150,7 +150,7 @@ of HTTP 500s.
 
 ```bash
 curl -s http://localhost:8080/health
-# {"status":"healthy","version":"0.1.0"}
+# {"status":"healthy","version":"0.1.0","commit":"23fb85b"}
 curl -s http://localhost:8080/ready
 # {"status":"ok","components":[{"name":"dynamodb_ratelimit","status":"ok","required":true,"details":null}, ...]}
 ```

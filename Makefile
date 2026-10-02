@@ -11,6 +11,9 @@ API_KEY ?= test-api-key
 # A Free-tier key; invariant A drains its 20-token bucket.
 FREE_API_KEY ?= free-api-key
 
+# What a locally built image reports as its commit in /health.
+export GIT_COMMIT ?= $(shell git describe --always --dirty 2>/dev/null || echo unknown)
+
 # Unique-per-invocation suffix for the smoke test key, so repeat runs never
 # land on a bucket a previous run already drained. Falls back when the recipe
 # shell has no `date +%s` (e.g. some Windows shells).

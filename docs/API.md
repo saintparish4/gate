@@ -618,10 +618,12 @@ curl -s -X POST http://localhost:8080/v1/quota/reconcile \
 ### `GET /health`
 
 No authentication. Liveness only: `200` whenever the process serves HTTP, with
-no dependency checks. `version` is the build's version (sbt-buildinfo).
+no dependency checks. `version` is the build's version (sbt-buildinfo), and
+`commit` is the git commit the build was made from, or `"unknown"` when the
+build was not told (an image built without the `GIT_COMMIT` build argument).
 
 ```json
-{ "status": "healthy", "version": "0.1.0" }
+{ "status": "healthy", "version": "0.1.0", "commit": "23fb85b" }
 ```
 
 ### `GET /ready`
