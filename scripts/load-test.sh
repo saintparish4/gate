@@ -11,6 +11,17 @@
 # ./scripts/load-test.sh dev  # Quick smoke test 
 # ./scripts/load-test.sh staging baseline # Baseline test 
 # ./scripts/load-test.sh prod stress # Stress test (careful!) 
+#
+# Environment:
+#   API_KEY   the key to send (default: the built-in test-api-key, which only
+#             docker compose serves). Against a deployed stack:
+#               source .demo-keys.env && APP_URL=http://<alb> ./scripts/load-test.sh demo quick
+#   APP_URL   the base URL. Without it the script looks up the ALB named
+#             rate-limiter-<environment>, and falls back to localhost:8080.
+#
+# This is a smoke-level load test, not a benchmark: one run, no repetitions.
+# Its latency thresholds are loose "is it broken" bounds. A p99 over a few
+# hundred requests is the third-worst request, and moves a lot between runs.
 
 set -euo pipefail
 
@@ -57,7 +68,11 @@ echo "Results: $RESULTS_DIR"
 echo ""
 
 # Get target URL
-BASE_URL="http://$(get_alb_dns "$ENVIRONMENT")"
+BASE_URL="${APP_URL:-http://$(get_alb_dns "$ENVIRONMENT")}"
+# The key reaches k6 through the environment, never the command line, so it is
+# not echoed and does not show in the process list. It was hard-coded to the
+# built-in key, which a deployed stack refuses: every request answered 401.
+export API_KEY="${API_KEY:-test-api-key}"
 echo "Target: $BASE_URL"
 echo ""
 
@@ -86,10 +101,19 @@ const rateLimitRejected = new Counter('rate_limit_rejected');
 const idempotencyNew = new Counter('idempotency_new');
 const idempotencyDuplicate = new Counter('idempotency_duplicate');
 const latencyTrend = new Trend('custom_latency');
+// Answers made by degradation mode (X-Gate-Degraded), which never reached the
+// store. Any at all means the run measured an outage, not the service.
+const degradedAnswers = new Rate('degraded_answers');
 
 // Test configuration from environment
 const BASE_URL = __ENV.BASE_URL || 'http://localhost:8080';
 const TEST_TYPE = __ENV.TEST_TYPE || 'baseline';
+const API_KEY = __ENV.API_KEY || 'test-api-key';
+
+// A 429 is a decision, and a 202 is an idempotency key in progress. k6 counts
+// every status of 400 and above as a failed request unless told otherwise, so
+// a limiter doing its job would have failed the error-rate threshold.
+http.setResponseCallback(http.expectedStatuses(200, 202, 429));
 
 // Warmup scenario - runs before main test
 // Increased duration to reduce cold starts in local Docker/LocalStack environment
@@ -177,21 +201,25 @@ export const options = {
         [TEST_TYPE]: scenarios[TEST_TYPE],
     },
     thresholds: {
-        // Apply thresholds only to the main test scenario (not warmup)
-        // Realistic thresholds for local Docker/LocalStack environment:
-        // - Accounts for Docker networking overhead
-        // - Allows for occasional LocalStack/DynamoDB cold starts
-        // - More lenient than production but still catches real issues
-        [`http_req_duration{scenario:${TEST_TYPE}}`]: ['p(95)<500', 'p(99)<2000'], // 95% < 500ms, 99% < 2s
+        // Applied to the main scenario only, not the warmup.
+        //
+        // The latency bounds say "not broken", nothing finer: one run of a few
+        // hundred requests cannot resolve more. There used to be a p(99)<200
+        // per endpoint as well, tighter than the p(99)<2000 beside it and
+        // failed by a normal LocalStack run, so a quick test rarely passed.
+        [`http_req_duration{scenario:${TEST_TYPE}}`]: ['p(95)<500', 'p(99)<2000'],
         [`http_req_failed{scenario:${TEST_TYPE}}`]: ['rate<0.01'],  // Error rate < 1%
-        [`http_req_duration{endpoint:ratelimit,scenario:${TEST_TYPE}}`]: ['p(99)<200'],  // Rate limit checks < 200ms
-        [`http_req_duration{endpoint:idempotency,scenario:${TEST_TYPE}}`]: ['p(99)<200'], // Idempotency checks < 200ms
+        // Every answer has to be a real decision.
+        checks: ['rate>0.99'],
+        degraded_answers: ['rate==0'],
     },
     summaryTrendStats: ['min', 'avg', 'med', 'p(90)', 'p(95)', 'p(99)', 'max'],
 };
 
-// Custom metrics for OCC contention analysis
-const occRetryRate = new Rate('occ_contention_rejection'); // 429s under high contention
+// Share of hot-key checks that were refused. A refusal is an empty bucket or
+// an exhausted OCC retry; the two cannot be told apart from the answer, so
+// this is not an OCC rate (RateLimitOCCAttempts in CloudWatch is).
+const hotKeyRefused = new Rate('hot_key_refused');
 
 // Test data generators
 function randomUserId() {
@@ -207,13 +235,12 @@ export function rateLimitCheck() {
     const payload = JSON.stringify({
         key: randomUserId(),
         cost: 1,
-        algorithm: 'token_bucket',
     });
 
     const params = {
         headers: {
             'Content-Type': 'application/json',
-            'Authorization': 'Bearer test-api-key',
+            'Authorization': `Bearer ${API_KEY}`,
         },
         tags: { endpoint: 'ratelimit' },
     };
@@ -223,6 +250,7 @@ export function rateLimitCheck() {
     const duration = Date.now() - startTime;
 
     latencyTrend.add(duration);
+    degradedAnswers.add(res.headers['X-Gate-Degraded'] === 'true');
 
     const checks = check(res, {
         'status is 200 or 429': (r) => r.status === 200 || r.status === 429,
@@ -242,14 +270,12 @@ export function rateLimitCheck() {
         console.error(`HTTP error: ${res.status} - ${res.body.substring(0, 100)}`);
     }
 
-    // Track allowed vs rejected
+    // Track allowed vs rejected. A refusal is a 429; it used to be looked for
+    // in a 200, so it was never counted.
     if (res.status === 200) {
-        const body = JSON.parse(res.body);
-        if (body.allowed) {
-            rateLimitAllowed.add(1);
-        } else {
-            rateLimitRejected.add(1);
-        }
+        rateLimitAllowed.add(1);
+    } else if (res.status === 429) {
+        rateLimitRejected.add(1);
     }
 
     return res;
@@ -267,7 +293,7 @@ export function idempotencyCheck() {
     const params = {
         headers: {
             'Content-Type': 'application/json',
-            'Authorization': 'Bearer test-api-key',
+            'Authorization': `Bearer ${API_KEY}`,
         },
         tags: { endpoint: 'idempotency' },
     };
@@ -275,7 +301,8 @@ export function idempotencyCheck() {
     const res = http.post(`${BASE_URL}/v1/idempotency/check`, payload, params);
 
     const checks = check(res, {
-        'status is 200': (r) => r.status === 200,
+        // 202 is a key another request has in progress: a valid answer.
+        'status is 200 or 202': (r) => r.status === 200 || r.status === 202,
         'has status field': (r) => {
             try {
                 const body = JSON.parse(r.body);
@@ -315,7 +342,7 @@ export function highContentionCheck() {
     const params = {
         headers: {
             'Content-Type': 'application/json',
-            'Authorization': 'Bearer test-api-key',
+            'Authorization': `Bearer ${API_KEY}`,
         },
         tags: { endpoint: 'ratelimit', scenario: 'highContention' },
     };
@@ -326,17 +353,13 @@ export function highContentionCheck() {
         'status is 200 or 429': (r) => r.status === 200 || r.status === 429,
     });
 
+    degradedAnswers.add(res.headers['X-Gate-Degraded'] === 'true');
     if (res.status === 200) {
-        const body = JSON.parse(res.body);
-        if (body.allowed) {
-            rateLimitAllowed.add(1);
-        } else {
-            rateLimitRejected.add(1);
-            occRetryRate.add(1);
-        }
+        rateLimitAllowed.add(1);
+        hotKeyRefused.add(false);
     } else if (res.status === 429) {
         rateLimitRejected.add(1);
-        occRetryRate.add(1);
+        hotKeyRefused.add(true);
     }
 
     // No sleep — we want maximum concurrency pressure on this single key
@@ -384,6 +407,10 @@ EOF
 echo -e "${YELLOW}Starting load test...${NC}"
 echo ""
 
+# A failed threshold makes k6 exit non-zero. Under `set -e` that ended the
+# script right here, before the summary below was ever printed, so the summary
+# only appeared for runs that had nothing to explain.
+set +e
 k6 run \
     --out json="$RESULTS_DIR/results.json" \
     --summary-export="$RESULTS_DIR/summary.json" \
@@ -393,6 +420,7 @@ k6 run \
     2>&1 | tee "$RESULTS_DIR/output.log"
 
 EXIT_CODE=${PIPESTATUS[0]}
+set -e
 
 echo ""
 echo -e "${GREEN}=== Test Complete ===${NC}"
@@ -448,4 +476,6 @@ echo ""
 echo "To view detailed results:"
 echo "  cat $RESULTS_DIR/summary.json | jq"
 echo ""
+
+exit "$EXIT_CODE"
 
