@@ -566,20 +566,25 @@ benchmark.
 
 ## Performance
 
-Fixed-RPS latency figures, measured with the `latency` load scenario against
-LocalStack on a laptop, are in [PERFORMANCE.md](docs/PERFORMANCE.md). The
-representative warm-path row is 1,000 target RPS: 948 achieved, p50 6.9 ms,
-p95 59.5 ms, p99 217.7 ms, 0% errors. Each decision costs exactly one
-strongly consistent read and one conditional write, about $1.50 per million
-checks on DynamoDB on-demand, rising toward $12.75 per million in the
-worst case of 10 conflict retries per check.
+There is no current latency benchmark. The only fixed-RPS figures are from
+April 2026, one run per rate against LocalStack on a laptop; they are kept in
+[PERFORMANCE.md](docs/PERFORMANCE.md) as history and should not be quoted. A
+benchmark with repetitions on AWS is planned.
 
-The cost of correctness without a lock shows up on a single hot key. With 50
-virtual users hammering one key, throughput drops from about 50 RPS to 4 to 8
-RPS and p99 latency reaches 13 s, because most conditional writes fail and
-re-read. The service stays safe, never over-issuing, and pays in throughput
-and tail latency on that one key. `RateLimitOCCAttempts` in CloudWatch shows
-it happening.
+Cost is derived from the code and current prices, not measured. An admitted
+rate-limit check is one strongly consistent read and one conditional write,
+about $0.75 per million on DynamoDB on-demand in us-east-1; a refused check
+only reads, about $0.125 per million. With all 10 conflict retries on every
+check it is about $8.25 per million. Idempotency and quota cost more per
+decision; PERFORMANCE.md says how.
+
+The cost of correctness without a lock shows up on a single hot key. In one
+LocalStack measurement with 50 virtual users on one key, throughput dropped
+from about 50 RPS to 4 to 8 RPS and p99 latency reached 13 s, because most
+conditional writes fail and re-read. The service stays safe, never
+over-issuing, and pays in throughput and tail latency on that one key.
+`RateLimitOCCAttempts` in CloudWatch shows it happening. That figure has not
+been repeated or measured on AWS.
 
 **Load tools**
 
@@ -753,7 +758,7 @@ terraform output api_endpoint
 
 - [API reference](docs/API.md) — request and response schemas for every route
 - [Architecture](docs/ARCHITECTURE.md) — what the code does on each path, and why
-- [Performance](docs/PERFORMANCE.md) — fixed-RPS latency and DynamoDB cost per decision
+- [Performance](docs/PERFORMANCE.md) — the April LocalStack latency figures (historical) and the derived DynamoDB cost per decision
 - [Compliance notes](docs/COMPLIANCE.md) — what the audit trail records today, and what is planned
 - ADRs: [DynamoDB over Redis](docs/adr/001-dynamodb-over-redis.md),
   [hand-rolled circuit breaker](docs/adr/002-hand-rolled-circuit-breaker.md),
