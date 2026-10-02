@@ -464,7 +464,8 @@ and pull request:
 2. **integration** — the integration suite against TestContainers LocalStack.
 3. **correctness** — brings the compose stack up and waits for `/ready`. It
    smoke-tests `/health`, one rate-limit call, and one idempotency call, then
-   runs `sbt "loadSim/run --scenario correctness"`. A violation fails the build.
+   runs `sbt "loadSim/run --scenario correctness"`. Anything but a pass fails the
+   build.
 
 The correctness scenario warms the server for about 15 s, then asserts four
 invariants:
@@ -476,9 +477,17 @@ invariants:
 | **C** — token quota never over-admits | 50 workers spending 25,000 tokens each against a 1,000,000 limit for 20 s | `admitted x 25,000 <= 1,000,000`, some rejections, 0 errors |
 | **D** — tenants never share state | Two clients (`API_KEY` and `FREE_API_KEY`) racing for 20 s on the same 10 idempotency keys and the same quota user, while the second reconciles every reservation the first is granted | each client creates its own 10 records; each is held to 40 quota admissions and together they pass 40; every stolen reconcile answers 404; 0 conflicts, 0 errors |
 
-Each invariant prints `PASS` or `FAIL` with a detail prefix (`OVER-ISSUE`,
-`UNDER-ISSUE`, `DEGRADED`, `VACUOUS`, `VIOLATION`, `OVER-ADMISSION`), then
-`Overall: PASS` or `Overall: FAIL` and a matching exit code. `make correctness`
+Each invariant ends in one of three verdicts, and the run exits with the worst
+of them:
+
+| Verdict | Exit | Meaning | Detail prefixes |
+|---|---|---|---|
+| `PASS` | 0 | The property held, and the run was able to show it | |
+| `VIOLATION` | 1 | The property was broken | `OVER-ISSUE`, `UNDER-ISSUE`, `DOUBLE CLAIM`, `NEVER CLAIMED`, `CONFLICT`, `OVER-ADMISSION`, `SHARED IDEMPOTENCY`, `SHARED QUOTA`, `CROSS-TENANT RECONCILE` |
+| `INCONCLUSIVE` | 2 | The run cannot say: requests errored, answers came from degradation mode, or a limit was never reached | `DEGRADED`, `VACUOUS`, `METRICS UNREADABLE`, or an error count |
+
+The two used to share one word, `FAIL`, so a run with eight timed-out requests
+and no broken invariant read as two failed invariants. `make correctness`
 runs it locally; `make APP_URL=http://<host> correctness` runs it against any
 deployment. A counts degraded decisions from `gate_degraded_total`, so it reads
 `/metrics` with `ADMIN_API_KEY` (default `admin-api-key`); if `/metrics` cannot

@@ -31,7 +31,9 @@ import org.HdrHistogram.ConcurrentHistogram
  *                      C) token-quota non-over-admission
  *                      D) cross-tenant isolation: two clients racing on the
  *                         same idempotency keys, quota user, and reservations
- *                    exits non-zero on any invariant violation
+ *                    exits 0 on PASS, 1 on VIOLATION (an invariant was
+ *                    broken), 2 on INCONCLUSIVE (the run could not tell:
+ *                    errors, degraded answers, or a limit never reached)
  *   latency        — fixed-RPS latency measurement with HdrHistogram; emits a
  *                    markdown table row of rps, p50, p95, p99, error_rate
  *
@@ -351,11 +353,12 @@ object Scenarios:
     }
 
   // ------------------------------------------------------------------
-  // Correctness scenario: three invariants, CI-gated
+  // Correctness scenario: four invariants, CI-gated
   // ------------------------------------------------------------------
 
   /**
-   * correctness: runs three invariants and exits non-zero on any violation.
+   * correctness: runs four invariants. Each ends as PASS, VIOLATION or
+   * INCONCLUSIVE (see Verdict); the run exits 0, 1 or 2 for the worst of them.
    *
    * Invariant A — token-bucket non-over-issue:
    *   Server must never issue more tokens than capacity + refillRate * duration.
@@ -417,25 +420,55 @@ object Scenarios:
       b  <- invariantB_idempotencyExactlyOneCreated(client, baseUrl, runId, concurrency.getOrElse(50), apiKey)
       c  <- invariantC_quotaNonOverAdmission(client, baseUrl, runId, concurrency.getOrElse(50), apiKey)
       d  <- invariantD_crossTenantIsolation(client, baseUrl, runId, concurrency.getOrElse(10), apiKey, freeKey)
-      ok  = a.passed && b.passed && c.passed && d.passed
+      overall = Verdict.overall(List(a, b, c, d).map(_.verdict))
       _  <- Console[IO].println(
               s"""
                  |=== Correctness Results ===
-                 |  A) Token bucket non-over-issue     : ${if a.passed then "PASS" else "FAIL"}
+                 |  A) Token bucket non-over-issue     : ${a.verdict.label}
                  |     ${a.details}
-                 |  B) Idempotency exactly-one-Created : ${if b.passed then "PASS" else "FAIL"}
+                 |  B) Idempotency exactly-one-Created : ${b.verdict.label}
                  |     ${b.details}
-                 |  C) Token quota non-over-admission  : ${if c.passed then "PASS" else "FAIL"}
+                 |  C) Token quota non-over-admission  : ${c.verdict.label}
                  |     ${c.details}
-                 |  D) Cross-tenant isolation          : ${if d.passed then "PASS" else "FAIL"}
+                 |  D) Cross-tenant isolation          : ${d.verdict.label}
                  |     ${d.details}
                  |
-                 |Overall: ${if ok then "PASS" else "FAIL"}
+                 |Overall: ${overall.label}
                  |""".stripMargin
             )
-    yield if ok then ExitCode.Success else ExitCode.Error
+    yield overall.exitCode
 
-  private case class InvariantResult(passed: Boolean, details: String)
+  /**
+   * What one invariant's run showed.
+   *
+   * There used to be two outcomes, and anything short of a clean pass printed
+   * FAIL. A run in which eight calls timed out and no invariant was broken read
+   * "VIOLATION: created=10 (expected 10) ... errors=5", and was reported as two
+   * failed invariants. "Could not answer" is not "answered wrong":
+   *
+   *   Pass          the property held, and the run was able to show it
+   *   Violation     the property was broken: more issued, admitted or created
+   *                 than the limit allows, or state crossed between tenants
+   *   Inconclusive  the run cannot say: requests errored, answers came from
+   *                 degradation mode, or a limit was never reached
+   *
+   * A violation is reported even when the run also had errors, because an error
+   * cannot make a limiter issue more. Both non-pass outcomes exit non-zero, so
+   * CI is no less strict; they differ in what to do next.
+   */
+  enum Verdict(val label: String, val exitCode: ExitCode):
+    case Pass         extends Verdict("PASS", ExitCode.Success)
+    case Violation    extends Verdict("VIOLATION", ExitCode(1))
+    case Inconclusive extends Verdict("INCONCLUSIVE", ExitCode(2))
+
+  object Verdict:
+    /** A violation anywhere outranks an inconclusive run, which outranks a pass. */
+    def overall(verdicts: List[Verdict]): Verdict =
+      if verdicts.contains(Violation) then Violation
+      else if verdicts.contains(Inconclusive) then Inconclusive
+      else Pass
+
+  case class InvariantResult(verdict: Verdict, details: String)
 
   /**
    * Ramps 1 -> 5 -> 20 workers over ~15 s on throwaway keys before any invariant
@@ -526,20 +559,19 @@ object Scenarios:
       // Positive and small: clock correction. Growing with duration: a bug.
       val excessSecs  = (a - capacity) / refillPerSec.toDouble - elapsedSecs
       val window      = f"elapsed=$elapsedSecs%.1fs, server-excess=$excessSecs%+.1fs"
-      val pass =
-        a <= maxAllowed && a >= minAllowed && b > 0 && e == 0 && degraded <= 0.0
-      val why   =
-        if pass then s"minAllowed=$minAllowed <= allowed=$a <= maxAllowed=$maxAllowed ($window, total=$t, blocked=$b, errors=$e)"
-        else if e > 0 then s"errors=$e (total=$t, allowed=$a, blocked=$b)\n     Sample errors:\n${sampler.render}"
+      val result =
         // Degradation mode answers without consulting the bucket, so allowed/
-        // blocked stop describing the limiter. Reject-all in particular pins
-        // allowed and inflates blocked, which reads exactly like a healthy
-        // limiter holding the line.
-        else if degraded > 0.0 then s"DEGRADED: ${degraded.toLong} decision(s) came from degradation mode, not the token bucket (circuit breaker open, bulkhead full, or store errors) — allowed=$a measures nothing. Check gate_degraded_total and gate_circuit_breaker_state."
-        else if b == 0 then s"VACUOUS: never blocked (total=$t, allowed=$a) — the bucket was never exhausted"
-        else if a < minAllowed then s"UNDER-ISSUE: allowed=$a < minAllowed=$minAllowed (total=$t, blocked=$b) — the limiter went dark"
-        else s"OVER-ISSUE: allowed=$a > maxAllowed=$maxAllowed ($window, total=$t, blocked=$b, errors=$e)"
-      IO.pure(InvariantResult(pass, why))
+        // blocked stop describing the limiter. Reject-all pins allowed and
+        // inflates blocked, which reads exactly like a healthy limiter holding
+        // the line; allow-all admits past the ceiling by design. Either way
+        // the counts measure nothing, so this is checked before the ceiling.
+        if degraded > 0.0 then InvariantResult(Verdict.Inconclusive, s"DEGRADED: ${degraded.toLong} decision(s) came from degradation mode, not the token bucket (circuit breaker open, bulkhead full, or store errors) — allowed=$a measures nothing. Check gate_degraded_total and gate_circuit_breaker_state.")
+        else if a > maxAllowed then InvariantResult(Verdict.Violation, s"OVER-ISSUE: allowed=$a > maxAllowed=$maxAllowed ($window, total=$t, blocked=$b, errors=$e)")
+        else if e > 0 then InvariantResult(Verdict.Inconclusive, s"errors=$e (total=$t, allowed=$a, blocked=$b)\n     Sample errors:\n${sampler.render}")
+        else if b == 0 then InvariantResult(Verdict.Inconclusive, s"VACUOUS: never blocked (total=$t, allowed=$a) — the bucket was never exhausted")
+        else if a < minAllowed then InvariantResult(Verdict.Violation, s"UNDER-ISSUE: allowed=$a < minAllowed=$minAllowed (total=$t, blocked=$b) — the limiter went dark")
+        else InvariantResult(Verdict.Pass, s"minAllowed=$minAllowed <= allowed=$a <= maxAllowed=$maxAllowed ($window, total=$t, blocked=$b, errors=$e)")
+      IO.pure(result)
 
     // Without /metrics there is no telling a token-bucket decision from a
     // degraded one, so the run is refused rather than trusted.
@@ -563,7 +595,7 @@ object Scenarios:
          |  minAllowed    = $minAllowed  (a quarter of the nominal budget; catches a limiter that rejects everything)
          |""".stripMargin
     ) *>
-    run.valueOr(err => InvariantResult(false, metricsUnreadable(err)))
+    run.valueOr(err => InvariantResult(Verdict.Inconclusive, metricsUnreadable(err)))
 
   private def metricsUnreadable(err: String): String =
     s"METRICS UNREADABLE: $err — without gate_degraded_total a degraded decision looks like a token-bucket one. Pass --admin-key with a key holding AdminMetrics."
@@ -613,13 +645,16 @@ object Scenarios:
       val c    = created.get
       val e    = errors.get
       val cf   = conflict.get
-      val pass = c == K && e == 0 && cf == 0
-      val why =
-        if pass then s"created=$c == K=$K, conflicts=$cf, errors=$e, duplicates=${duplicate.get}"
-        else
-          val errSection = if e > 0 then s"\n     Sample errors:\n${sampler.render}" else ""
-          s"VIOLATION: created=$c (expected $K), conflicts=$cf (expected 0), errors=$e (expected 0), duplicates=${duplicate.get}$errSection"
-      IO.pure(InvariantResult(pass, why))
+      val counts     = s"created=$c (K=$K), conflicts=$cf, errors=$e, duplicates=${duplicate.get}"
+      val errSection = if e > 0 then s"\n     Sample errors:\n${sampler.render}" else ""
+      val result =
+        if c > K then InvariantResult(Verdict.Violation, s"DOUBLE CLAIM: more than one 'new' for a key — $counts$errSection")
+        else if cf > 0 then InvariantResult(Verdict.Violation, s"CONFLICT: a 409 for an identical request — $counts$errSection")
+        // A missing 'new' with errors may be a claim whose answer was lost.
+        else if e > 0 then InvariantResult(Verdict.Inconclusive, s"$counts$errSection")
+        else if c < K then InvariantResult(Verdict.Violation, s"NEVER CLAIMED: a key was never answered 'new' — $counts")
+        else InvariantResult(Verdict.Pass, counts)
+      IO.pure(result)
     }
 
   private def invariantC_quotaNonOverAdmission(
@@ -669,13 +704,12 @@ object Scenarios:
       val con    = contended.get
       val e      = errors.get
       val tokens = adm * perRequest
-      val pass   = tokens <= userLimit && rej > 0 && e == 0
-      val why =
-        if pass then s"admitted=$adm ($tokens tokens) <= userLimit=$userLimit, rejected=$rej, contended=$con, errors=$e"
-        else if e > 0 then s"errors=$e (admitted=$adm, rejected=$rej, contended=$con)\n     Sample errors:\n${sampler.render}"
-        else if rej == 0 then s"VACUOUS: limit never reached (admitted=$adm, contended=$con) — quotas disabled or stack too slow"
-        else s"OVER-ADMISSION: admitted=$adm ($tokens tokens) > userLimit=$userLimit (rejected=$rej, contended=$con)"
-      IO.pure(InvariantResult(pass, why))
+      val result =
+        if tokens > userLimit then InvariantResult(Verdict.Violation, s"OVER-ADMISSION: admitted=$adm ($tokens tokens) > userLimit=$userLimit (rejected=$rej, contended=$con, errors=$e)")
+        else if e > 0 then InvariantResult(Verdict.Inconclusive, s"errors=$e (admitted=$adm, rejected=$rej, contended=$con)\n     Sample errors:\n${sampler.render}")
+        else if rej == 0 then InvariantResult(Verdict.Inconclusive, s"VACUOUS: limit never reached (admitted=$adm, contended=$con) — quotas disabled or stack too slow")
+        else InvariantResult(Verdict.Pass, s"admitted=$adm ($tokens tokens) <= userLimit=$userLimit, rejected=$rej, contended=$con, errors=$e")
+      IO.pure(result)
     }
 
   private def invariantD_crossTenantIsolation(
@@ -754,7 +788,7 @@ object Scenarios:
     }.loop
 
     if keyA == keyB then
-      IO.pure(InvariantResult(false, "D needs two different keys: --api-key and --free-key are the same, so there is only one tenant"))
+      IO.pure(InvariantResult(Verdict.Inconclusive, "D needs two different keys: --api-key and --free-key are the same, so there is only one tenant"))
     else
       Console[IO].println(
         s"""-- Invariant D — cross-tenant isolation --
@@ -783,25 +817,25 @@ object Scenarios:
         val conflicts  = a.conflicts.get + b.conflicts.get
         val (t, landed) = (thefts.get, theftsLanded.get)
         val e          = errors.get
-        val idemOk     = ca == K && cb == K
-        val quotaOk    = aa <= maxAdmitted && ab <= maxAdmitted && aa + ab > maxAdmitted
-        val theftOk    = t > 0 && landed == 0
-        val pass       = idemOk && quotaOk && theftOk && conflicts == 0 && e == 0
+        val rejected   = rejectedAll.get
         val summary =
           s"created A=$ca B=$cb (K=$K each), admitted A=$aa B=$ab (max $maxAdmitted each, ${aa + ab} together), stolen reconciles refused=${t - landed}/$t, conflicts=$conflicts, errors=$e"
-        val why =
-          if pass then summary
-          else
-            val cause =
-              if e > 0 then "errors"
-              else if !idemOk then "SHARED IDEMPOTENCY: each client must create its own K records"
-              else if aa > maxAdmitted || ab > maxAdmitted then "OVER-ADMISSION"
-              else if aa + ab <= maxAdmitted then "SHARED QUOTA or VACUOUS: together the clients never passed one limit"
-              else if landed > 0 then "CROSS-TENANT RECONCILE: B changed A's reservation"
-              else if t == 0 then "VACUOUS: A was never granted a reservation to steal"
-              else "conflicts"
-            s"$cause — $summary\n     Sample errors:\n${sampler.render}"
-        IO.pure(InvariantResult(pass, why))
+        def because(verdict: Verdict, cause: String): InvariantResult =
+          InvariantResult(verdict, s"$cause — $summary\n     Sample errors:\n${sampler.render}")
+        val result =
+          if landed > 0 then because(Verdict.Violation, "CROSS-TENANT RECONCILE: B changed A's reservation")
+          else if ca > K || cb > K then because(Verdict.Violation, "DOUBLE CLAIM: a client was answered 'new' twice for a key")
+          else if aa > maxAdmitted || ab > maxAdmitted then because(Verdict.Violation, "OVER-ADMISSION")
+          else if conflicts > 0 then because(Verdict.Violation, "CONFLICT: a 409 for an identical request")
+          // From here on a shortfall may be an answer that was lost.
+          else if e > 0 then because(Verdict.Inconclusive, "errors")
+          else if ca < K || cb < K then because(Verdict.Violation, "SHARED IDEMPOTENCY: each client must create its own K records")
+          // The limit was reached, and the two clients reached it together.
+          else if aa + ab <= maxAdmitted && rejected > 0 then because(Verdict.Violation, "SHARED QUOTA: together the clients were held to one limit")
+          else if aa + ab <= maxAdmitted then because(Verdict.Inconclusive, "VACUOUS: together the clients never reached a limit")
+          else if t == 0 then because(Verdict.Inconclusive, "VACUOUS: A was never granted a reservation to steal")
+          else InvariantResult(Verdict.Pass, summary)
+        IO.pure(result)
       }
 
   // ------------------------------------------------------------------
