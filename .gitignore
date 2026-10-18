@@ -112,3 +112,7 @@ base/
 
 # Build-in-public drafts (unpublished)
 notes/
+
+# TLC working files from running the specs by hand (scripts/check-specs.sh uses a temp dir)
+spec/states/
+spec/*_TTrace_*

@@ -25,7 +25,7 @@ NEED_SBT = @command -v sbt >/dev/null 2>&1 || { echo "Error: sbt not found in PA
 
 .DEFAULT_GOAL := help
 .PHONY: help up up-clean down clean logs status run dev stack obs \
-        fmt test test-it test-all smoke health correctness env-drift monitoring-check tf-validate tf-test
+        fmt test test-it test-all smoke health correctness env-drift monitoring-check tf-validate tf-test spec
 
 help: ## Show this help
 	@awk 'BEGIN { FS = ":.*##"; printf "Usage: make <target>\n" } \
@@ -108,6 +108,9 @@ correctness: ## Check the correctness invariants (APP_URL=... to target a deploy
 	$(NEED_SBT)
 	@echo "Correctness invariants against $(APP_URL) (keys from API_KEY and FREE_API_KEY; not printed)"
 	@API_KEY='$(API_KEY)' FREE_API_KEY='$(FREE_API_KEY)' sbt "loadSim/run --scenario correctness --url $(APP_URL)"
+
+spec: ## Model-check the TLA+ specs in spec/ against spec/expected.txt (needs Java, ~6 min)
+	bash scripts/check-specs.sh
 
 ##@ Probes
 

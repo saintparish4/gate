@@ -1,0 +1,12 @@
+# <module> <config> <expected>: "pass", or the invariant TLC must report violated.
+# A violation listed here is a known counterexample (README.md, Findings). When a
+# fix lands, its line changes to pass in the same commit.
+RateLimitOCC RateLimitOCC.cfg pass
+RateLimitOCC RateLimitOCC_ttl.cfg NeverOverIssue
+Idempotency Idempotency.cfg pass
+Idempotency Idempotency_noclaim.cfg NoOverlap
+Idempotency Idempotency_lease.cfg NoOverlap
+Idempotency Idempotency_honest.cfg HonestComplete
+Quota Quota.cfg pass
+Quota Quota_release.cfg CounterCoversLedger
+Quota Quota_ttl.cfg CounterCoversLedger
