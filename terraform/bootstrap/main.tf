@@ -102,6 +102,36 @@ output "repository_url" {
   value       = aws_ecr_repository.app.repository_url
 }
 
+# The usage aggregator's images (ADR-007), kept like the service's: immutable
+# tags, scanned, and outliving every environment.
+variable "aggregator_repository_name" {
+  description = "ECR repository for the usage aggregator image"
+  type        = string
+  default     = "gate-usage-aggregator"
+}
+
+resource "aws_ecr_repository" "aggregator" {
+  name                 = var.aggregator_repository_name
+  image_tag_mutability = "IMMUTABLE"
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+
+  encryption_configuration {
+    encryption_type = "AES256"
+  }
+}
+
+resource "aws_ecr_lifecycle_policy" "aggregator" {
+  repository = aws_ecr_repository.aggregator.name
+  policy     = aws_ecr_lifecycle_policy.app.policy
+}
+
+output "aggregator_repository_url" {
+  value = aws_ecr_repository.aggregator.repository_url
+}
+
 # ---------------------------------------------------------------------------
 # A role GitHub Actions can assume, for the scheduled correctness run.
 #

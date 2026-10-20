@@ -181,10 +181,11 @@ monitoring-check: ## Check every app metric the Terraform dashboard and alarms u
 
 # -backend=false: validation needs no state, so it runs without AWS access or
 # the S3 bucket bootstrap.sh creates.
-tf-validate: ## Validate both Terraform roots (no AWS access needed)
+tf-validate: ## Validate the three Terraform roots (no AWS access needed)
 	@command -v terraform >/dev/null 2>&1 || { echo "Error: terraform not found in PATH."; echo "  Install it: https://www.terraform.io/downloads"; exit 1; }
 	cd terraform && terraform init -backend=false -input=false >/dev/null && terraform validate
 	cd terraform/bootstrap && terraform init -backend=false -input=false >/dev/null && terraform validate
+	cd terraform/eks && terraform init -backend=false -input=false >/dev/null && terraform validate
 
 tf-test: ## Plan the ALB's TLS and exposure rules against a mocked AWS provider
 	@command -v terraform >/dev/null 2>&1 || { echo "Error: terraform not found in PATH."; exit 1; }
