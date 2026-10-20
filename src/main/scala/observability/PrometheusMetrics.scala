@@ -61,7 +61,22 @@ class PrometheusMetrics[F[_]: Sync](val registry: CollectorRegistry):
     .help("Circuit breaker state (0=closed, 0.5=half-open, 1=open)")
     .labelNames("name").register(registry)
 
+  // Every answer the service gives, by route template, status and whether it
+  // was a degraded one. The SLOs in docs/SLO.md are ratios of these; the
+  // decision counters above only ever saw rate-limit checks, and no 5xx.
+  val httpRequests: Counter = Counter.build().name("gate_http_requests_total")
+    .help("HTTP answers by route template, status code, and X-Gate-Degraded")
+    .labelNames("route", "code", "degraded").register(registry)
+
   // -- Histograms --
+
+  // Buckets include 0.1: the latency objective's threshold must be one.
+  val httpDuration: Histogram = Histogram.build()
+    .name("gate_http_request_duration_seconds")
+    .help("Time from request to response headers, by route template")
+    .labelNames("route")
+    .buckets(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0)
+    .register(registry)
 
   val dynamoLatency: Histogram = Histogram.build()
     .name("gate_dynamodb_latency_seconds")
@@ -93,6 +108,16 @@ class PrometheusMetrics[F[_]: Sync](val registry: CollectorRegistry):
   List("user", "agent", "org").foreach(quotaTokensAdmitted.labels(_))
   List("checkAndConsume", "getStatus", "idempotency_check", "quota_reserve")
     .foreach(dynamoLatency.labels(_))
+  // The failures the availability SLO counts, per decision route. A series
+  // born at its first 503 has no earlier sample, so rate() never sees that
+  // first jump: on the first local multi-replica run, three 503s read as an
+  // error ratio of exactly zero.
+  HttpMetrics.DecisionRoutes.foreach { route =>
+    List("500", "503").foreach(httpRequests.labels(route, _, "false"))
+    httpDuration.labels(route)
+  }
+  List("200", "429")
+    .foreach(httpRequests.labels("/v1/ratelimit/check", _, "true"))
 
   /** Serialize all registered metrics to Prometheus text exposition format. */
   def scrape: F[String] = Sync[F].delay {

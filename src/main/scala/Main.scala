@@ -15,7 +15,7 @@ import api.Routes
 import config.*
 import core.*
 import events.{BroadcastingEventPublisher, EventPublisher, KinesisPublisher}
-import observability.CorrelationIdMiddleware
+import observability.{CorrelationIdMiddleware, HttpMetrics}
 import resilience.HealthAggregator
 import wiring.*
 
@@ -143,10 +143,15 @@ object Main extends IOApp:
       // not JSON, 422 for one that does not match the schema); without it an
       // undecodable body surfaces as an empty 500. The correlation middleware
       // goes around that, so those answers carry X-Request-Id too.
+      // The request metrics go inside the correlation middleware and around
+      // everything toHttpApp answers, so every status the SLOs count is seen.
       httpApp: org.http4s.HttpApp[IO] = Routes.toHttpApp(
         routes.routes,
         summon[Logger[IO]],
-        CorrelationIdMiddleware.middleware(correlationLocal),
+        r =>
+          CorrelationIdMiddleware.middleware(correlationLocal)(
+            obs.promMetrics.fold(r)(prom => HttpMetrics.middleware(prom)(r)),
+          ),
       )
 
       _ <- Resource.make(Async[IO].unit)(_ =>
