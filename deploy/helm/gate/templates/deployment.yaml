@@ -1,0 +1,121 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gate.fullname" . }}
+  labels:
+    {{- include "gate.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+spec:
+  {{- if not .Values.gate.autoscaling.enabled }}
+  replicas: {{ .Values.gate.replicas }}
+  {{- end }}
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Never fewer serving replicas than asked for during a rollout.
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      {{- include "gate.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gate.selectorLabels" . | nindent 8 }}
+      annotations:
+        # A config change rolls the pods; env is read once, at start.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ .Values.gate.serviceAccount.name }}
+      terminationGracePeriodSeconds: {{ .Values.gate.terminationGracePeriodSeconds }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      # Spread over zones first, then nodes, so one zone's loss leaves replicas.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "gate.selectorLabels" . | nindent 14 }}
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "gate.selectorLabels" . | nindent 14 }}
+      containers:
+        - name: gate
+          image: {{ include "gate.image" (dict "image" .Values.gate.image "what" "gate") }}
+          imagePullPolicy: {{ .Values.gate.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.gate.env.SERVER_PORT | int }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "gate.fullname" . }}
+          {{- with .Values.gate.extraEnv }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          # A cold JVM on one vCPU takes tens of seconds to bind (the README's
+          # cold-start finding), so liveness waits for the startup probe.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 3
+            failureThreshold: 40
+          # /ready probes the stores, each bounded by 3 s, so 5 s is enough.
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          # /health only: a store outage must not restart every pod at once.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 4
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "{{ .Values.gate.preStopSleepSeconds }}"]
+          resources:
+            {{- toYaml .Values.gate.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # The JVM writes perf data and temp files; the root filesystem is
+        # read-only.
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.gate.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.gate.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.gate.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

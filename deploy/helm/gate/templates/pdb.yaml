@@ -1,0 +1,11 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "gate.fullname" . }}
+  labels:
+    {{- include "gate.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.gate.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "gate.selectorLabels" . | nindent 6 }}

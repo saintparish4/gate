@@ -26,7 +26,7 @@ NEED_SBT = @command -v sbt >/dev/null 2>&1 || { echo "Error: sbt not found in PA
 .DEFAULT_GOAL := help
 .PHONY: help up up-clean down clean logs status run dev stack obs \
         fmt test test-it test-all smoke health correctness env-drift monitoring-check tf-validate tf-test spec \
-        slo-check usage-check
+        slo-check usage-check helm-check
 
 help: ## Show this help
 	@awk 'BEGIN { FS = ":.*##"; printf "Usage: make <target>\n" } \
@@ -150,6 +150,22 @@ usage-check: ## Check the usage aggregator committed every event the service pub
 	bash scripts/check-usage-pipeline.sh
 
 ##@ Infrastructure
+
+HELM_CHART = deploy/helm/gate
+helm-check: ## Lint and render the Helm chart, schema-check it, and check what it refuses
+	@command -v helm >/dev/null 2>&1 || { echo "Error: helm not found in PATH."; exit 1; }
+	@command -v kubeconform >/dev/null 2>&1 || { echo "Error: kubeconform not found in PATH."; exit 1; }
+	helm lint $(HELM_CHART) -f $(HELM_CHART)/ci/test-values.yaml
+	helm lint $(HELM_CHART) -f $(HELM_CHART)/ci/kind-values.yaml
+	helm template gate $(HELM_CHART) -f $(HELM_CHART)/ci/test-values.yaml 2>/dev/null \
+	  | kubeconform -strict -summary -kubernetes-version 1.31.0 -schema-location default \
+	      -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+	@for bad in "--set ingress.certificateArn= --set ingress.inboundCidrs={0.0.0.0/0}" \
+	            "--set gate.image.tag=latest" "--set gate.env.SECRETS_MANAGER_ENABLED=false"; do \
+	  if helm template gate $(HELM_CHART) -f $(HELM_CHART)/ci/test-values.yaml $$bad >/dev/null 2>&1; then \
+	    echo "FAIL: the chart rendered with $$bad"; exit 1; \
+	  fi; \
+	done; echo "OK: the chart refuses a public plaintext ALB, a latest tag, and Secrets Manager off"
 
 # promtool from the Prometheus image compose already uses, so nothing to install.
 PROMTOOL = docker run --rm -v "$(CURDIR)/observability/prometheus:/p" -w /p --entrypoint promtool prom/prometheus:v2.54.1

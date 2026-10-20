@@ -1,0 +1,177 @@
+# Default values for the gate chart.
+#
+# What the chart assumes exists (terraform/eks creates all of it; see
+# deploy/README.md):
+#   - the DynamoDB tables, the Kinesis stream, and the API-keys secret;
+#   - EKS Pod Identity associations granting the two service accounts below
+#     their AWS permissions (no access keys in the cluster);
+#   - for `ingress`, the AWS Load Balancer Controller;
+#   - for `metrics`, the Prometheus Operator CRDs and a Grafana dashboard
+#     sidecar (kube-prometheus-stack provides both).
+#
+# Every value under gate.env matches what Terraform sets on the ECS task
+# (terraform/main.tf). scripts/check-env-drift.sh fails CI when they diverge.
+
+nameOverride: ""
+fullnameOverride: ""
+
+gate:
+  image:
+    # The ECR repository from terraform/bootstrap, e.g.
+    # 123456789012.dkr.ecr.us-east-1.amazonaws.com/rate-limiter
+    repository: ""
+    # An immutable tag: the short commit publish-image.sh pushes. Never latest.
+    tag: ""
+    pullPolicy: IfNotPresent
+
+  # Ignored while autoscaling is on. Two is the floor: one replica has no
+  # one to take its traffic during a rollout or a node drain.
+  replicas: 2
+
+  serviceAccount:
+    # Fixed, not derived from the release: the Pod Identity association in
+    # terraform/eks names it.
+    name: gate
+    annotations: {}
+
+  env:
+    SERVER_HOST: "0.0.0.0"
+    SERVER_PORT: "8080"
+    AWS_REGION: us-east-1
+    RATE_LIMIT_TABLE: ""
+    IDEMPOTENCY_TABLE: ""
+    TOKEN_QUOTA_TABLE: ""
+    KINESIS_STREAM: ""
+    KINESIS_ENABLED: "true"
+    METRICS_ENABLED: "true"
+    METRICS_NAMESPACE: RateLimiter/eks
+    METRICS_ENVIRONMENT: eks
+    TOKEN_QUOTA_ENABLED: "true"
+    # Never false: the app refuses the public built-in keys without
+    # ALLOW_BUILT_IN_KEYS, which a deployment never sets.
+    SECRETS_MANAGER_ENABLED: "true"
+    # The secret is "<prefix>/<environment>/<name>".
+    SECRETS_PREFIX: gate
+    SECRETS_ENVIRONMENT: eks
+    API_KEYS_SECRET_NAME: api-keys
+    # Pinned, never inherited (CLAUDE.md, "Keep").
+    DEGRADATION_MODE: reject-all
+    CIRCUIT_BREAKER_MAX_FAILURES: "5"
+    CIRCUIT_BREAKER_RESET_TIMEOUT: "30 seconds"
+    AUTH_RATE_LIMIT_PER_MINUTE: "1000"
+    # Behind the ALB the connecting address is the ALB's; the client's is the
+    # last X-Forwarded-For entry. Set false if pods are reached any other way.
+    AUTH_TRUST_FORWARDED_FOR: "true"
+    # Unauthenticated; never on in a shared deployment.
+    DASHBOARD_ENABLED: "false"
+    PROMETHEUS_ENABLED: "true"
+    TRACING_ENABLED: "false"
+    OTEL_SDK_DISABLED: "true"
+    OTEL_EXPORTER_OTLP_ENDPOINT: ""
+    OTEL_SERVICE_NAME: gate
+
+  # Extra env entries, as a list (valueFrom allowed). The kind rehearsal uses
+  # it for LocalStack's endpoint and dummy credentials.
+  extraEnv: []
+
+  # Matches the ECS task (1 vCPU, 2 GiB). One 1-vCPU replica is CPU-bound at
+  # about 450 decisions a second (CLAUDE.md); the limit is memory only, so a
+  # busy replica is not throttled below its request.
+  resources:
+    requests:
+      cpu: "1"
+      memory: 2Gi
+    limits:
+      memory: 2Gi
+
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 70
+
+  podDisruptionBudget:
+    minAvailable: 1
+
+  # Seconds the pod keeps serving after it is told to stop, so the load
+  # balancer stops sending to it first. Must stay below
+  # terminationGracePeriodSeconds less the server's shutdown timeout.
+  preStopSleepSeconds: 15
+  terminationGracePeriodSeconds: 60
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+aggregator:
+  # The usage aggregator (ADR-007): reads the stream, writes per-client usage.
+  enabled: true
+  image:
+    repository: ""
+    tag: ""
+    pullPolicy: IfNotPresent
+  serviceAccount:
+    name: gate-usage-aggregator
+    annotations: {}
+  env:
+    AWS_REGION: us-east-1
+    KINESIS_STREAM: ""
+    USAGE_TABLE: ""
+    USAGE_TTL_DAYS: "90"
+  extraEnv: []
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 512Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+service:
+  type: ClusterIP
+  port: 80
+  # Only with type NodePort; the kind rehearsal maps it to the host.
+  nodePort: null
+
+ingress:
+  # An ALB through the AWS Load Balancer Controller.
+  enabled: false
+  className: alb
+  scheme: internet-facing
+  # With a certificate the ALB listens on 443 and redirects 80 to it.
+  certificateArn: ""
+  # Who may reach the ALB. Without a certificate this must not include
+  # 0.0.0.0/0 unless allowPublicPlaintext is set, the same rule Terraform holds
+  # the ECS ALB to (PR 4): API keys travel in a header.
+  inboundCidrs: []
+  allowPublicPlaintext: false
+  # Target-group slow start, as on ECS. It only applies while another target
+  # is already healthy.
+  slowStartSeconds: 60
+  host: ""
+  annotations: {}
+
+metrics:
+  serviceMonitor:
+    # Needs the Prometheus Operator CRDs.
+    enabled: false
+    interval: 15s
+    # Extra labels, e.g. `release: kube-prometheus-stack` if your Prometheus
+    # selects ServiceMonitors by label.
+    labels: {}
+    # /metrics needs a key holding AdminMetrics. Create this Secret yourself
+    # (scripts/deploy-eks.sh does), never in values.
+    adminKeySecret:
+      name: gate-metrics-key
+      key: api-key
+  prometheusRule:
+    # The SLO rules (docs/SLO.md), the same file compose's Prometheus loads.
+    enabled: false
+    labels: {}
+  grafanaDashboards:
+    # ConfigMaps a Grafana sidecar picks up by label.
+    enabled: false
+    label: grafana_dashboard
+    labelValue: "1"

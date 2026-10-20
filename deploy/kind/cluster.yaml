@@ -1,0 +1,13 @@
+# The kind cluster scripts/kind-rehearsal.sh uses: one control-plane node and
+# two workers, so the replicas land on different nodes as they would on EKS.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      # The chart's Service as a NodePort, so traffic from the host is spread
+      # over every replica by kube-proxy. port-forward would pin one pod.
+      - containerPort: 30080
+        hostPort: 18080
+  - role: worker
+  - role: worker

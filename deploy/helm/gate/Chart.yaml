@@ -1,0 +1,13 @@
+apiVersion: v2
+name: gate
+description: >-
+  Gate, a spend-control and enforcement service (rate limits, idempotency, token
+  quotas on DynamoDB), and its usage aggregator.
+type: application
+# The chart's own version. appVersion is the service's, from build.sbt.
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/saintparish4/gate
+sources:
+  - https://github.com/saintparish4/gate
+keywords: [rate-limiting, idempotency, quota, dynamodb]

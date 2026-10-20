@@ -1,0 +1,20 @@
+# Values that render every template, for `make helm-check`. Not a deployment.
+gate:
+  image: {repository: 123456789012.dkr.ecr.us-east-1.amazonaws.com/rate-limiter, tag: abc1234}
+  env:
+    RATE_LIMIT_TABLE: gate-eks-rate-limits
+    IDEMPOTENCY_TABLE: gate-eks-idempotency
+    TOKEN_QUOTA_TABLE: gate-eks-token-quotas
+    KINESIS_STREAM: gate-eks-events
+aggregator:
+  image: {repository: 123456789012.dkr.ecr.us-east-1.amazonaws.com/gate-usage-aggregator, tag: abc1234}
+  env:
+    KINESIS_STREAM: gate-eks-events
+    USAGE_TABLE: gate-eks-usage
+ingress:
+  enabled: true
+  certificateArn: arn:aws:acm:us-east-1:123456789012:certificate/00000000-0000-0000-0000-000000000000
+metrics:
+  serviceMonitor: {enabled: true}
+  prometheusRule: {enabled: true}
+  grafanaDashboards: {enabled: true}
