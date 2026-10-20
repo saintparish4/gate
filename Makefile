@@ -26,7 +26,7 @@ NEED_SBT = @command -v sbt >/dev/null 2>&1 || { echo "Error: sbt not found in PA
 .DEFAULT_GOAL := help
 .PHONY: help up up-clean down clean logs status run dev stack obs \
         fmt test test-it test-all smoke health correctness env-drift monitoring-check tf-validate tf-test spec \
-        usage-check
+        slo-check usage-check
 
 help: ## Show this help
 	@awk 'BEGIN { FS = ":.*##"; printf "Usage: make <target>\n" } \
@@ -150,6 +150,12 @@ usage-check: ## Check the usage aggregator committed every event the service pub
 	bash scripts/check-usage-pipeline.sh
 
 ##@ Infrastructure
+
+# promtool from the Prometheus image compose already uses, so nothing to install.
+PROMTOOL = docker run --rm -v "$(CURDIR)/observability/prometheus:/p" -w /p --entrypoint promtool prom/prometheus:v2.54.1
+slo-check: ## Check the SLO rules, and run their unit tests (needs Docker)
+	$(PROMTOOL) check rules rules/slo.yml
+	$(PROMTOOL) test rules tests/slo_test.yml
 
 env-drift: ## Compare env vars across application.conf, compose and Terraform
 	./scripts/check-env-drift.sh

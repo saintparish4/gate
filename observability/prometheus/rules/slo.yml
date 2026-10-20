@@ -1,0 +1,317 @@
+# Gate's service level objectives, as Prometheus rules. docs/SLO.md says what
+# each one promises and why; this file is how they are measured.
+#
+# Every ratio sums over all instances, so it reads the same with one task or
+# twenty. The decision routes are the /v1 ones: /health, /ready, /metrics and
+# the dashboard are not what a client depends on.
+#
+# A sum over a selector with no series is empty, not zero, and empty plus
+# anything is empty: each term that can be absent is `or vector(0)`. Without
+# it, a window with no 5xx at all hid every degraded answer in it.
+#
+# Multiwindow, multi-burn-rate alerts (Google SRE workbook, chapter 5): a page
+# when the 30-day budget is burning 14.4x (2% in an hour) or 6x (5% in six
+# hours), and a ticket at 3x over a day or 1x over three days. Each long window
+# is paired with a short one, so an alert clears soon after the burn stops.
+#
+# Tested by observability/prometheus/tests/slo_test.yml (`make slo-check`).
+groups:
+  - name: gate-slo-availability
+    rules:
+      - record: gate:slo_availability:error_ratio_rate5m
+        expr: |
+          (
+            (sum(rate(gate_http_requests_total{route=~"/v1/.+", code=~"5.."}[5m])) or vector(0))
+            + (sum(rate(gate_http_requests_total{route=~"/v1/.+", code!~"5..", degraded="true"}[5m])) or vector(0))
+          )
+          /
+          clamp_min(sum(rate(gate_http_requests_total{route=~"/v1/.+"}[5m])), 1e-9)
+      - record: gate:slo_availability:error_ratio_rate30m
+        expr: |
+          (
+            (sum(rate(gate_http_requests_total{route=~"/v1/.+", code=~"5.."}[30m])) or vector(0))
+            + (sum(rate(gate_http_requests_total{route=~"/v1/.+", code!~"5..", degraded="true"}[30m])) or vector(0))
+          )
+          /
+          clamp_min(sum(rate(gate_http_requests_total{route=~"/v1/.+"}[30m])), 1e-9)
+      - record: gate:slo_availability:error_ratio_rate1h
+        expr: |
+          (
+            (sum(rate(gate_http_requests_total{route=~"/v1/.+", code=~"5.."}[1h])) or vector(0))
+            + (sum(rate(gate_http_requests_total{route=~"/v1/.+", code!~"5..", degraded="true"}[1h])) or vector(0))
+          )
+          /
+          clamp_min(sum(rate(gate_http_requests_total{route=~"/v1/.+"}[1h])), 1e-9)
+      - record: gate:slo_availability:error_ratio_rate2h
+        expr: |
+          (
+            (sum(rate(gate_http_requests_total{route=~"/v1/.+", code=~"5.."}[2h])) or vector(0))
+            + (sum(rate(gate_http_requests_total{route=~"/v1/.+", code!~"5..", degraded="true"}[2h])) or vector(0))
+          )
+          /
+          clamp_min(sum(rate(gate_http_requests_total{route=~"/v1/.+"}[2h])), 1e-9)
+      - record: gate:slo_availability:error_ratio_rate6h
+        expr: |
+          (
+            (sum(rate(gate_http_requests_total{route=~"/v1/.+", code=~"5.."}[6h])) or vector(0))
+            + (sum(rate(gate_http_requests_total{route=~"/v1/.+", code!~"5..", degraded="true"}[6h])) or vector(0))
+          )
+          /
+          clamp_min(sum(rate(gate_http_requests_total{route=~"/v1/.+"}[6h])), 1e-9)
+      - record: gate:slo_availability:error_ratio_rate1d
+        expr: |
+          (
+            (sum(rate(gate_http_requests_total{route=~"/v1/.+", code=~"5.."}[1d])) or vector(0))
+            + (sum(rate(gate_http_requests_total{route=~"/v1/.+", code!~"5..", degraded="true"}[1d])) or vector(0))
+          )
+          /
+          clamp_min(sum(rate(gate_http_requests_total{route=~"/v1/.+"}[1d])), 1e-9)
+      - record: gate:slo_availability:error_ratio_rate3d
+        expr: |
+          (
+            (sum(rate(gate_http_requests_total{route=~"/v1/.+", code=~"5.."}[3d])) or vector(0))
+            + (sum(rate(gate_http_requests_total{route=~"/v1/.+", code!~"5..", degraded="true"}[3d])) or vector(0))
+          )
+          /
+          clamp_min(sum(rate(gate_http_requests_total{route=~"/v1/.+"}[3d])), 1e-9)
+      - record: gate:slo_availability:error_ratio_rate30d
+        expr: |
+          (
+            (sum(rate(gate_http_requests_total{route=~"/v1/.+", code=~"5.."}[30d])) or vector(0))
+            + (sum(rate(gate_http_requests_total{route=~"/v1/.+", code!~"5..", degraded="true"}[30d])) or vector(0))
+          )
+          /
+          clamp_min(sum(rate(gate_http_requests_total{route=~"/v1/.+"}[30d])), 1e-9)
+
+  - name: gate-slo-latency
+    rules:
+      - record: gate:slo_latency:error_ratio_rate5m
+        expr: |
+          1 - (
+            sum(rate(gate_http_request_duration_seconds_bucket{route=~"/v1/.+", le="0.1"}[5m]))
+            /
+            clamp_min(sum(rate(gate_http_request_duration_seconds_count{route=~"/v1/.+"}[5m])), 1e-9)
+          )
+      - record: gate:slo_latency:error_ratio_rate30m
+        expr: |
+          1 - (
+            sum(rate(gate_http_request_duration_seconds_bucket{route=~"/v1/.+", le="0.1"}[30m]))
+            /
+            clamp_min(sum(rate(gate_http_request_duration_seconds_count{route=~"/v1/.+"}[30m])), 1e-9)
+          )
+      - record: gate:slo_latency:error_ratio_rate1h
+        expr: |
+          1 - (
+            sum(rate(gate_http_request_duration_seconds_bucket{route=~"/v1/.+", le="0.1"}[1h]))
+            /
+            clamp_min(sum(rate(gate_http_request_duration_seconds_count{route=~"/v1/.+"}[1h])), 1e-9)
+          )
+      - record: gate:slo_latency:error_ratio_rate2h
+        expr: |
+          1 - (
+            sum(rate(gate_http_request_duration_seconds_bucket{route=~"/v1/.+", le="0.1"}[2h]))
+            /
+            clamp_min(sum(rate(gate_http_request_duration_seconds_count{route=~"/v1/.+"}[2h])), 1e-9)
+          )
+      - record: gate:slo_latency:error_ratio_rate6h
+        expr: |
+          1 - (
+            sum(rate(gate_http_request_duration_seconds_bucket{route=~"/v1/.+", le="0.1"}[6h]))
+            /
+            clamp_min(sum(rate(gate_http_request_duration_seconds_count{route=~"/v1/.+"}[6h])), 1e-9)
+          )
+      - record: gate:slo_latency:error_ratio_rate1d
+        expr: |
+          1 - (
+            sum(rate(gate_http_request_duration_seconds_bucket{route=~"/v1/.+", le="0.1"}[1d]))
+            /
+            clamp_min(sum(rate(gate_http_request_duration_seconds_count{route=~"/v1/.+"}[1d])), 1e-9)
+          )
+      - record: gate:slo_latency:error_ratio_rate3d
+        expr: |
+          1 - (
+            sum(rate(gate_http_request_duration_seconds_bucket{route=~"/v1/.+", le="0.1"}[3d]))
+            /
+            clamp_min(sum(rate(gate_http_request_duration_seconds_count{route=~"/v1/.+"}[3d])), 1e-9)
+          )
+      - record: gate:slo_latency:error_ratio_rate30d
+        expr: |
+          1 - (
+            sum(rate(gate_http_request_duration_seconds_bucket{route=~"/v1/.+", le="0.1"}[30d]))
+            /
+            clamp_min(sum(rate(gate_http_request_duration_seconds_count{route=~"/v1/.+"}[30d])), 1e-9)
+          )
+
+  - name: gate-slo-usage-pipeline
+    rules:
+      # 1 while the aggregator's slowest shard is a minute or more behind.
+      - record: gate:slo_usage_freshness:stale
+        expr: max(gate_usage_millis_behind_latest) >= bool 60000
+      - record: gate:slo_usage_freshness:error_ratio_1h
+        expr: avg_over_time(gate:slo_usage_freshness:stale[1h])
+      - record: gate:slo_usage_freshness:error_ratio_6h
+        expr: avg_over_time(gate:slo_usage_freshness:stale[6h])
+      - record: gate:slo_usage_freshness:error_ratio_1d
+        expr: avg_over_time(gate:slo_usage_freshness:stale[1d])
+      - record: gate:slo_usage_freshness:error_ratio_30d
+        expr: avg_over_time(gate:slo_usage_freshness:stale[30d])
+      - record: gate:slo_event_delivery:error_ratio_rate1h
+        expr: |
+          (sum(rate(gate_events_dropped_total[1h])) or vector(0))
+          /
+          clamp_min(
+            sum(rate(gate_events_published_total[1h])) + (sum(rate(gate_events_dropped_total[1h])) or vector(0)),
+            1e-9
+          )
+      - record: gate:slo_event_delivery:error_ratio_rate1d
+        expr: |
+          (sum(rate(gate_events_dropped_total[1d])) or vector(0))
+          /
+          clamp_min(
+            sum(rate(gate_events_published_total[1d])) + (sum(rate(gate_events_dropped_total[1d])) or vector(0)),
+            1e-9
+          )
+      - record: gate:slo_event_delivery:error_ratio_rate30d
+        expr: |
+          (sum(rate(gate_events_dropped_total[30d])) or vector(0))
+          /
+          clamp_min(
+            sum(rate(gate_events_published_total[30d])) + (sum(rate(gate_events_dropped_total[30d])) or vector(0)),
+            1e-9
+          )
+
+  - name: gate-slo-alerts
+    rules:
+      - alert: GateAvailabilityBurnRateFast
+        expr: |
+          gate:slo_availability:error_ratio_rate1h > 0.0144
+          and
+          gate:slo_availability:error_ratio_rate5m > 0.0144
+        for: 2m
+        labels:
+          severity: page
+          slo: availability
+        annotations:
+          summary: "Decision availability: burning the 30-day error budget at 14.4x or more (1h and 5m windows)"
+          description: "Error ratio over 1h is {{ $value | humanizePercentage }}, against a budget of 0.1%."
+          runbook: "docs/SLO.md#availability"
+      - alert: GateAvailabilityBurnRateMedium
+        expr: |
+          gate:slo_availability:error_ratio_rate6h > 0.006
+          and
+          gate:slo_availability:error_ratio_rate30m > 0.006
+        for: 2m
+        labels:
+          severity: page
+          slo: availability
+        annotations:
+          summary: "Decision availability: burning the 30-day error budget at 6x or more (6h and 30m windows)"
+          description: "Error ratio over 6h is {{ $value | humanizePercentage }}, against a budget of 0.1%."
+          runbook: "docs/SLO.md#availability"
+      - alert: GateAvailabilityBurnRateSlow
+        expr: |
+          gate:slo_availability:error_ratio_rate1d > 0.003
+          and
+          gate:slo_availability:error_ratio_rate2h > 0.003
+        for: 15m
+        labels:
+          severity: ticket
+          slo: availability
+        annotations:
+          summary: "Decision availability: burning the 30-day error budget at 3x or more (1d and 2h windows)"
+          description: "Error ratio over 1d is {{ $value | humanizePercentage }}, against a budget of 0.1%."
+          runbook: "docs/SLO.md#availability"
+      - alert: GateAvailabilityBurnRateChronic
+        expr: |
+          gate:slo_availability:error_ratio_rate3d > 0.001
+          and
+          gate:slo_availability:error_ratio_rate6h > 0.001
+        for: 15m
+        labels:
+          severity: ticket
+          slo: availability
+        annotations:
+          summary: "Decision availability: burning the 30-day error budget at 1x or more (3d and 6h windows)"
+          description: "Error ratio over 3d is {{ $value | humanizePercentage }}, against a budget of 0.1%."
+          runbook: "docs/SLO.md#availability"
+      - alert: GateLatencyBurnRateFast
+        expr: |
+          gate:slo_latency:error_ratio_rate1h > 0.144
+          and
+          gate:slo_latency:error_ratio_rate5m > 0.144
+        for: 2m
+        labels:
+          severity: page
+          slo: latency
+        annotations:
+          summary: "Decision latency: burning the 30-day error budget at 14.4x or more (1h and 5m windows)"
+          description: "Error ratio over 1h is {{ $value | humanizePercentage }}, against a budget of 1%."
+          runbook: "docs/SLO.md#latency"
+      - alert: GateLatencyBurnRateMedium
+        expr: |
+          gate:slo_latency:error_ratio_rate6h > 0.06
+          and
+          gate:slo_latency:error_ratio_rate30m > 0.06
+        for: 2m
+        labels:
+          severity: page
+          slo: latency
+        annotations:
+          summary: "Decision latency: burning the 30-day error budget at 6x or more (6h and 30m windows)"
+          description: "Error ratio over 6h is {{ $value | humanizePercentage }}, against a budget of 1%."
+          runbook: "docs/SLO.md#latency"
+      - alert: GateLatencyBurnRateSlow
+        expr: |
+          gate:slo_latency:error_ratio_rate1d > 0.03
+          and
+          gate:slo_latency:error_ratio_rate2h > 0.03
+        for: 15m
+        labels:
+          severity: ticket
+          slo: latency
+        annotations:
+          summary: "Decision latency: burning the 30-day error budget at 3x or more (1d and 2h windows)"
+          description: "Error ratio over 1d is {{ $value | humanizePercentage }}, against a budget of 1%."
+          runbook: "docs/SLO.md#latency"
+      - alert: GateLatencyBurnRateChronic
+        expr: |
+          gate:slo_latency:error_ratio_rate3d > 0.01
+          and
+          gate:slo_latency:error_ratio_rate6h > 0.01
+        for: 15m
+        labels:
+          severity: ticket
+          slo: latency
+        annotations:
+          summary: "Decision latency: burning the 30-day error budget at 1x or more (3d and 6h windows)"
+          description: "Error ratio over 3d is {{ $value | humanizePercentage }}, against a budget of 1%."
+          runbook: "docs/SLO.md#latency"
+      - alert: GateUsageAggregatorBehind
+        expr: max(gate_usage_millis_behind_latest) / 1000 > 300
+        for: 10m
+        labels:
+          severity: page
+          slo: usage_freshness
+        annotations:
+          summary: "The usage aggregator is more than five minutes behind the event stream"
+          description: "Slowest shard is {{ $value | humanizeDuration }} behind. Records past the stream's retention (24 h by default) are lost to usage."
+          runbook: "docs/SLO.md#usage_freshness"
+      - alert: GateUsageAggregatorAbsent
+        expr: absent(gate_usage_millis_behind_latest)
+        for: 10m
+        labels:
+          severity: page
+          slo: usage_freshness
+        annotations:
+          summary: "No usage aggregator is reporting: usage is not being counted"
+          runbook: "docs/SLO.md#usage_freshness"
+      - alert: GateEventsDropped
+        expr: gate:slo_event_delivery:error_ratio_rate1h > 0.001
+        for: 15m
+        labels:
+          severity: ticket
+          slo: event_delivery
+        annotations:
+          summary: "More than 0.1% of usage events were dropped before reaching the stream in the last hour"
+          description: "Dropped ratio {{ $value | humanizePercentage }}. Usage totals are a lower bound by that much (ADR-003, ADR-007)."
+          runbook: "docs/SLO.md#event_delivery"

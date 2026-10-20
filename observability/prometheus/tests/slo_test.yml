@@ -1,0 +1,121 @@
+# promtool unit tests for rules/slo.yml: `make slo-check`.
+# Each case says what a burn looks like and checks the rule sees it. A rule
+# that cannot fire here would not fire in production either.
+rule_files:
+  - ../rules/slo.yml
+
+evaluation_interval: 1m
+
+tests:
+  # 5% of decisions fail with a 5xx for over an hour, on two instances: 50
+  # times the 0.1% budget. The fast page fires; the error ratio sums across
+  # instances.
+  - interval: 1m
+    input_series:
+      - series: 'gate_http_requests_total{instance="a",route="/v1/ratelimit/check",code="200",degraded="false"}'
+        values: '0+475x120'
+      - series: 'gate_http_requests_total{instance="b",route="/v1/ratelimit/check",code="200",degraded="false"}'
+        values: '0+475x120'
+      - series: 'gate_http_requests_total{instance="a",route="/v1/ratelimit/check",code="503",degraded="false"}'
+        values: '0+50x120'
+      # Probes are not decisions: a failing /ready must not count.
+      - series: 'gate_http_requests_total{instance="a",route="/ready",code="503",degraded="false"}'
+        values: '0+1000x120'
+    promql_expr_test:
+      # Rounded: the ratio is 0.05 to within float error, not exactly.
+      - expr: round(gate:slo_availability:error_ratio_rate1h, 0.0001)
+        eval_time: 70m
+        exp_samples:
+          - labels: '{}'
+            value: 0.05
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: GateAvailabilityBurnRateFast
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              slo: availability
+            exp_annotations:
+              summary: "Decision availability: burning the 30-day error budget at 14.4x or more (1h and 5m windows)"
+              description: "Error ratio over 1h is 5%, against a budget of 0.1%."
+              runbook: "docs/SLO.md#availability"
+
+  # A degraded answer is a failure even though it is a 429, not a 5xx: the
+  # service answered without its store. An ordinary 429 is a correct answer.
+  - interval: 1m
+    input_series:
+      - series: 'gate_http_requests_total{route="/v1/ratelimit/check",code="429",degraded="false"}'
+        values: '0+900x60'
+      - series: 'gate_http_requests_total{route="/v1/ratelimit/check",code="429",degraded="true"}'
+        values: '0+100x60'
+    promql_expr_test:
+      # Rounded: the ratio is 0.05 to within float error, not exactly.
+      - expr: round(gate:slo_availability:error_ratio_rate30m, 0.0001)
+        eval_time: 40m
+        exp_samples:
+          - labels: '{}'
+            value: 0.1
+
+  # Healthy: all fast, all 2xx. Nothing fires.
+  - interval: 1m
+    input_series:
+      - series: 'gate_http_requests_total{route="/v1/quota/check",code="200",degraded="false"}'
+        values: '0+1000x120'
+      - series: 'gate_http_request_duration_seconds_bucket{route="/v1/quota/check",le="0.1"}'
+        values: '0+1000x120'
+      - series: 'gate_http_request_duration_seconds_count{route="/v1/quota/check"}'
+        values: '0+1000x120'
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: GateAvailabilityBurnRateFast
+      - eval_time: 90m
+        alertname: GateLatencyBurnRateFast
+    promql_expr_test:
+      - expr: gate:slo_latency:error_ratio_rate1h
+        eval_time: 90m
+        exp_samples:
+          - labels: 'gate:slo_latency:error_ratio_rate1h'
+            value: 0
+
+  # 20% of decisions slower than 100 ms for over an hour: 20 times the 1%
+  # latency budget.
+  - interval: 1m
+    input_series:
+      - series: 'gate_http_request_duration_seconds_bucket{route="/v1/ratelimit/check",le="0.1"}'
+        values: '0+800x120'
+      - series: 'gate_http_request_duration_seconds_count{route="/v1/ratelimit/check"}'
+        values: '0+1000x120'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: GateLatencyBurnRateFast
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              slo: latency
+            exp_annotations:
+              summary: "Decision latency: burning the 30-day error budget at 14.4x or more (1h and 5m windows)"
+              description: "Error ratio over 1h is 20%, against a budget of 1%."
+              runbook: "docs/SLO.md#latency"
+
+  # The aggregator falls ten minutes behind and stays there.
+  - interval: 1m
+    input_series:
+      - series: 'gate_usage_millis_behind_latest{shard="shardId-000000000000"}'
+        values: '0x10 600000x30'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: GateUsageAggregatorBehind
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              slo: usage_freshness
+            exp_annotations:
+              summary: "The usage aggregator is more than five minutes behind the event stream"
+              description: "Slowest shard is 10m 0s behind. Records past the stream's retention (24 h by default) are lost to usage."
+              runbook: "docs/SLO.md#usage_freshness"
+    promql_expr_test:
+      - expr: gate:slo_usage_freshness:stale
+        eval_time: 30m
+        exp_samples:
+          - labels: 'gate:slo_usage_freshness:stale'
+            value: 1
