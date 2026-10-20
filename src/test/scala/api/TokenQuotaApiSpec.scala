@@ -176,6 +176,35 @@ class TokenQuotaApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
         body.outputDelta shouldBe 10L // 10 actual - 0 estimated
       }
 
+    "publishes one usage event per reservation, however often it is reconciled" in {
+      for
+        eventsRef <- Ref.of[IO, List[RateLimitEvent]](Nil)
+        publisher = new EventPublisher[IO]:
+          def publish(e: RateLimitEvent): IO[Unit] = eventsRef.update(_ :+ e)
+          def publishBatch(es: List[RateLimitEvent]): IO[Unit] = eventsRef
+            .update(_ ++ es)
+          def healthCheck: IO[Either[String, Unit]] = IO.pure(Right(()))
+        api <- makeApi(events = publisher)
+        id <- reserve(api, "user-usage", 100)
+        first <- api.reconcile(reconcileRequest(id, 80, 10), testClient)
+        // A retry after a lost answer: the same usage, the same 200.
+        replay <- api.reconcile(reconcileRequest(id, 80, 10), testClient)
+        // The publish is fire-and-forget (`.start`). Give the fibers time to run.
+        _ <- IO.sleep(50.millis)
+        events <- eventsRef.get
+      yield
+        first.status shouldBe Status.Ok
+        replay.status shouldBe Status.Ok
+        events.collect { case e: RateLimitEvent.QuotaReconciled => e } match
+          case List(e) =>
+            e.reservationId shouldBe id
+            e.clientId shouldBe testClient.clientId
+            e.actualInputTokens shouldBe 80L
+            e.actualOutputTokens shouldBe 10L
+            e.inputDelta shouldBe -20L
+          case other => fail(s"expected one QuotaReconciled, got $other")
+    }
+
     "POST /v1/quota/reconcile returns 404 for a reservation it does not know" in
       makeApi().flatMap(api =>
         api.reconcile(reconcileRequest("unknown", 0, 0), testClient),
@@ -212,9 +241,10 @@ class TokenQuotaApiSpec extends AsyncFreeSpec with AsyncIOSpec with Matchers:
       }
 
     "returns 503 with Retry-After when the reservation is contended" in {
-      val api = makeApiWith(
-        stubService(QuotaDecision.Contended(25), ReconcileResult.Reconciled(0, 0)),
-      )
+      val api = makeApiWith(stubService(
+        QuotaDecision.Contended(25),
+        ReconcileResult.Reconciled(0, 0, applied = true),
+      ))
       for
         resp <- api
           .check(checkRequest("user-f", estimatedInput = 10), testClient)

@@ -1,0 +1,18 @@
+{{- range $name, $required := dict "RATE_LIMIT_TABLE" true "IDEMPOTENCY_TABLE" true "TOKEN_QUOTA_TABLE" true "KINESIS_STREAM" true }}
+{{- if not (index $.Values.gate.env $name) }}
+{{- fail (printf "gate.env.%s is required (terraform output helm_values sets it)" $name) }}
+{{- end }}
+{{- end }}
+{{- if ne (toString .Values.gate.env.SECRETS_MANAGER_ENABLED) "true" }}
+{{- fail "gate.env.SECRETS_MANAGER_ENABLED must be \"true\": without it the service serves only the public built-in keys, and refuses to start" }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "gate.fullname" . }}
+  labels:
+    {{- include "gate.labels" . | nindent 4 }}
+data:
+  {{- range $k, $v := .Values.gate.env }}
+  {{ $k }}: {{ toString $v | quote }}
+  {{- end }}

@@ -7,9 +7,14 @@
 #
 #   export ECR_IMAGE=$(./scripts/publish-image.sh)
 #   ./scripts/deploy-demo.sh
+#
+# The usage aggregator's image (ADR-007) is the same script with its own
+# repository and Dockerfile:
+#   ECR_REPO_NAME=gate-usage-aggregator DOCKERFILE=aggregator.Dockerfile ./scripts/publish-image.sh
 set -euo pipefail
 
 REPO="${ECR_REPO_NAME:-gate}"
+DOCKERFILE="${DOCKERFILE:-Dockerfile}"
 REGION="${AWS_REGION:-us-east-1}"
 
 # Tags are immutable, so a tag always names one image. A build from a tree
@@ -50,7 +55,7 @@ aws ecr get-login-password --region "$REGION" \
 # --platform produces an image the task will fail to start.
 log "Building $URI for linux/amd64..."
 # The tag is the commit (or commit-dirty-timestamp), and /health reports it.
-docker build --platform linux/amd64 --build-arg GIT_COMMIT="$TAG" -t "$URI" . >&2
+docker build --platform linux/amd64 --build-arg GIT_COMMIT="$TAG" -f "$DOCKERFILE" -t "$URI" . >&2
 
 log "Pushing..."
 docker push "$URI" >&2

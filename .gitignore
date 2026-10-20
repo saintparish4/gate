@@ -57,6 +57,7 @@ book/
 .env.*.local
 # Demo API keys written by scripts/deploy-demo.sh
 .demo-keys.env
+.eks-keys.env
 # Names the account's state bucket; written by scripts/bootstrap.sh
 terraform/backend.hcl
 # Only root configurations pin providers; a module's lock file comes from tf-test
@@ -112,3 +113,7 @@ base/
 
 # Build-in-public drafts (unpublished)
 notes/
+
+# TLC working files from running the specs by hand (scripts/check-specs.sh uses a temp dir)
+spec/states/
+spec/*_TTrace_*

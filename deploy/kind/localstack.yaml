@@ -1,0 +1,40 @@
+# LocalStack inside the rehearsal cluster, standing in for DynamoDB, Kinesis
+# and Secrets Manager. The image is the repository's (localstack.Dockerfile),
+# whose init script creates the tables and the stream.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: localstack
+  namespace: gate
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: localstack}
+  template:
+    metadata:
+      labels: {app: localstack}
+    spec:
+      containers:
+        - name: localstack
+          image: gate-rehearsal-localstack:local
+          imagePullPolicy: Never
+          env:
+            - {name: SERVICES, value: "dynamodb,kinesis,cloudwatch,secretsmanager"}
+          ports:
+            - containerPort: 4566
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "curl -sf http://localhost:4566/_localstack/init/ready | grep -q '\"completed\": true'"]
+            periodSeconds: 5
+            failureThreshold: 60
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: localstack
+  namespace: gate
+spec:
+  selector: {app: localstack}
+  ports:
+    - port: 4566
+      targetPort: 4566

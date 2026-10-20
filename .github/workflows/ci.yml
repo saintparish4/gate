@@ -59,6 +59,25 @@ jobs:
     - name: Validate Terraform and test the ALB exposure rules
       run: make tf-validate tf-test
 
+    # The SLO rules are only as good as their ability to fire: their unit tests
+    # feed each burn and check the alert. promtool runs from the Prometheus
+    # image compose already pins.
+    - name: Check the SLO rules and their tests
+      run: make slo-check
+
+    - name: Set up Helm
+      uses: azure/setup-helm@v4
+      with:
+        version: v3.16.4
+
+    # Lint, render every template, schema-check the result (CRDs included), and
+    # check the chart refuses what it must: a public plaintext ALB, `latest`.
+    - name: Check the Helm chart
+      run: |
+        curl -fsSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz \
+          | tar -xz -C /usr/local/bin kubeconform
+        make helm-check
+
     # `cache: sbt` includes ~/.cache/coursier, where sbt keeps downloaded jars.
     # The hand-rolled cache this replaces saved ~/.ivy2/cache, which sbt stopped
     # using in 1.3, so every job fetched every dependency again.
@@ -73,7 +92,7 @@ jobs:
       uses: sbt/setup-sbt@v1
 
     - name: Check formatting
-      run: sbt scalafmtCheckAll
+      run: sbt scalafmtCheckAll aggregator/scalafmtCheckAll
 
     - name: Compile
       run: sbt compile
@@ -86,6 +105,11 @@ jobs:
     # that could no longer fail would be caught here.
     - name: Prove the correctness invariants can fail
       run: sbt loadSim/test
+
+    # Includes the usage aggregator's exactly-once test: lost answers, failed
+    # reads, and two readers on the same shards.
+    - name: Run the usage aggregator's tests
+      run: sbt aggregator/test
 
   # Separate from `unit` so a formatting or unit failure reports in about two
   # minutes instead of waiting behind TestContainers.
@@ -174,6 +198,21 @@ jobs:
       env:
         DOCKER_BUILD_RECORD_UPLOAD: false
 
+    # The usage aggregator, cached under its own scope. The tag is the name
+    # compose looks for, so `up --no-build` below fails loudly if they part.
+    - name: Build usage aggregator image (layers cached between runs)
+      uses: docker/build-push-action@v7
+      with:
+        builder: ${{ steps.buildx.outputs.name }}
+        context: .
+        file: aggregator.Dockerfile
+        tags: ${{ env.COMPOSE_PROJECT_NAME }}-usage-aggregator
+        load: true
+        cache-from: type=gha,scope=usage-aggregator
+        cache-to: type=gha,mode=max,scope=usage-aggregator
+      env:
+        DOCKER_BUILD_RECORD_UPLOAD: false
+
     - name: Wait for LocalStack image
       run: |
         while [ ! -f "$RUNNER_TEMP/localstack-build.rc" ]; do sleep 1; done
@@ -223,6 +262,14 @@ jobs:
 
     - name: "Run correctness invariants (A: token-bucket non-over-issue, B: idempotency exactly-one-Created, C: quota non-over-admission, D: cross-tenant isolation)"
       run: sbt "loadSim/run --scenario correctness"
+
+    # Every event the service published during the run, committed to usage
+    # once. It waits for the service's queues to drain and the aggregator to
+    # catch up.
+    - name: Usage pipeline — published events committed exactly once
+      run: make usage-check
+      env:
+        WAIT_SECONDS: "180"
 
     - name: Cleanup
       if: always()

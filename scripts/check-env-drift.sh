@@ -21,9 +21,10 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 APP_CONF="$ROOT/src/main/resources/application.conf"
 COMPOSE="$ROOT/docker-compose.yml"
 TF_MAIN="$ROOT/terraform/main.tf"
+HELM_VALUES="$ROOT/deploy/helm/gate/values.yaml"
 COMPOSE_SERVICE="${COMPOSE_SERVICE:-rate-limiter}"
 
-for f in "$APP_CONF" "$COMPOSE" "$TF_MAIN"; do
+for f in "$APP_CONF" "$COMPOSE" "$TF_MAIN" "$HELM_VALUES"; do
   [ -f "$f" ] || { echo "Error: missing $f" >&2; exit 1; }
 done
 
@@ -77,6 +78,20 @@ tf_vars() {
   ' "$TF_MAIN" | sort -u
 }
 
+# The service's env map in the Helm chart (gate.env in values.yaml). EKS is
+# the second deployed shape (ADR-008), so it drifts the same way ECS can.
+helm_vars() {
+  awk '
+    /^gate:/ { ingate = 1; next }
+    /^[a-z]/ { ingate = 0 }
+    ingate && /^  env:/ { env = 1; next }
+    env && /^  [a-zA-Z]/ { env = 0 }
+    env && /^    [A-Z_][A-Z0-9_]*:/ {
+      line = $0; sub(/^    /, "", line); sub(/:.*/, "", line); print line
+    }
+  ' "$HELM_VALUES" | sort -u
+}
+
 is_local_only() {
   local v="$1"
   for l in "${LOCAL_ONLY[@]}"; do [ "$v" = "$l" ] && return 0; done
@@ -88,11 +103,13 @@ is_local_only() {
 APP=$(app_vars)
 CMP=$(compose_vars)
 TF=$(tf_vars)
+HELM=$(helm_vars)
 
 printf 'Environment variables\n'
 printf '  application.conf reads : %s\n' "$(echo "$APP" | grep -c .)"
 printf '  docker-compose sets    : %s (service: %s)\n' "$(echo "$CMP" | grep -c .)" "$COMPOSE_SERVICE"
-printf '  terraform sets         : %s\n\n' "$(echo "$TF" | grep -c .)"
+printf '  terraform sets         : %s\n' "$(echo "$TF" | grep -c .)"
+printf '  helm chart sets        : %s\n\n' "$(echo "$HELM" | grep -c .)"
 
 status=0
 
@@ -112,6 +129,31 @@ if [ -n "$drift" ]; then
   status=1
 else
   printf 'OK: every compose variable is either set in Terraform or deliberately local-only.\n\n'
+fi
+
+# 1b. Terraform and the chart deploy the same service; each should set what the
+#     other does. PROMETHEUS_ENABLED is the chart's alone: its SLO metrics come
+#     from /metrics, and ECS defaults it on.
+HELM_ONLY=(PROMETHEUS_ENABLED)
+helm_drift=""
+while read -r v; do
+  [ -n "$v" ] || continue
+  echo "$HELM" | grep -qx "$v" || helm_drift+="  $v (Terraform sets it, the chart does not)"$'\n'
+done <<< "$TF"
+while read -r v; do
+  [ -n "$v" ] || continue
+  if ! echo "$TF" | grep -qx "$v" && ! printf '%s\n' "${HELM_ONLY[@]}" | grep -qx "$v"; then
+    helm_drift+="  $v (the chart sets it, Terraform does not)"$'\n'
+  fi
+  echo "$APP" | grep -qx "$v" || case "$v" in OTEL_*) ;; *) helm_drift+="  $v (the chart sets it, the app never reads it)"$'\n' ;; esac
+done <<< "$HELM"
+
+if [ -n "$helm_drift" ]; then
+  printf 'DRIFT: the Helm chart and Terraform configure the service differently\n'
+  printf '%s\n' "$helm_drift"
+  status=1
+else
+  printf 'OK: the Helm chart sets the same variables as Terraform.\n\n'
 fi
 
 # 2. Supported by the app but set nowhere: a silent default. Often fine, but

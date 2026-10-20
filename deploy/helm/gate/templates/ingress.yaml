@@ -1,0 +1,55 @@
+{{- if .Values.ingress.enabled }}
+{{- $tls := ne .Values.ingress.certificateArn "" }}
+{{- $public := has "0.0.0.0/0" .Values.ingress.inboundCidrs }}
+{{- if and (eq .Values.ingress.scheme "internet-facing") (not $tls) }}
+{{- if not .Values.ingress.inboundCidrs }}
+{{- fail "ingress.inboundCidrs is required without a certificate: an ALB with no listener rules open to nobody is useless, and one open to everyone sends API keys in plaintext" }}
+{{- end }}
+{{- if and $public (not .Values.ingress.allowPublicPlaintext) }}
+{{- fail "ingress: refusing a public plaintext ALB. Set ingress.certificateArn, narrow ingress.inboundCidrs, or set ingress.allowPublicPlaintext: true (API keys would cross the internet unencrypted)" }}
+{{- end }}
+{{- end }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "gate.fullname" . }}
+  labels:
+    {{- include "gate.labels" . | nindent 4 }}
+  annotations:
+    alb.ingress.kubernetes.io/scheme: {{ .Values.ingress.scheme }}
+    # Pods, not nodes: the ALB health-checks each replica's /ready.
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/healthcheck-path: /ready
+    alb.ingress.kubernetes.io/healthcheck-timeout-seconds: "5"
+    alb.ingress.kubernetes.io/target-group-attributes: >-
+      slow_start.duration_seconds={{ .Values.ingress.slowStartSeconds }},deregistration_delay.timeout_seconds=30
+    {{- with .Values.ingress.inboundCidrs }}
+    alb.ingress.kubernetes.io/inbound-cidrs: {{ join "," . | quote }}
+    {{- end }}
+    {{- if $tls }}
+    alb.ingress.kubernetes.io/certificate-arn: {{ .Values.ingress.certificateArn | quote }}
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
+    {{- else }}
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+    {{- end }}
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  rules:
+    - {{- with .Values.ingress.host }}
+      host: {{ . | quote }}
+      {{- end }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "gate.fullname" . }}
+                port:
+                  name: http
+{{- end }}

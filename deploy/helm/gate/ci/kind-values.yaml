@@ -1,0 +1,44 @@
+# The chart on a local kind cluster against LocalStack (scripts/kind-rehearsal.sh).
+# Everything AWS-specific is overridden here, and only here: the chart's
+# defaults stay the EKS ones.
+gate:
+  image: {repository: gate-rehearsal-server, tag: local, pullPolicy: Never}
+  # Two replicas, not autoscaled: the point is a fixed number of pods sharing
+  # one store.
+  replicas: 2
+  autoscaling: {enabled: false}
+  env:
+    RATE_LIMIT_TABLE: rate-limits
+    IDEMPOTENCY_TABLE: idempotency
+    TOKEN_QUOTA_TABLE: gate-token-quotas
+    KINESIS_STREAM: rate-limit-events
+    SECRETS_ENVIRONMENT: kind
+    METRICS_ENABLED: "false"
+    # Reached through a NodePort, not an ALB: X-Forwarded-For is the client's.
+    AUTH_TRUST_FORWARDED_FOR: "false"
+    # As compose: the correctness scenario drives one key far past 1000/min.
+    AUTH_RATE_LIMIT_PER_MINUTE: "10000000"
+  extraEnv:
+    - {name: USE_LOCALSTACK, value: "true"}
+    - {name: AWS_ENDPOINT, value: "http://localstack:4566"}
+    - {name: DYNAMODB_ENDPOINT, value: "http://localstack:4566"}
+    - {name: KINESIS_ENDPOINT, value: "http://localstack:4566"}
+    - {name: AWS_ACCESS_KEY_ID, value: test}
+    - {name: AWS_SECRET_ACCESS_KEY, value: test}
+    # LocalStack is far slower than DynamoDB (see docker-compose.yml).
+    - {name: TIMEOUT_RATE_LIMIT_CHECK, value: "10 seconds"}
+    - {name: TIMEOUT_IDEMPOTENCY_CHECK, value: "10 seconds"}
+    - {name: TIMEOUT_QUOTA_CHECK, value: "10 seconds"}
+  resources:
+    requests: {cpu: 500m, memory: 1Gi}
+    limits: {memory: 1Gi}
+aggregator:
+  image: {repository: gate-rehearsal-aggregator, tag: local, pullPolicy: Never}
+  env:
+    KINESIS_STREAM: rate-limit-events
+    USAGE_TABLE: gate-usage
+  extraEnv:
+    - {name: AWS_ENDPOINT, value: "http://localstack:4566"}
+service:
+  type: NodePort
+  nodePort: 30080

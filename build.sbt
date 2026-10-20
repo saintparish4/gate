@@ -123,3 +123,34 @@ lazy val loadSim = project.in(file("loadSim")).settings(
     "org.typelevel" %% "cats-effect-testing-scalatest" % "1.7.0" % Test,
   ),
 )
+
+// The usage aggregator: reads the event stream the service publishes to Kinesis
+// and folds it into per-client, per-minute usage in DynamoDB (ADR-007). It is
+// its own deployable, so it does not pull in the service. Its tests depend on
+// the service's compiled code, so they decode the events the service really
+// encodes rather than a copy of their shape.
+lazy val aggregator = project.in(file("aggregator"))
+  .enablePlugins(JavaAppPackaging, DockerPlugin)
+  .dependsOn(root % "test->compile").settings(
+    name := "gate-usage-aggregator",
+    version := "0.1.0",
+    scalaVersion := scala3Version,
+    Compile / run / fork := true,
+    libraryDependencies ++= Seq(
+      "org.typelevel" %% "cats-effect" % CatsEffectVersion,
+      "org.http4s" %% "http4s-ember-server" % Http4sVersion,
+      "org.http4s" %% "http4s-dsl" % Http4sVersion,
+      "io.circe" %% "circe-parser" % CirceVersion,
+      "software.amazon.awssdk" % "dynamodb" % AwsSdkVersion,
+      "software.amazon.awssdk" % "kinesis" % AwsSdkVersion,
+      "io.prometheus" % "simpleclient" % PrometheusVersion,
+      "io.prometheus" % "simpleclient_common" % PrometheusVersion,
+      "io.prometheus" % "simpleclient_hotspot" % PrometheusVersion,
+      "ch.qos.logback" % "logback-classic" % "1.5.19",
+      "org.typelevel" %% "log4cats-slf4j" % "2.7.1",
+      "org.scalatest" %% "scalatest" % "3.2.19" % Test,
+      "org.scalatestplus" %% "scalacheck-1-18" % "3.2.19.0" % Test,
+      "org.scalacheck" %% "scalacheck" % "1.18.1" % Test,
+      "org.typelevel" %% "cats-effect-testing-scalatest" % "1.7.0" % Test,
+    ),
+  )

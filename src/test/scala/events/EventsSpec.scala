@@ -13,6 +13,25 @@ class EventsSpec extends AnyFreeSpec with Matchers:
 
   "RateLimitEvent" - {
 
+    "QuotaReconciled event carries its type and the usage the aggregator sums" in {
+      val event: RateLimitEvent = RateLimitEvent.QuotaReconciled(
+        timestamp = Instant.ofEpochMilli(1705312200000L),
+        apiKey = "key_001",
+        clientId = "client-1",
+        reservationId = "res-1",
+        actualInputTokens = 80,
+        actualOutputTokens = 10,
+        inputDelta = -20,
+        outputDelta = 10,
+      )
+      val json = event.asJson(using RateLimitEvent.given_Encoder_RateLimitEvent)
+      event.partitionKey shouldBe "client-1"
+      json.hcursor.get[String]("event_type").toOption shouldBe
+        Some("quota_reconciled")
+      json.hcursor.get[Long]("actualInputTokens").toOption shouldBe Some(80L)
+      json.hcursor.get[Long]("actualOutputTokens").toOption shouldBe Some(10L)
+    }
+
     "Allowed event" - {
       val timestamp = Instant.ofEpochMilli(1705312200000L)
       val event = RateLimitEvent.Allowed(

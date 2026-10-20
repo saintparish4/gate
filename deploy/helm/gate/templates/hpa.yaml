@@ -1,0 +1,27 @@
+{{- if .Values.gate.autoscaling.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "gate.fullname" . }}
+  labels:
+    {{- include "gate.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "gate.fullname" . }}
+  minReplicas: {{ .Values.gate.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.gate.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.gate.autoscaling.targetCPUUtilizationPercentage }}
+  behavior:
+    # A new replica is cold for its first seconds; scaling down slowly keeps
+    # the warm ones.
+    scaleDown:
+      stabilizationWindowSeconds: 300
+{{- end }}

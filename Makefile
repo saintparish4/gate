@@ -24,8 +24,9 @@ SMOKE_ID := $(shell date +%s 2>/dev/null || echo 0)
 NEED_SBT = @command -v sbt >/dev/null 2>&1 || { echo "Error: sbt not found in PATH."; echo "  Install it: https://www.scala-sbt.org/download.html"; echo "  Or skip sbt entirely and use Docker: make stack"; exit 1; }
 
 .DEFAULT_GOAL := help
-.PHONY: help up up-clean down clean logs status run dev stack obs \
-        fmt test test-it test-all smoke health correctness env-drift monitoring-check tf-validate tf-test
+.PHONY: help up up-clean down clean logs status run dev stack stack-scaled obs \
+        fmt test test-it test-all smoke health correctness env-drift monitoring-check tf-validate tf-test spec \
+        slo-check usage-check helm-check
 
 help: ## Show this help
 	@awk 'BEGIN { FS = ":.*##"; printf "Usage: make <target>\n" } \
@@ -46,6 +47,10 @@ up-clean: ## Rebuild the LocalStack image from scratch, then start it
 stack: ## Start the whole stack in Docker (LocalStack + app) — no sbt needed
 	$(COMPOSE) up -d --build --wait
 	@echo "Gate is up at $(APP_URL). Follow it with 'make logs'."
+
+stack-scaled: ## Start GATE_REPLICAS (default 3) replicas behind a load balancer on :8080
+	$(COMPOSE) -f docker-compose.yml -f docker-compose.scale.yml up -d --build --wait
+	@echo "$${GATE_REPLICAS:-3} replicas behind http://localhost:8080. Stop with: $(COMPOSE) -f docker-compose.yml -f docker-compose.scale.yml down -v"
 
 obs: ## Start the stack plus Prometheus, Grafana and Jaeger
 	$(COMPOSE) --profile obs up -d --build --wait
@@ -90,10 +95,10 @@ fmt: ## Format all Scala sources (CI fails on unformatted code)
 	$(NEED_SBT)
 	sbt scalafmtAll
 
-test: ## Run unit tests, and the load simulator's own tests
+test: ## Run unit tests, the load simulator's own tests, and the aggregator's
 	$(NEED_SBT)
 	sbt unitTest
-	sbt loadSim/test
+	sbt loadSim/test aggregator/test
 
 test-it: ## Run integration tests (TestContainers — needs Docker, not LocalStack)
 	$(NEED_SBT)
@@ -108,6 +113,9 @@ correctness: ## Check the correctness invariants (APP_URL=... to target a deploy
 	$(NEED_SBT)
 	@echo "Correctness invariants against $(APP_URL) (keys from API_KEY and FREE_API_KEY; not printed)"
 	@API_KEY='$(API_KEY)' FREE_API_KEY='$(FREE_API_KEY)' sbt "loadSim/run --scenario correctness --url $(APP_URL)"
+
+spec: ## Model-check the TLA+ specs in spec/ against spec/expected.txt (needs Java, ~6 min)
+	bash scripts/check-specs.sh
 
 ##@ Probes
 
@@ -142,7 +150,32 @@ smoke: ## Send 100 rate-limit checks and verify the X-RateLimit-* headers
 	done; \
 	echo "OK: 100 requests sent; X-RateLimit-Limit, -Remaining and -Reset all present."
 
+usage-check: ## Check the usage aggregator committed every event the service published (stack running)
+	bash scripts/check-usage-pipeline.sh
+
 ##@ Infrastructure
+
+HELM_CHART = deploy/helm/gate
+helm-check: ## Lint and render the Helm chart, schema-check it, and check what it refuses
+	@command -v helm >/dev/null 2>&1 || { echo "Error: helm not found in PATH."; exit 1; }
+	@command -v kubeconform >/dev/null 2>&1 || { echo "Error: kubeconform not found in PATH."; exit 1; }
+	helm lint $(HELM_CHART) -f $(HELM_CHART)/ci/test-values.yaml
+	helm lint $(HELM_CHART) -f $(HELM_CHART)/ci/kind-values.yaml
+	helm template gate $(HELM_CHART) -f $(HELM_CHART)/ci/test-values.yaml 2>/dev/null \
+	  | kubeconform -strict -summary -kubernetes-version 1.31.0 -schema-location default \
+	      -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+	@for bad in "--set ingress.certificateArn= --set ingress.inboundCidrs={0.0.0.0/0}" \
+	            "--set gate.image.tag=latest" "--set gate.env.SECRETS_MANAGER_ENABLED=false"; do \
+	  if helm template gate $(HELM_CHART) -f $(HELM_CHART)/ci/test-values.yaml $$bad >/dev/null 2>&1; then \
+	    echo "FAIL: the chart rendered with $$bad"; exit 1; \
+	  fi; \
+	done; echo "OK: the chart refuses a public plaintext ALB, a latest tag, and Secrets Manager off"
+
+# promtool from the Prometheus image compose already uses, so nothing to install.
+PROMTOOL = docker run --rm -v "$(CURDIR)/observability/prometheus:/p" -w /p --entrypoint promtool prom/prometheus:v2.54.1
+slo-check: ## Check the SLO rules, and run their unit tests (needs Docker)
+	$(PROMTOOL) check rules rules/slo.yml
+	$(PROMTOOL) test rules tests/slo_test.yml
 
 env-drift: ## Compare env vars across application.conf, compose and Terraform
 	./scripts/check-env-drift.sh
@@ -152,10 +185,11 @@ monitoring-check: ## Check every app metric the Terraform dashboard and alarms u
 
 # -backend=false: validation needs no state, so it runs without AWS access or
 # the S3 bucket bootstrap.sh creates.
-tf-validate: ## Validate both Terraform roots (no AWS access needed)
+tf-validate: ## Validate the three Terraform roots (no AWS access needed)
 	@command -v terraform >/dev/null 2>&1 || { echo "Error: terraform not found in PATH."; echo "  Install it: https://www.terraform.io/downloads"; exit 1; }
 	cd terraform && terraform init -backend=false -input=false >/dev/null && terraform validate
 	cd terraform/bootstrap && terraform init -backend=false -input=false >/dev/null && terraform validate
+	cd terraform/eks && terraform init -backend=false -input=false >/dev/null && terraform validate
 
 tf-test: ## Plan the ALB's TLS and exposure rules against a mocked AWS provider
 	@command -v terraform >/dev/null 2>&1 || { echo "Error: terraform not found in PATH."; exit 1; }

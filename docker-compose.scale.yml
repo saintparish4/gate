@@ -1,0 +1,28 @@
+# Several replicas of the service over one LocalStack, behind a round-robin
+# load balancer on :8080. The replicas share nothing but DynamoDB and Kinesis,
+# as tasks behind an ALB do, so the correctness invariants run against it test
+# the distributed claim rather than one process.
+#
+#   GATE_REPLICAS=3 docker compose -f docker-compose.yml -f docker-compose.scale.yml up -d --build --wait
+#   make stack-scaled            (the same, GATE_REPLICAS defaulting to 3)
+#
+# Throughput on it says nothing about AWS: every replica waits on one LocalStack
+# process, which is the bottleneck long before the replicas are.
+services:
+  rate-limiter:
+    # The load balancer owns :8080; replicas publishing it would collide.
+    ports: !reset []
+    deploy:
+      replicas: ${GATE_REPLICAS:-3}
+
+  lb:
+    image: nginx:1.27-alpine
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./observability/nginx/gate-lb.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      rate-limiter:
+        condition: service_healthy
+    networks:
+      - rate-limiter-network

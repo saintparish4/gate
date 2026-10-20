@@ -105,6 +105,7 @@ class TokenQuotaApi[F[_]: Async: Tracer](
       latency <- Clock[F].realTime.map(_.toMillis - startTime)
       _ <- metricsPublisher
         .recordLatency("token_quota_reconcile", latency.toDouble)
+      _ <- publishReconciled(result, req, client).start
       resp <- buildReconcileResponse(result)
     yield resp
 
@@ -173,7 +174,7 @@ class TokenQuotaApi[F[_]: Async: Tracer](
 
   private def buildReconcileResponse(result: ReconcileResult): F[Response[F]] =
     result match
-      case ReconcileResult.Reconciled(inputDelta, outputDelta) => Ok(
+      case ReconcileResult.Reconciled(inputDelta, outputDelta, _) => Ok(
           TokenQuotaReconcileResponse("reconciled", inputDelta, outputDelta)
             .asJson,
         )
@@ -196,6 +197,33 @@ class TokenQuotaApi[F[_]: Async: Tracer](
   private def currentTraceId: F[Option[String]] = Tracer[F].currentSpanContext
     .map(_.filter(_.isValid).map(_.traceIdHex))
 
+  // Only the reconcile that applied the usage publishes it. A replay answers
+  // the same deltas but would count the same tokens twice downstream.
+  private def publishReconciled(
+      result: ReconcileResult,
+      req: TokenQuotaReconcileRequest,
+      client: AuthenticatedClient,
+  ): F[Unit] = result match
+    case ReconcileResult.Reconciled(inputDelta, outputDelta, true) =>
+      for
+        now <- Clock[F].realTime.map(d => Instant.ofEpochMilli(d.toMillis))
+        traceId <- currentTraceId
+        _ <- eventPublisher.publish(RateLimitEvent.QuotaReconciled(
+          timestamp = now,
+          apiKey = client.apiKeyId,
+          clientId = client.clientId,
+          reservationId = req.reservationId,
+          actualInputTokens = req.actualInputTokens,
+          actualOutputTokens = req.actualOutputTokens,
+          inputDelta = inputDelta,
+          outputDelta = outputDelta,
+          traceId = traceId,
+        )).handleErrorWith(error =>
+          logger.warn(s"Failed to publish reconcile event: ${error.getMessage}"),
+        )
+      yield ()
+    case _ => Async[F].unit
+
   private def publishQuotaEvent(
       decision: QuotaDecision,
       req: TokenQuotaCheckRequest,
@@ -213,6 +241,7 @@ class TokenQuotaApi[F[_]: Async: Tracer](
         limit = limit,
         used = used,
         apiKey = client.apiKeyId,
+        clientId = client.clientId,
         traceId = traceId,
       )
       getRequestId().flatMap { requestId =>

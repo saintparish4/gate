@@ -1,0 +1,103 @@
+{{- if .Values.aggregator.enabled }}
+{{- range $name := list "KINESIS_STREAM" "USAGE_TABLE" }}
+{{- if not (index $.Values.aggregator.env $name) }}
+{{- fail (printf "aggregator.env.%s is required (terraform output helm_values sets it)" $name) }}
+{{- end }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gate.fullname" . }}-usage-aggregator
+  labels:
+    {{- include "gate.labels" . | nindent 4 }}
+    app.kubernetes.io/component: usage-aggregator
+spec:
+  # One reader. A second stays correct but spends writes on fenced commits
+  # (ADR-007), and Recreate keeps a rollout from running two.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "gate.aggregatorSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gate.aggregatorSelectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ .Values.aggregator.serviceAccount.name }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: usage-aggregator
+          image: {{ include "gate.image" (dict "image" .Values.aggregator.image "what" "aggregator") }}
+          imagePullPolicy: {{ .Values.aggregator.image.pullPolicy }}
+          ports:
+            - name: metrics
+              containerPort: 9095
+          env:
+            {{- range $k, $v := .Values.aggregator.env }}
+            - name: {{ $k }}
+              value: {{ toString $v | quote }}
+            {{- end }}
+            {{- with .Values.aggregator.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: metrics
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: metrics
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+          resources:
+            {{- toYaml .Values.aggregator.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.aggregator.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.aggregator.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.aggregator.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "gate.fullname" . }}-usage-aggregator
+  labels:
+    {{- include "gate.labels" . | nindent 4 }}
+    app.kubernetes.io/component: usage-aggregator
+spec:
+  selector:
+    {{- include "gate.aggregatorSelectorLabels" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: 9095
+      targetPort: metrics
+{{- end }}

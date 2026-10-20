@@ -266,7 +266,7 @@ class TokenQuotaServiceSpec
         result <- svc.reconcile(client, id, 800, 0)
         state <- store.getQuota(userPk("user1"))
       yield
-        result shouldBe ReconcileResult.Reconciled(-200, 0)
+        result shouldBe ReconcileResult.Reconciled(-200, 0, applied = true)
         state.map(_.inputTokens) shouldBe Some(800L)
     }
 
@@ -294,8 +294,8 @@ class TokenQuotaServiceSpec
         replay <- svc.reconcile(client, id, 0, 0)
         state <- store.getQuota(userPk("user1"))
       yield
-        first shouldBe ReconcileResult.Reconciled(-1000, 0)
-        replay shouldBe first
+        first shouldBe ReconcileResult.Reconciled(-1000, 0, applied = true)
+        replay shouldBe ReconcileResult.Reconciled(-1000, 0, applied = false)
         state.map(_.totalTokens) shouldBe Some(0L)
     }
 
@@ -412,6 +412,6 @@ class TokenQuotaServiceSpec
       yield
         stolen shouldBe ReconcileResult.NotFound
         counterA.map(_.totalTokens) shouldBe Some(9_000L)
-        own shouldBe ReconcileResult.Reconciled(0, 0)
+        own shouldBe ReconcileResult.Reconciled(0, 0, applied = true)
     }
   }

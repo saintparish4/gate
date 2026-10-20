@@ -39,3 +39,4 @@ Kinesis event publishing is fire-and-forget: events are enqueued to a bounded in
 ## Corrections
 
 - 27 September 2026: this ADR said a full queue drops the new event and that audit events are logged as structured lines. The queue evicts the oldest event, and before that change evictions were not counted at all. Audit lines are plain text.
+- 20 October 2026: the drain fiber sent one `PutRecord` at a time, which capped publishing well below the decision rate: the first CI run of the usage check saw 7,798 events evicted from a full queue in one correctness run. It now sends up to 500 queued events per `PutRecords` and retries only the records a call rejects. Delivery is still at most once.

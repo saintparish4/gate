@@ -1,0 +1,16 @@
+Gate {{ .Chart.AppVersion }} is installed as {{ include "gate.fullname" . }} in {{ .Release.Namespace }}.
+
+  kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "gate.fullname" . }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "gate.fullname" . }} 8080:{{ .Values.service.port }}
+  curl -s localhost:8080/ready
+{{- if .Values.ingress.enabled }}
+
+The ALB takes a minute or two to provision:
+  kubectl -n {{ .Release.Namespace }} get ingress {{ include "gate.fullname" . }}
+{{- end }}
+{{- if .Values.aggregator.enabled }}
+
+Usage aggregator lag (docs/SLO.md, usage freshness):
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "gate.fullname" . }}-usage-aggregator 9095
+  curl -s localhost:9095/metrics | grep gate_usage_millis_behind_latest
+{{- end }}

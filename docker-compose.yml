@@ -92,6 +92,31 @@ services:
     networks:
       - rate-limiter-network
 
+  # Folds the event stream into per-client, per-minute usage in the gate-usage
+  # table (ADR-007). Metrics on :9095/metrics.
+  usage-aggregator:
+    build:
+      context: .
+      dockerfile: aggregator.Dockerfile
+    ports:
+      - "9095:9095"
+    environment:
+      - AWS_REGION=us-east-1
+      - AWS_ENDPOINT=http://localstack:4566
+      - KINESIS_STREAM=rate-limit-events
+      - USAGE_TABLE=gate-usage
+    depends_on:
+      localstack:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9095/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    networks:
+      - rate-limiter-network
+
   # Observability stack — start with `docker compose --profile obs up`.
   # Runs alongside the base services; Prometheus scrapes the app's /metrics
   # endpoint and Grafana is auto-provisioned with the Gate dashboard.
@@ -102,6 +127,7 @@ services:
       - "9090:9090"
     volumes:
       - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/prometheus/rules:/etc/prometheus/rules:ro
       - prometheus-data:/prometheus
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
