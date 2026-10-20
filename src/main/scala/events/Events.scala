@@ -81,10 +81,31 @@ object RateLimitEvent:
       limit: Long,
       used: Long,
       apiKey: String,
+      // The tenant, as every other usage event names it. Without it the
+      // aggregator could not file a refusal under the client that was refused.
+      clientId: String,
       override val traceId: Option[String] = None,
   ) extends RateLimitEvent:
     val eventType = "token_quota_exceeded"
     val partitionKey = userId
+
+  /** A quota reservation was reconciled with the usage the caller reported. The
+    * usage aggregator sums these into tokens used per client. Published once
+    * per reservation: a replayed reconcile publishes nothing.
+    */
+  case class QuotaReconciled(
+      timestamp: Instant,
+      apiKey: String,
+      clientId: String,
+      reservationId: String,
+      actualInputTokens: Long,
+      actualOutputTokens: Long,
+      inputDelta: Long,
+      outputDelta: Long,
+      override val traceId: Option[String] = None,
+  ) extends RateLimitEvent:
+    val eventType = "quota_reconciled"
+    val partitionKey = clientId
 
   /** Compliance audit event emitted for every denied/rejected/conflict
     * decision. PCI DSS 4.0.1 requires 7-year retention of all access-denied
@@ -123,6 +144,7 @@ object RateLimitEvent:
       case e: IdempotencyHit => (e.asJson, e.eventType)
       case e: IdempotencyNew => (e.asJson, e.eventType)
       case e: TokenQuotaExceeded => (e.asJson, e.eventType)
+      case e: QuotaReconciled => (e.asJson, e.eventType)
       case e: AuditEvent => (e.asJson, e.eventType)
     withMetadata(json, eventType, event.traceId)
   }

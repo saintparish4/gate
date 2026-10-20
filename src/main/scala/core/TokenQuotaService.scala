@@ -56,9 +56,11 @@ object QuotaDecision:
 sealed trait ReconcileResult
 object ReconcileResult:
   /** Applied, or already applied with the same actual usage. The deltas are
-    * actual minus the stored estimate.
+    * actual minus the stored estimate. `applied` is false on the replay: the
+    * answer is the same, but the usage event is published once, so the usage
+    * aggregator does not count a retried reconcile twice.
     */
-  case class Reconciled(inputDelta: Long, outputDelta: Long)
+  case class Reconciled(inputDelta: Long, outputDelta: Long, applied: Boolean)
       extends ReconcileResult
 
   /** The adjustment was not recorded; the caller should retry it. */
@@ -449,10 +451,12 @@ object TokenQuotaService:
         actualOutputTokens: Long,
     ): F[ReconcileResult] =
       val usage = ReconciledUsage(actualInputTokens, actualOutputTokens)
-      def deltas(record: ReservationRecord) = ReconcileResult.Reconciled(
-        actualInputTokens - record.estimatedInput,
-        actualOutputTokens - record.estimatedOutput,
-      )
+      def deltas(record: ReservationRecord, applied: Boolean) = ReconcileResult
+        .Reconciled(
+          actualInputTokens - record.estimatedInput,
+          actualOutputTokens - record.estimatedOutput,
+          applied,
+        )
       for
         nowMs <- Clock[F].realTime.map(_.toMillis)
         outcome <- store.reconcile(
@@ -462,12 +466,13 @@ object TokenQuotaService:
           nowMs,
         )
         result <- outcome match
-          case ReconcileOutcome.Applied(record) => Async[F].pure(deltas(record))
+          case ReconcileOutcome.Applied(record) => Async[F]
+              .pure(deltas(record, applied = true))
           // A retry after a lost response: same usage, same answer, nothing
           // applied twice.
           case ReconcileOutcome.AlreadyReconciled(record)
               if record.reconciled.contains(usage) =>
-            Async[F].pure(deltas(record))
+            Async[F].pure(deltas(record, applied = false))
           case ReconcileOutcome.AlreadyReconciled(record) => metrics
               .increment("TokenQuotaReconcileConflict") *> Async[F].pure(
               ReconcileResult.Conflict(record.reconciled.getOrElse(usage)),

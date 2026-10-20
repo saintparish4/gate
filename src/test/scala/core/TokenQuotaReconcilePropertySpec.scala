@@ -82,10 +82,11 @@ class TokenQuotaReconcilePropertySpec
               val h = held(i)
               svc.reconcile(owner, h.id, in, out).map {
                 // The first reconcile replaces the estimate with the usage.
-                case ReconcileResult.Reconciled(_, _) if !h.reconciled =>
+                case ReconcileResult.Reconciled(_, _, true) if !h.reconciled =>
                   held.updated(i, Held(h.id, in, out, reconciled = true))
-                // A replay with the same usage, or a conflicting one: no change.
-                case ReconcileResult.Reconciled(_, _) | ReconcileResult
+                // A replay with the same usage, or a conflicting one: no change,
+                // and a replay says it applied nothing.
+                case ReconcileResult.Reconciled(_, _, false) | ReconcileResult
                       .Conflict(_) if h.reconciled => held
                 case other => fail(s"unexpected reconcile result: $other")
               }
