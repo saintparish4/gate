@@ -24,7 +24,7 @@ SMOKE_ID := $(shell date +%s 2>/dev/null || echo 0)
 NEED_SBT = @command -v sbt >/dev/null 2>&1 || { echo "Error: sbt not found in PATH."; echo "  Install it: https://www.scala-sbt.org/download.html"; echo "  Or skip sbt entirely and use Docker: make stack"; exit 1; }
 
 .DEFAULT_GOAL := help
-.PHONY: help up up-clean down clean logs status run dev stack obs \
+.PHONY: help up up-clean down clean logs status run dev stack stack-scaled obs \
         fmt test test-it test-all smoke health correctness env-drift monitoring-check tf-validate tf-test spec \
         slo-check usage-check helm-check
 
@@ -47,6 +47,10 @@ up-clean: ## Rebuild the LocalStack image from scratch, then start it
 stack: ## Start the whole stack in Docker (LocalStack + app) — no sbt needed
 	$(COMPOSE) up -d --build --wait
 	@echo "Gate is up at $(APP_URL). Follow it with 'make logs'."
+
+stack-scaled: ## Start GATE_REPLICAS (default 3) replicas behind a load balancer on :8080
+	$(COMPOSE) -f docker-compose.yml -f docker-compose.scale.yml up -d --build --wait
+	@echo "$${GATE_REPLICAS:-3} replicas behind http://localhost:8080. Stop with: $(COMPOSE) -f docker-compose.yml -f docker-compose.scale.yml down -v"
 
 obs: ## Start the stack plus Prometheus, Grafana and Jaeger
 	$(COMPOSE) --profile obs up -d --build --wait

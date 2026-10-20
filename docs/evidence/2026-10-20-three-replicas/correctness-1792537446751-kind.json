@@ -1,0 +1,95 @@
+{
+  "scenario" : "correctness",
+  "runId" : "1792537446751",
+  "startedAt" : "2026-10-20T23:04:06.753409Z",
+  "finishedAt" : "2026-10-20T23:06:11.762450Z",
+  "target" : "http://localhost:18080",
+  "server" : {
+    "version" : "0.1.0",
+    "commit" : "v0.1.0-108-g5276e99-dirty"
+  },
+  "loadSim" : {
+    "commit" : "v0.1.0-112-g46c47e5-dirty"
+  },
+  "overall" : "PASS",
+  "invariants" : [
+    {
+      "name" : "A",
+      "title" : "token bucket never over-issues",
+      "verdict" : "PASS",
+      "details" : "minAllowed=20 <= allowed=81 <= maxAllowed=84 (window: server=30s, client monotonic=30.0s wall=31.2s, THIS MACHINE'S CLOCKS DISAGREE BY 3.8%, total=2081, blocked=2000, errors=0)",
+      "counts" : {
+        "allowed" : 81,
+        "blocked" : 2000,
+        "clientMonotonicMillis" : 30018,
+        "clientWallMillis" : 31208,
+        "degraded" : 0,
+        "errors" : 0,
+        "maxAllowed" : 84,
+        "minAllowed" : 20,
+        "serverWindowSecs" : 30,
+        "total" : 2081
+      },
+      "errors" : [
+      ]
+    },
+    {
+      "name" : "B",
+      "title" : "idempotency creates exactly once",
+      "verdict" : "PASS",
+      "details" : "each of 119 keys was answered 'new' exactly once — keys=119, created=119, conflicts=0, errors=0, duplicates=2796",
+      "counts" : {
+        "conflicts" : 0,
+        "created" : 119,
+        "doubleClaimed" : 0,
+        "duplicates" : 2796,
+        "errors" : 0,
+        "keys" : 119,
+        "neverClaimed" : 0,
+        "total" : 2915
+      },
+      "errors" : [
+      ]
+    },
+    {
+      "name" : "C",
+      "title" : "token quota never over-admits",
+      "verdict" : "PASS",
+      "details" : "no user admitted past 1000000 tokens — users filled=3 of 3 used, admitted per user=39/40/40 (max 40), rejected=204, contended=9, errors=0",
+      "counts" : {
+        "admitted" : 119,
+        "contended" : 9,
+        "errors" : 0,
+        "rejected" : 204,
+        "total" : 332,
+        "usersFilled" : 3,
+        "usersOverLimit" : 0,
+        "usersUsed" : 3
+      },
+      "errors" : [
+      ]
+    },
+    {
+      "name" : "D",
+      "title" : "tenants never share state",
+      "verdict" : "PASS",
+      "details" : "idempotency keys A=79 B=79 (created A=79 B=79), admitted A=40 B=40 (max 40 each, 80 together), stolen reconciles refused=461/461, conflicts=0, errors=0",
+      "counts" : {
+        "admittedA" : 40,
+        "admittedB" : 40,
+        "conflicts" : 0,
+        "doubleClaimed" : 0,
+        "errors" : 0,
+        "keysA" : 79,
+        "keysB" : 79,
+        "neverClaimed" : 0,
+        "rejected" : 792,
+        "thefts" : 461,
+        "theftsLanded" : 0,
+        "total" : 1848
+      },
+      "errors" : [
+      ]
+    }
+  ]
+}

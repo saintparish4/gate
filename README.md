@@ -64,9 +64,11 @@ deliberately out of scope for now.
 | Tenancy | Every storage key scoped to the authenticated client ([ADR-005](docs/adr/005-tenant-namespaced-storage-keys.md)), with cross-tenant tests and invariant D | | Hosted multi-tenant service: accounts, billing, a managed control plane |
 | Access | API keys from Secrets Manager, a permission per route, a per-task throttle per key and on unknown keys per source | Audit records for failed authentication and permission refusals | SSO and role management |
 | Failure behavior | Resilience stack on the rate-limit path; timeout and bulkhead on idempotency and quota; corrupt state fails closed and self-heals | | Serving decisions from a local cache during an outage |
-| Events and audit | Kinesis events at most once; `AUDIT` log lines | Firehose to S3 (Parquet), Glue, Athena, and 7-year retention: in Terraform, never deployed ([COMPLIANCE.md](docs/COMPLIANCE.md)) | |
+| Events and audit | Kinesis events at most once; `AUDIT` log lines; per-client, per-minute usage folded from the stream, each record once ([ADR-007](docs/adr/007-usage-aggregation-from-the-event-stream.md)) | Firehose to S3 (Parquet), Glue, Athena, and 7-year retention: in Terraform, never deployed ([COMPLIANCE.md](docs/COMPLIANCE.md)) | |
 | Consistency | One AWS Region is the consistency boundary | A written statement of the single-region semantics | Exact limits across Regions (global tables) |
-| Evidence | Invariants A-D in CI and against a Terraform deploy on AWS; LocalStack latency figures | A benchmark report on real AWS | |
+| Evidence | Invariants A-D in CI, against a Terraform deploy on AWS, and across three replicas behind a load balancer on LocalStack; LocalStack latency figures | A benchmark report on real AWS | |
+| Deployment | ECS Fargate by Terraform, run on AWS; a Helm chart and an EKS Terraform root, rehearsed on kind ([deploy/README.md](deploy/README.md)) | The first EKS deploy on AWS | |
+| Objectives | Written SLOs with burn-rate alerts and a Grafana dashboard ([SLO.md](docs/SLO.md)) | Revising the targets against a month of real traffic | |
 | Interfaces | HTTP API; a local demo dashboard (Terraform pins it off) | | A product web UI or admin console |
 
 ## Architecture
@@ -405,12 +407,17 @@ make obs        # the stack plus Prometheus, Grafana and Jaeger
 
 | Tool | URL | Notes |
 |---|---|---|
-| Grafana | <http://localhost:3000> | `admin` / `admin`, anonymous viewer enabled; dashboard "Gate — Rate Limiting & Quotas" |
-| Prometheus | <http://localhost:9090> | Scrapes the app every 5 s with the development `admin-api-key` |
+| Grafana | <http://localhost:3000> | `admin` / `admin`, anonymous viewer enabled; dashboards "Gate — Rate Limiting & Quotas" and "Gate — SLOs" |
+| Prometheus | <http://localhost:9090> | Scrapes every app replica and the usage aggregator every 5 s, and loads the SLO rules |
 | Jaeger | <http://localhost:16686> | Service `gate`; compose points the OTLP exporter at it |
 
-The dashboard source is
-[`observability/grafana/dashboards/gate.json`](observability/grafana/dashboards/gate.json).
+The dashboard sources are in
+[`observability/grafana/dashboards`](observability/grafana/dashboards). The SLO
+dashboard reads the recording rules in
+[`observability/prometheus/rules/slo.yml`](observability/prometheus/rules/slo.yml),
+and [docs/SLO.md](docs/SLO.md) says what each objective promises. `make
+slo-check` runs the rules' own tests, which feed each kind of burn and check
+that its alert fires.
 
 **Prometheus metrics** (`GET /metrics` with an `AdminMetrics` key)
 
@@ -426,6 +433,15 @@ The dashboard source is
 | `gate_quota_tokens_admitted_total` | counter | `level`; tokens reserved by admitted quota checks, i.e. the pre-request estimate |
 | `gate_events_published_total` | counter | `event_type`; counted once a Kinesis put succeeds |
 | `gate_events_dropped_total` | counter | Kinesis events dropped after the retry |
+| `gate_http_requests_total` | counter | `route` (the template, never a key), `code`, `degraded`; every answer, which is what the availability SLO counts |
+| `gate_http_request_duration_seconds` | histogram | `route`; request to response headers, which is what the latency SLO counts |
+
+The usage aggregator serves its own metrics on `:9095/metrics`:
+`gate_usage_records_total{event_type}`, `gate_usage_commits_total{result}`
+(`committed`, `fenced`, `error`), `gate_usage_millis_behind_latest{shard}`,
+`gate_usage_tokens_total{direction}` and `gate_usage_decisions_total{result}`.
+`make usage-check` (run in CI) compares what the service published with what
+the aggregator committed, type by type.
 
 The bounded label combinations exist at zero from startup, so a quiet series
 reads 0 rather than "No data".
@@ -529,6 +545,17 @@ different clients. Against a deployed stack both come from `.demo-keys.env`,
 and they reach the load simulator through the environment: as command-line
 flags they were echoed by `make` and by sbt, so a run printed them. Source:
 [`LoadSim.scala`](loadSim/src/main/scala/LoadSim.scala).
+
+### Across replicas
+
+`make stack-scaled` runs three replicas over one LocalStack, behind a
+round-robin load balancer on `:8080`. They share only DynamoDB and Kinesis, as
+tasks behind an ALB do. On 20 October 2026 the scenario passed A-D against it
+with `errors=0` (run 1792536390218), the load split 2,418 / 2,413 / 2,412
+requests across the replicas, and the aggregator committed every one of the
+9,462 events published, once. That is one run on LocalStack, so it is evidence
+that the claim holds across processes, not a measurement of AWS
+([docs/evidence/2026-10-20-three-replicas](docs/evidence/2026-10-20-three-replicas/README.md)).
 
 ### On AWS
 
@@ -766,18 +793,29 @@ terraform apply -var-file=environments/dev.tfvars \
 terraform output api_endpoint
 ```
 
+### Kubernetes (EKS)
+
+A Helm chart and an EKS Terraform root are prepared but not yet applied on
+AWS. [deploy/README.md](deploy/README.md) covers what they create, the
+deploy and teardown scripts, the cost (about $13 a day while up), and a local
+rehearsal on kind.
+
 ## Documentation
 
 - [API reference](docs/API.md) — request and response schemas for every route
 - [Architecture](docs/ARCHITECTURE.md) — what the code does on each path, and why
 - [Performance](docs/PERFORMANCE.md) — the April LocalStack latency figures (historical) and the derived DynamoDB cost per decision
 - [Compliance notes](docs/COMPLIANCE.md) — what the audit trail records today, and what is planned
+- [Service level objectives](docs/SLO.md) — availability, latency, usage freshness and event delivery, with their alerts
+- [Deploying on Kubernetes](deploy/README.md) — the Helm chart and the EKS root
 - ADRs: [DynamoDB over Redis](docs/adr/001-dynamodb-over-redis.md),
   [hand-rolled circuit breaker](docs/adr/002-hand-rolled-circuit-breaker.md),
   [fire-and-forget event publishing](docs/adr/003-fire-and-forget-event-publishing.md),
   [OCC over pessimistic locking](docs/adr/004-occ-over-pessimistic-locking.md),
   [tenant-namespaced storage keys](docs/adr/005-tenant-namespaced-storage-keys.md),
-  [idempotency claim token](docs/adr/006-idempotency-claim-token.md)
+  [idempotency claim token](docs/adr/006-idempotency-claim-token.md),
+  [usage aggregation from the event stream](docs/adr/007-usage-aggregation-from-the-event-stream.md),
+  [Kubernetes as a second deployment target](docs/adr/008-kubernetes-as-a-second-deployment-target.md)
 
 ## Technology stack
 
