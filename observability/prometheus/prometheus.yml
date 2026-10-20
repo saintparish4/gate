@@ -15,6 +15,9 @@ scrape_configs:
       credentials: admin-api-key
     static_configs:
       - targets: ["rate-limiter:8080"]
+  - job_name: usage-aggregator
+    static_configs:
+      - targets: ["usage-aggregator:9095"]
 
   - job_name: prometheus
     static_configs:

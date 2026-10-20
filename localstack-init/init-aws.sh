@@ -131,6 +131,27 @@ awslocal dynamodb update-time-to-live \
   --table-name gate-token-quotas \
   --time-to-live-specification Enabled=true,AttributeName=ttl 2>/dev/null || echo "Note: TTL update skipped (may already be enabled or not supported)"
 
+# Create DynamoDB table: gate-usage (the usage aggregator's sums and its
+# per-shard checkpoints; ADR-007)
+if table_exists "gate-usage"; then
+    echo "DynamoDB table 'gate-usage' already exists, skipping creation"
+else
+    echo "Creating DynamoDB table: gate-usage"
+    if awslocal dynamodb create-table \
+      --table-name gate-usage \
+      --attribute-definitions AttributeName=pk,AttributeType=S AttributeName=sk,AttributeType=S \
+      --key-schema AttributeName=pk,KeyType=HASH AttributeName=sk,KeyType=RANGE \
+      --billing-mode PAY_PER_REQUEST \
+      --tags Key=Environment,Value=local; then
+        awslocal dynamodb wait table-exists --table-name gate-usage || true
+    else
+        echo "WARNING: Failed to create table 'gate-usage', it may already exist"
+    fi
+fi
+awslocal dynamodb update-time-to-live \
+  --table-name gate-usage \
+  --time-to-live-specification Enabled=true,AttributeName=ttl 2>/dev/null || echo "Note: TTL update skipped (may already be enabled or not supported)"
+
 # Wait for Kinesis service
 wait_for_service "kinesis"
 

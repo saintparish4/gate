@@ -25,7 +25,8 @@ NEED_SBT = @command -v sbt >/dev/null 2>&1 || { echo "Error: sbt not found in PA
 
 .DEFAULT_GOAL := help
 .PHONY: help up up-clean down clean logs status run dev stack obs \
-        fmt test test-it test-all smoke health correctness env-drift monitoring-check tf-validate tf-test spec
+        fmt test test-it test-all smoke health correctness env-drift monitoring-check tf-validate tf-test spec \
+        usage-check
 
 help: ## Show this help
 	@awk 'BEGIN { FS = ":.*##"; printf "Usage: make <target>\n" } \
@@ -90,10 +91,10 @@ fmt: ## Format all Scala sources (CI fails on unformatted code)
 	$(NEED_SBT)
 	sbt scalafmtAll
 
-test: ## Run unit tests, and the load simulator's own tests
+test: ## Run unit tests, the load simulator's own tests, and the aggregator's
 	$(NEED_SBT)
 	sbt unitTest
-	sbt loadSim/test
+	sbt loadSim/test aggregator/test
 
 test-it: ## Run integration tests (TestContainers — needs Docker, not LocalStack)
 	$(NEED_SBT)
@@ -144,6 +145,9 @@ smoke: ## Send 100 rate-limit checks and verify the X-RateLimit-* headers
 		i=$$((i + 1)); \
 	done; \
 	echo "OK: 100 requests sent; X-RateLimit-Limit, -Remaining and -Reset all present."
+
+usage-check: ## Check the usage aggregator committed every event the service published (stack running)
+	bash scripts/check-usage-pipeline.sh
 
 ##@ Infrastructure
 
