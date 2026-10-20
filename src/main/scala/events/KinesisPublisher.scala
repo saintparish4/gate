@@ -24,10 +24,13 @@ import observability.MetricsPublisher
   *     `circularBuffer` queue; when the queue is full the oldest event is
   *     evicted, counted as `DroppedKinesisEvent{reason=queue_full}`. Evictions
   *     used to be silent while the docs said every drop was counted.
-  *   - A single background fiber dequeues events and publishes them to Kinesis.
-  *     On transient failure the fiber retries once; if the retry also fails the
-  *     event is dropped, counted as
-  *     `DroppedKinesisEvent{reason=publish_failed}`.
+  *   - A single background fiber takes whatever is queued, up to 500 events,
+  *     and sends it in one `PutRecords`. Records the call rejects, or the whole
+  *     batch if the call fails, are sent once more; what fails again is
+  *     dropped, counted as `DroppedKinesisEvent{reason=publish_failed}`. It
+  *     used to send one `PutRecord` at a time: on the first CI run of the usage
+  *     check that capped the drain far below the decision rate, and the full
+  *     queue evicted 7,798 events in one correctness run.
   *   - The drain fiber is managed by `KinesisPublisher.resource` and is
   *     cancelled on Resource release.
   *
@@ -69,11 +72,16 @@ class KinesisPublisher[F[_]: Async: Logger: Temporal](
       Async[F].delay(client.describeStreamSummary(request).toCompletableFuture),
     ).map(_ => Right(())).handleError(e => Left(e.getMessage))
 
-  /** Background drain loop: take one event, publish it with single retry. Runs
-    * forever until cancelled by Resource cleanup.
+  /** Background drain loop: wait for one event, take up to a batch's worth with
+    * it, publish them together. Runs forever until cancelled by Resource
+    * cleanup.
     */
-  private[events] def drainLoop: F[Nothing] = queue.take
-    .flatMap(publishWithRetry).foreverM
+  private[events] def drainLoop: F[Nothing] = nextBatch.flatMap(publishWithRetry)
+    .foreverM
+
+  private def nextBatch: F[List[RateLimitEvent]] = queue.take.flatMap(first =>
+    queue.tryTakeN(Some(KinesisPublisher.MaxBatch - 1)).map(first :: _),
+  )
 
   /** Drain remaining events from the queue on shutdown. Bounded by a 10s
     * timeout so shutdown does not block indefinitely.
@@ -81,42 +89,60 @@ class KinesisPublisher[F[_]: Async: Logger: Temporal](
   private def drain(): F[Unit] = Temporal[F].timeout(
     queue.size.flatMap(n =>
       if n == 0 then Async[F].unit
-      else queue.take.flatMap(publishWithRetry) *> drain(),
+      else nextBatch.flatMap(publishWithRetry) *> drain(),
     ),
     10.seconds,
   ).handleError(_ => ())
 
   // Counted only once a put succeeds, so a published count that trails the
   // decision rate means events are being lost, not merely queued.
-  private def publishWithRetry(event: RateLimitEvent): F[Unit] =
-    val published = metrics
-      .increment("KinesisEventPublished", Map("event_type" -> event.eventType))
-    publishDirect(event).attempt.flatMap {
-      case Right(_) => published
-      case Left(e1) => logger
-          .warn(e1)(s"Kinesis publish failed (attempt 1), retrying: ${event
-              .eventType}") *> publishDirect(event).attempt.flatMap {
-          case Right(_) => published
-          case Left(e2) => logger.error(e2)(
-              s"Kinesis publish failed after retry, dropping event: ${event
-                  .eventType}",
-            ) *> metrics.increment(
-              "DroppedKinesisEvent",
-              Map("reason" -> "publish_failed"),
-            )
-        }
+  private[events] def publishWithRetry(events: List[RateLimitEvent]): F[Unit] =
+    putBatch(events).flatMap {
+      case Nil => Async[F].unit
+      case failed => logger.warn(s"Kinesis put failed for ${failed
+            .size} of ${events.size} events (attempt 1), retrying") *>
+          putBatch(failed).flatMap {
+            case Nil => Async[F].unit
+            case dropped => logger
+                .error(s"Kinesis put failed after retry, dropping ${dropped
+                    .size} events") *> dropped.traverse_(_ =>
+                metrics.increment(
+                  "DroppedKinesisEvent",
+                  Map("reason" -> "publish_failed"),
+                ),
+              )
+          }
     }
 
-  private def publishDirect(event: RateLimitEvent): F[Unit] =
-    val json = event.asJson.noSpaces
-    val bytes = SdkBytes.fromUtf8String(json)
-    val request = PutRecordRequest.builder().streamName(config.streamName)
-      .partitionKey(event.partitionKey).data(bytes).build()
+  /** One PutRecords: counts the events Kinesis took, returns the ones it did
+    * not. A call that fails outright returns them all.
+    */
+  private def putBatch(events: List[RateLimitEvent]): F[List[RateLimitEvent]] =
+    val entries = events.map(e =>
+      PutRecordsRequestEntry.builder().partitionKey(e.partitionKey)
+        .data(SdkBytes.fromUtf8String(e.asJson.noSpaces)).build(),
+    )
+    val request = PutRecordsRequest.builder().streamName(config.streamName)
+      .records(entries.asJava).build()
     Async[F].fromCompletableFuture(
-      Async[F].delay(client.putRecord(request).toCompletableFuture),
-    ).void
+      Async[F].delay(client.putRecords(request).toCompletableFuture),
+    ).attempt.flatMap {
+      case Left(e) => logger.warn(e)("Kinesis PutRecords call failed").as(events)
+      case Right(response) =>
+        // Results are in request order; a failed one carries an error code.
+        val results = response.records.asScala.toList
+        val (failed, ok) = events.zip(results)
+          .partition((_, r) => r.errorCode != null)
+        ok.traverse_((e, _) =>
+          metrics
+            .increment("KinesisEventPublished", Map("event_type" -> e.eventType)),
+        ).as(failed.map(_._1))
+    }
 
 object KinesisPublisher:
+
+  /** The most records one PutRecords takes. */
+  val MaxBatch: Int = 500
 
   /** Create a `KinesisPublisher` wrapped in a `Resource` that manages the
     * background drain fiber lifecycle.
