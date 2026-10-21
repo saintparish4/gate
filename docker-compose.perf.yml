@@ -1,0 +1,70 @@
+# The overload characterization's environment (docs/perf), shaped like one
+# Fargate task per replica and pinned to cores so the parts do not steal from
+# each other on a 4-core laptop:
+#
+#   cores 0-1 (cpus 0-3)  gate replicas, the aggregator, nginx, Prometheus
+#   core 2    (cpus 4-5)  LocalStack and Toxiproxy
+#   core 3    (cpus 6-7)  the load generator, outside Docker (taskset)
+#
+# Use with the base and scale files:
+#   docker compose -f docker-compose.yml -f docker-compose.scale.yml -f docker-compose.perf.yml \
+#     up -d --build --wait localstack toxiproxy rate-limiter usage-aggregator lb prometheus
+#
+# What differs from compose's defaults, and why: production timeouts (2 s, 2 s,
+# 5 s, not compose's widened 10 s) so overload fails as it would on AWS;
+# tracing off, as Terraform sets it without a collector; no LocalStack
+# persistence, so a run never inherits the last one's state; GC logs and a JFR
+# recording in each replica's /tmp, copied out after the run; and the store
+# reached through Toxiproxy in every condition, so a fault run differs from the
+# others only by its fault.
+services:
+  localstack:
+    cpuset: "4,5"
+    environment:
+      - PERSISTENCE=0
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    cpuset: "4,5"
+    command: ["-host=0.0.0.0", "-config=/config/toxiproxy.json"]
+    ports:
+      - "8474:8474"
+    volumes:
+      - ./observability/perf/toxiproxy.json:/config/toxiproxy.json:ro
+    depends_on:
+      localstack:
+        condition: service_healthy
+    networks:
+      - rate-limiter-network
+
+  rate-limiter:
+    cpuset: "0-3"
+    cpus: 1.0
+    mem_limit: 2g
+    environment:
+      - DYNAMODB_ENDPOINT=http://toxiproxy:4570
+      - KINESIS_ENDPOINT=http://toxiproxy:4571
+      - TIMEOUT_RATE_LIMIT_CHECK=2 seconds
+      - TIMEOUT_IDEMPOTENCY_CHECK=2 seconds
+      - TIMEOUT_QUOTA_CHECK=5 seconds
+      - DEGRADATION_MODE=reject-all
+      - TRACING_ENABLED=false
+      - OTEL_SDK_DISABLED=true
+      - STORAGE_BACKEND=${GATE_STORAGE_BACKEND:-dynamodb}
+      - KINESIS_ENABLED=${GATE_KINESIS_ENABLED:-true}
+      - JAVA_OPTS=-XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0 -XX:+ExitOnOutOfMemoryError -Djava.security.egd=file:/dev/./urandom -Xlog:gc*:file=/tmp/gc.log:time,uptime,level,tags -XX:StartFlightRecording=filename=/tmp/gate.jfr,settings=profile,dumponexit=true
+    depends_on:
+      toxiproxy:
+        condition: service_started
+
+  usage-aggregator:
+    cpuset: "0-3"
+
+  lb:
+    cpuset: "0-3"
+
+  prometheus:
+    cpuset: "0-3"
+    volumes: !override
+      - ./observability/perf/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/prometheus/rules:/etc/prometheus/rules:ro

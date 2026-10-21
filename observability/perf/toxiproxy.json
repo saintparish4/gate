@@ -1,0 +1,4 @@
+[
+  {"name": "dynamodb", "listen": "0.0.0.0:4570", "upstream": "localstack:4566", "enabled": true},
+  {"name": "kinesis", "listen": "0.0.0.0:4571", "upstream": "localstack:4566", "enabled": true}
+]
