@@ -76,6 +76,7 @@ object ResilientRateLimitStore:
       metrics: MetricsPublisher[F],
       degradationMode: GracefulDegradation.DegradationMode =
         GracefulDegradation.DegradationMode.AllowAll,
+      bulkheads: Option[Bulkhead.Registry[F]] = None,
   ): Resource[F, RateLimitStore[F]] =
     for
       // Create circuit breaker
@@ -102,6 +103,7 @@ object ResilientRateLimitStore:
               maxConcurrent = config.bulkhead.maxConcurrent,
               maxWait = config.bulkhead.maxWait,
             ),
+            bulkheads,
           ).map(Some(_))
         else Temporal[F].pure(None),
       )

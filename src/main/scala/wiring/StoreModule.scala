@@ -16,6 +16,8 @@ case class StoreModule[F[_]](
     resilientStore: RateLimitStore[F],
     idempotencyStore: IdempotencyStore[F],
     tokenQuotaStore: Option[TokenQuotaStore[F]],
+    // Each store's bulkhead, sampled into gauges by Main.
+    bulkheads: Bulkhead.Registry[F],
 )
 
 object StoreModule:
@@ -25,6 +27,7 @@ object StoreModule:
       events: EventPublisher[F],
   ): Resource[F, StoreModule[F]] =
     for
+      bulkheads <- Resource.eval(resilience.Bulkhead.Registry[F])
       rateLimitStore <- config.storage.backend match
         case "in-memory" => Resource.eval(RateLimitStore.inMemory[F])
         case _ => config.rateLimit.algorithm match
@@ -64,6 +67,7 @@ object StoreModule:
         config.resilience,
         metrics,
         config.resilience.parsedDegradationMode,
+        Some(bulkheads),
       )
 
       rawIdempotencyStore <- config.storage.backend match
@@ -80,6 +84,7 @@ object StoreModule:
         "idempotency",
         config.resilience.timeout.idempotencyCheck,
         config.resilience.bulkhead,
+        Some(bulkheads),
       )
       idempotencyStore = StoreGuard
         .idempotency(rawIdempotencyStore, idempotencyGuard)
@@ -88,6 +93,7 @@ object StoreModule:
         "quota",
         config.resilience.timeout.quotaCheck,
         config.resilience.bulkhead,
+        Some(bulkheads),
       )
       rawTokenQuotaStore <-
         if config.tokenQuota.enabled then
@@ -111,4 +117,5 @@ object StoreModule:
       resilientStore,
       idempotencyStore,
       rawTokenQuotaStore.map(StoreGuard.tokenQuota(_, quotaGuard)),
+      bulkheads,
     )

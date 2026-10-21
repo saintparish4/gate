@@ -36,11 +36,13 @@ object StoreGuard:
       name: String,
       timeout: FiniteDuration,
       settings: BulkheadSettings,
+      bulkheads: Option[Bulkhead.Registry[F]] = None,
   ): Resource[F, StoreGuard[F]] = Resource.eval(
     (if settings.enabled then
        Bulkhead[F](
          s"$name-operations",
          BulkheadConfig(settings.maxConcurrent, settings.maxWait),
+         bulkheads,
        ).map(Some(_))
      else Temporal[F].pure(None)).map(new StoreGuard[F](name, timeout, _)),
   )

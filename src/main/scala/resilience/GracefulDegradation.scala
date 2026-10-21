@@ -97,35 +97,50 @@ type BulkheadRejected = core.GateError.BulkheadFull
 object Bulkhead:
   import cats.effect.std.Semaphore
 
+  /** Every bulkhead built with it, by name, so their occupancy can be sampled
+    * as gauges. The limits are where overload sheds, and were invisible.
+    */
+  final class Registry[F[_]](ref: Ref[F, List[(String, Bulkhead[F])]]):
+    def add(name: String, bulkhead: Bulkhead[F]): F[Unit] = ref
+      .update(_ :+ name -> bulkhead)
+    def all: F[List[(String, Bulkhead[F])]] = ref.get
+
+  object Registry:
+    def apply[F[_]: Concurrent]: F[Registry[F]] = Ref
+      .of[F, List[(String, Bulkhead[F])]](Nil).map(new Registry[F](_))
+
   def apply[F[_]: Temporal: Logger](
       name: String,
       config: BulkheadConfig = BulkheadConfig.default,
+      registry: Option[Registry[F]] = None,
   ): F[Bulkhead[F]] =
     for
       semaphore <- Semaphore[F](config.maxConcurrent)
       inFlightRef <- Ref.of[F, Int](0)
       queuedRef <- Ref.of[F, Int](0)
-    yield new Bulkhead[F]:
-      private val logger = Logger[F]
+      bulkhead = new Bulkhead[F]:
+        private val logger = Logger[F]
 
-      // Only the wait for a permit is bounded by maxWait. The operation itself
-      // runs to completion once admitted, otherwise a slow backend turns the
-      // bulkhead into a hard timeout that cancels writes already in flight.
-      override def execute[A](fa: F[A]): F[A] =
-        val acquire = Temporal[F].timeout(semaphore.acquire, config.maxWait)
-          .adaptError { case _: java.util.concurrent.TimeoutException =>
-            core.GateError.BulkheadFull(name)
-          }
-        queuedRef.update(_ + 1) *>
-          Temporal[F].bracketFull(poll => poll(acquire))(_ =>
-            queuedRef.update(_ - 1) *> inFlightRef.update(_ + 1) *>
-              fa.guarantee(inFlightRef.update(_ - 1)),
-          )((_, _) => semaphore.release).onError {
-            case _: core.GateError.BulkheadFull => queuedRef.update(_ - 1) *>
-                logger.warn(
-                  s"Bulkhead '$name' rejected request - wait timeout exceeded",
-                )
-          }
+        // Only the wait for a permit is bounded by maxWait. The operation itself
+        // runs to completion once admitted, otherwise a slow backend turns the
+        // bulkhead into a hard timeout that cancels writes already in flight.
+        override def execute[A](fa: F[A]): F[A] =
+          val acquire = Temporal[F].timeout(semaphore.acquire, config.maxWait)
+            .adaptError { case _: java.util.concurrent.TimeoutException =>
+              core.GateError.BulkheadFull(name)
+            }
+          queuedRef.update(_ + 1) *>
+            Temporal[F].bracketFull(poll => poll(acquire))(_ =>
+              queuedRef.update(_ - 1) *> inFlightRef.update(_ + 1) *>
+                fa.guarantee(inFlightRef.update(_ - 1)),
+            )((_, _) => semaphore.release).onError {
+              case _: core.GateError.BulkheadFull => queuedRef.update(_ - 1) *>
+                  logger.warn(
+                    s"Bulkhead '$name' rejected request - wait timeout exceeded",
+                  )
+            }
 
-      override def inFlight: F[Int] = inFlightRef.get
-      override def queued: F[Int] = queuedRef.get
+        override def inFlight: F[Int] = inFlightRef.get
+        override def queued: F[Int] = queuedRef.get
+      _ <- registry.traverse_(_.add(name, bulkhead))
+    yield bulkhead

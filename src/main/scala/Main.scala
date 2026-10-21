@@ -15,7 +15,7 @@ import api.Routes
 import config.*
 import core.*
 import events.{BroadcastingEventPublisher, EventPublisher, KinesisPublisher}
-import observability.{CorrelationIdMiddleware, HttpMetrics}
+import observability.{CorrelationIdMiddleware, HttpMetrics, RequestTiming}
 import resilience.HealthAggregator
 import wiring.*
 
@@ -42,16 +42,28 @@ object Main extends IOApp:
       obs <- ObservabilityModule.resource[IO](config)
       _ <- Resource.eval(summon[Logger[IO]].info("Observability initialized"))
 
-      underlyingEvents <- config.kinesis.enabled match
+      // Every store timing also counts toward its request's Server-Timing
+      // split, so everything below gets this publisher, not obs's own.
+      timingLocal <- Resource.eval(RequestTiming.makeLocal)
+      metricsPublisher = RequestTiming
+        .publisher(obs.metricsPublisher, timingLocal)
+      // Which replica answered, in X-Gate-Instance: the container's hostname.
+      instanceName <- Resource.eval(IO(
+        sys.env
+          .getOrElse("HOSTNAME", java.net.InetAddress.getLocalHost.getHostName),
+      ))
+
+      kinesisPublisher <- config.kinesis.enabled match
         case true =>
           for
             kinesisClient <- storage.AwsClients
               .kinesisClient[IO](config.aws, config.dynamodb)
             publisher <- KinesisPublisher
-              .resource[IO](kinesisClient, config.kinesis, obs.metricsPublisher)
-          yield publisher
-        case false => Resource
-            .pure[IO, EventPublisher[IO]](EventPublisher.noop[IO])
+              .resource[IO](kinesisClient, config.kinesis, metricsPublisher)
+          yield Some(publisher)
+        case false => Resource.pure[IO, Option[KinesisPublisher[IO]]](None)
+      underlyingEvents: EventPublisher[IO] = kinesisPublisher
+        .getOrElse(EventPublisher.noop[IO])
 
       // The dashboard queue only exists to feed the dashboard; with it off,
       // nothing drains it.
@@ -60,8 +72,26 @@ object Main extends IOApp:
         .fold(underlyingEvents)(BroadcastingEventPublisher(underlyingEvents, _))
 
       stores <- StoreModule
-        .resource[IO](config, obs.metricsPublisher, eventPublisher)
+        .resource[IO](config, metricsPublisher, eventPublisher)
       _ <- Resource.eval(summon[Logger[IO]].info("Stores initialized"))
+
+      // Where overload waits: the bulkheads and the event queue, once a second.
+      _ <- obs.promMetrics.traverse_ { prom =>
+        (for
+          depth <- kinesisPublisher.traverse(_.queueDepth)
+          bulkheads <- stores.bulkheads.all
+          occupancy <- bulkheads.traverse((name, b) =>
+            (b.inFlight, b.queued).mapN((n, q) => (name, n, q)),
+          )
+          _ <- IO {
+            depth.foreach(d => prom.eventQueueDepth.set(d.toDouble))
+            occupancy.foreach((name, n, q) =>
+              prom.bulkheadInFlight.labels(name).set(n.toDouble)
+              prom.bulkheadQueued.labels(name).set(q.toDouble),
+            )
+          }
+        yield ()).andWait(1.second).foreverM.background.void
+      }
       _ <- Resource.eval(wiring.Warmup.rateLimitPath[IO](
         stores.rateLimitStore,
         core.RateLimitProfile(
@@ -85,13 +115,13 @@ object Main extends IOApp:
         val svc = core.TokenQuotaService[IO](
           tqs,
           config.tokenQuota,
-          obs.metricsPublisher,
+          metricsPublisher,
           summon[Logger[IO]],
         )
         IO.pure(api.TokenQuotaApi[IO](
           svc,
           eventPublisher,
-          obs.metricsPublisher,
+          metricsPublisher,
           summon[Logger[IO]],
           () =>
             correlationLocal.get
@@ -127,7 +157,7 @@ object Main extends IOApp:
         stores.resilientStore,
         stores.idempotencyStore,
         eventPublisher,
-        obs.metricsPublisher,
+        metricsPublisher,
         security.authMiddleware,
         config.rateLimit,
         config.idempotency,
@@ -150,7 +180,9 @@ object Main extends IOApp:
         summon[Logger[IO]],
         r =>
           CorrelationIdMiddleware.middleware(correlationLocal)(
-            obs.promMetrics.fold(r)(prom => HttpMetrics.middleware(prom)(r)),
+            RequestTiming.middleware(timingLocal, obs.promMetrics, instanceName)(
+              obs.promMetrics.fold(r)(prom => HttpMetrics.middleware(prom)(r)),
+            ),
           ),
       )
 

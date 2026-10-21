@@ -65,6 +65,11 @@ class KinesisPublisher[F[_]: Async: Logger: Temporal](
     else Async[F].unit,
   ) *> queue.offer(event)
 
+  /** Events waiting for the drain fiber, sampled as a gauge: eviction starts
+    * when it reaches `kinesis.queue-size`.
+    */
+  def queueDepth: F[Int] = queue.size
+
   override def healthCheck: F[Either[String, Unit]] =
     val request = DescribeStreamSummaryRequest.builder()
       .streamName(config.streamName).build()
@@ -154,7 +159,7 @@ object KinesisPublisher:
       client: KinesisAsyncClient,
       config: KinesisConfig,
       metrics: MetricsPublisher[F],
-  ): Resource[F, EventPublisher[F]] =
+  ): Resource[F, KinesisPublisher[F]] =
     val logger = summon[Logger[F]]
     for
       queue <- Resource

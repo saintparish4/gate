@@ -68,7 +68,34 @@ class PrometheusMetrics[F[_]: Sync](val registry: CollectorRegistry):
     .help("HTTP answers by route template, status code, and X-Gate-Degraded")
     .labelNames("route", "code", "degraded").register(registry)
 
+  // Sampled every second by Main, for the overload characterization
+  // (docs/perf): where requests wait is where overload shows first.
+  val httpInFlight: Gauge = Gauge.build().name("gate_http_in_flight")
+    .help("Requests being answered right now, across all routes")
+    .register(registry)
+
+  val eventQueueDepth: Gauge = Gauge.build().name("gate_events_queue_depth")
+    .help("Events waiting to be put to Kinesis; the oldest are evicted at kinesis.queue-size")
+    .register(registry)
+
+  val bulkheadInFlight: Gauge = Gauge.build().name("gate_bulkhead_in_flight")
+    .help("Calls holding a bulkhead permit").labelNames("name")
+    .register(registry)
+
+  val bulkheadQueued: Gauge = Gauge.build().name("gate_bulkhead_queued")
+    .help("Calls waiting for a bulkhead permit, up to its max-wait")
+    .labelNames("name").register(registry)
+
   // -- Histograms --
+
+  // The part of each answer spent in store calls, OCC retries included (see
+  // RequestTiming). Request time less this is time in gate itself.
+  val httpStoreDuration: Histogram = Histogram.build()
+    .name("gate_http_store_seconds")
+    .help("Time each answer spent waiting on the store, by route template")
+    .labelNames("route").buckets(
+      0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+    ).register(registry)
 
   // Buckets include 0.1: the latency objective's threshold must be one.
   val httpDuration: Histogram = Histogram.build()

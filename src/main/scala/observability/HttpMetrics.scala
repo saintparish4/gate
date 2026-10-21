@@ -58,14 +58,21 @@ object HttpMetrics:
             .observe((now.toNanos - started) / 1e9)
         },
       )
-    OptionT(Clock[F].monotonic.map(_.toNanos).flatMap(started =>
-      routes(req).value.flatTap {
-        case Some(resp) => record(
-            resp.status.code,
-            resp.headers.get(RateLimitApi.DegradedHeader).isDefined,
-            started,
-          )
-        case None => Sync[F].unit
-      }.onError(_ => record(500, degraded = false, started)),
-    ))
+    // In flight from request to response headers: the server's side of a
+    // Little's Law check against the client's throughput and latency.
+    val inFlight = Resource.make(Sync[F].delay(prom.httpInFlight.inc()))(_ =>
+      Sync[F].delay(prom.httpInFlight.dec()),
+    )
+    OptionT(
+      inFlight.surround(Clock[F].monotonic.map(_.toNanos).flatMap(started =>
+        routes(req).value.flatTap {
+          case Some(resp) => record(
+              resp.status.code,
+              resp.headers.get(RateLimitApi.DegradedHeader).isDefined,
+              started,
+            )
+          case None => Sync[F].unit
+        }.onError(_ => record(500, degraded = false, started)),
+      )),
+    )
   }
