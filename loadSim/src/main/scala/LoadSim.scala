@@ -123,6 +123,9 @@ object LoadSim extends IOApp:
         case "highContention" => withPreflight(_ => Scenarios.highContention(client, baseUrl).as(ExitCode.Success))
         case "correctness"    => withPreflight(server => Scenarios.correctness(client, baseUrl, concurrency, apiKey, freeKey, server, Some(resultsDir)))
         case "latency"        => withPreflight(_ => Scenarios.latency(client, baseUrl, rps.getOrElse(1000), duration.getOrElse(60)))
+        // Open-loop load and its calibration server (OpenLoop.scala).
+        case "openloop"       => OpenLoop.run(args, apiKey)
+        case "fake-server"    => OpenLoop.fakeServer(args)
         case unknown =>
           Console[IO].errorln(
             s"Unknown scenario: $unknown. Valid: normal, burst, idempotency, realistic, highContention, correctness, latency"
