@@ -8,7 +8,8 @@ send lag, the server's Server-Timing split, and which replicas answered.
 
     python3 scripts/perf/summarize.py run.jsonl [--json]
 
-Standard library only. Percentiles are nearest-rank on the raw rows.
+Standard library only. Percentiles are nearest-rank on the raw rows. Times are
+as measured (monotonic); analyze.py rescales them by the run's clock ratio.
 """
 import json
 import math
@@ -39,12 +40,17 @@ def summarize(rows):
         lag = sorted(r["sent"] - r["intended"] for r in rs)
         store = sorted(r["store"] for r in answered if r.get("store") is not None)
         gate = sorted(r["gate"] for r in answered if r.get("gate") is not None)
-        done_span = (max(r["done"] for r in rs) - min(r["sent"] for r in rs)) / 1000.0
+        # Throughput is answers completed inside the stage's window, whichever
+        # stage scheduled them; a stage's own requests finish late when the
+        # server falls behind.
+        t_end = t1 + 1000.0 / rs[0]["rate"]
+        completed = sum(1 for r in rows if r["status"] > 0 and t0 <= r["done"] < t_end)
+        done_span = None
         out.append({
             "stage": stage,
             "offered_rps": rs[0]["rate"],
             "requests": len(rs),
-            "answered_rps": round(len(answered) / max(1e-9, done_span), 1),
+            "answered_rps": round(completed / max(1e-9, (t_end - t0) / 1000.0), 1),
             "status": dict(Counter(str(r["status"]) for r in rs)),
             "errors": dict(Counter(r["error"] for r in rs if r["error"])),
             "degraded": sum(1 for r in rs if r.get("degraded")),
